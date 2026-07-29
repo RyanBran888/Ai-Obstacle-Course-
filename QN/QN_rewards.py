@@ -29,8 +29,16 @@ class LivePlot:
 
         plt.ion()
         self.fig, self.ax = plt.subplots(figsize=(9, 5))
-        (self.raw,) = self.ax.plot([], [], lw=0.6, alpha=0.30, color="#4c8dff",
-                                   label="episode return")
+        (self.raw,) = self.ax.plot(
+            [],
+            [],
+            lw=0.6,
+            marker=".",
+            markersize=4,
+            alpha=0.40,
+            color="#4c8dff",
+            label="episode return",
+        )
         (self.mean,) = self.ax.plot([], [], lw=2.0, color="#12356b",
                                     label=f"{window}-episode mean")
         self.ax.axhline(0.0, lw=0.8, color="#999", ls=":")
@@ -40,18 +48,25 @@ class LivePlot:
         self.ax.grid(alpha=0.25)
         self.ax.legend(loc="lower right", framealpha=0.9)
         self.fig.tight_layout()
-        self.fig.show()
+        plt.show(block=False)
+        plt.pause(0.1)
 
     def update(self, history: list[float]) -> None:
-        if not self.on or not history or len(history) % self.every:
+        if not self.on:
             return
-        x = range(len(history))
-        self.raw.set_data(x, history)
-        self.mean.set_data(x, running_mean(history, self.window))
-        self.ax.relim()
-        self.ax.autoscale_view()
-        self.fig.canvas.draw_idle()
-        self.fig.canvas.flush_events()
+        if history and len(history) % self.every == 0:
+            x = range(len(history))
+            self.raw.set_data(x, history)
+            self.mean.set_data(x, running_mean(history, self.window))
+            self.ax.relim()
+            self.ax.autoscale_view()
+            self.fig.canvas.draw_idle()
+        self.pump()
+
+    def pump(self) -> None:
+        if self.on:
+            self.fig.canvas.flush_events()
+            plt.pause(0.001)
 
     def close(self) -> None:
         if self.on:

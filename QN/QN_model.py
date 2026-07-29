@@ -53,11 +53,22 @@ class QNetwork(nn.Module):
             layers.append(nn.Linear(size, width))
             layers.append(nn.ReLU())
             size = width
-        layers.append(nn.Linear(size, n_actions))
-        self.net = nn.Sequential(*layers)
+        self.trunk = nn.Sequential(*layers)
+
+        # Dueling head. A plain head has to express "how good is this state"
+        # and "which action is better" in one number, and the state term is far
+        # larger -- so the action term gets swamped and every action ends up
+        # with nearly the same Q-value. Splitting them gives the advantage
+        # stream its own gradient.
+        self.value = nn.Linear(size, 1)
+        self.advantage = nn.Linear(size, n_actions)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        h = self.trunk(x)
+        value = self.value(h)
+        advantage = self.advantage(h)
+        # subtracting the mean advantage keeps the split identifiable
+        return value + advantage - advantage.mean(dim=-1, keepdim=True)
 
     @torch.no_grad()
     def q_values(self, obs: torch.Tensor) -> torch.Tensor:
