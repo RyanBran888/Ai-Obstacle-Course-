@@ -66,3 +66,6 @@ Desktop.ini
 *.swo
 *~
 .claude/
+
+# Training reward plots (regenerate by running QN_train.py)
+training_rewards*.png
