@@ -26,7 +26,6 @@ from .entities import (
     Key,
     LockedDoor,
     MovingPlatform,
-    PressurePlate,
     PushableBlock,
     ResetZone,
     Switch,
@@ -198,10 +197,6 @@ class Room:
     @property
     def switches(self) -> tuple[Switch, ...]:
         return self.of_type(Switch)
-
-    @property
-    def plates(self) -> tuple[PressurePlate, ...]:
-        return self.of_type(PressurePlate)
 
     @property
     def platforms(self) -> tuple[MovingPlatform, ...]:

@@ -19,7 +19,6 @@ from ..entities import (
     Key,
     LockedDoor,
     MovingPlatform,
-    PressurePlate,
     PushableBlock,
     ResetZone,
     Switch,
@@ -29,7 +28,6 @@ from ..entities import (
 from ..requirements import (
     CheckpointRequirement,
     KeyRequirement,
-    PlateRequirement,
     SwitchRequirement,
 )
 from ..room import Room
@@ -186,7 +184,6 @@ def _entity_layer(
         EntityKind.TEMPORARY_BRIDGE: 1,
         EntityKind.MOVING_PLATFORM: 2,
         EntityKind.CHECKPOINT: 3,
-        EntityKind.PRESSURE_PLATE: 4,
         EntityKind.KEY: 5,
         EntityKind.SWITCH: 6,
         EntityKind.PUSHABLE_BLOCK: 7,
@@ -325,21 +322,6 @@ def _draw_entity(
             )
         return out
 
-    if isinstance(entity, PressurePlate):
-        pressed = state.is_plate_pressed(entity.id) if state else False
-        paired = entity.group.startswith("pair")
-        out = [
-            f'<rect x="{px + cell * 0.18:.1f}" y="{py + cell * 0.18:.1f}" '
-            f'width="{cell * 0.64:.1f}" height="{cell * 0.64:.1f}" rx="3" '
-            f'fill="{color}" fill-opacity="{0.85 if pressed else 0.2}" '
-            f'stroke="{color}" stroke-width="2"/>'
-        ]
-        if paired:
-            out.append(
-                f'<circle cx="{mid_x}" cy="{mid_y}" r="{cell * 0.11:.1f}" fill="{color}"/>'
-            )
-        return out
-
     if isinstance(entity, PushableBlock):
         pos = state.block_positions.get(entity.id, entity.pos) if state else entity.pos
         bx, by = pos[0] * cell, pos[1] * cell
@@ -378,12 +360,12 @@ def _lock_color(door: LockedDoor, theme: Theme) -> str:
     if not door.latching:
         return theme.accents["lock_hold"]
     requirement = door.requirement
+    if requirement.needs_simultaneity():
+        return theme.accents["lock_paired"]
     if isinstance(requirement, KeyRequirement):
         return theme.accents["lock_key"]
     if isinstance(requirement, SwitchRequirement):
         return theme.accents["lock_switch"]
-    if isinstance(requirement, PlateRequirement):
-        return theme.accents["lock_plate"]
     if isinstance(requirement, CheckpointRequirement):
         return theme.entity_color(EntityKind.CHECKPOINT)
     return theme.entity_color(EntityKind.LOCKED_DOOR)
@@ -444,19 +426,23 @@ def _legend_entries(room: Room) -> list[tuple[str, str]]:
     if EntityKind.KEY in kinds:
         entries.append((theme.entity_color(EntityKind.KEY), "key"))
     if EntityKind.LOCKED_DOOR in kinds:
-        entries.append((theme.accents["lock_key"], "key door"))
-        if any(isinstance(d.requirement, SwitchRequirement) and d.latching for d in room.doors):
+        if any(isinstance(d.requirement, KeyRequirement) for d in room.doors):
+            entries.append((theme.accents["lock_key"], "key door"))
+        if any(
+            isinstance(d.requirement, SwitchRequirement)
+            and d.latching
+            and not d.requirement.needs_simultaneity()
+            for d in room.doors
+        ):
             entries.append((theme.accents["lock_switch"], "switch door"))
         if any(not d.latching for d in room.doors):
             entries.append((theme.accents["lock_hold"], "hold door"))
         if any(d.timer for d in room.doors):
             entries.append((theme.accents["lock_timed"], "timed door"))
-        if any(isinstance(d.requirement, PlateRequirement) for d in room.doors):
-            entries.append((theme.accents["lock_plate"], "paired-plate door"))
+        if any(d.requirement.needs_simultaneity() for d in room.doors):
+            entries.append((theme.accents["lock_paired"], "paired-lever door"))
     if EntityKind.SWITCH in kinds:
         entries.append((theme.entity_color(EntityKind.SWITCH), "switch"))
-    if EntityKind.PRESSURE_PLATE in kinds:
-        entries.append((theme.entity_color(EntityKind.PRESSURE_PLATE), "plate"))
     if EntityKind.MOVING_PLATFORM in kinds:
         entries.append((theme.entity_color(EntityKind.MOVING_PLATFORM), "platform"))
     if EntityKind.PUSHABLE_BLOCK in kinds:

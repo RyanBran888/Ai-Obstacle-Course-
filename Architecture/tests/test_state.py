@@ -12,7 +12,7 @@ from helpers import (  # noqa: E402
     LEFT_TILE,
     LEFT_TILE_B,
     hold_switch_room,
-    paired_plate_room,
+    paired_lever_room,
     solvable_key_room,
     two_region_room,
 )
@@ -21,13 +21,12 @@ from coop_env import GenerationConfig, RoomGenerator  # noqa: E402
 from coop_env.entities import (  # noqa: E402
     MovingPlatform,
     PlatformCycle,
-    PressurePlate,
     PushableBlock,
     Switch,
     SwitchMode,
     TemporaryBridge,
 )
-from coop_env.requirements import PlateRequirement, SwitchRequirement, TriggerMode  # noqa: E402
+from coop_env.requirements import SwitchRequirement, TriggerMode  # noqa: E402
 from coop_env.state import EpisodeState  # noqa: E402
 from coop_env.utils.geometry import Vec2  # noqa: E402
 
@@ -48,18 +47,18 @@ class TestDoorLogic(unittest.TestCase):
         state.set_switch("switch_0", False)
         self.assertFalse(state.is_door_open("door_0"))
 
-    def test_paired_plates_need_both(self):
-        state = EpisodeState.from_room(paired_plate_room())
-        state.set_plate("plate_0", True)
+    def test_paired_levers_need_both(self):
+        state = EpisodeState.from_room(paired_lever_room())
+        state.set_switch("switch_0", True)
         self.assertFalse(state.is_door_open("door_0"))
-        state.set_plate("plate_1", True)
+        state.set_switch("switch_1", True)
         self.assertTrue(state.is_door_open("door_0"))
 
-    def test_latched_plate_door_stays_open_after_release(self):
-        state = EpisodeState.from_room(paired_plate_room())
-        state.set_plate("plate_0", True)
-        state.set_plate("plate_1", True)
-        state.set_plate("plate_0", False)
+    def test_latched_paired_door_stays_open_after_release(self):
+        state = EpisodeState.from_room(paired_lever_room())
+        state.set_switch("switch_0", True)
+        state.set_switch("switch_1", True)
+        state.set_switch("switch_0", False)
         self.assertTrue(state.is_door_open("door_0"))
 
     def test_timed_door_relocks(self):
@@ -98,20 +97,26 @@ class TestDoorLogic(unittest.TestCase):
         self.assertTrue(state.is_switch_active("switch_0"))
 
 
-class TestCrateOnPlate(unittest.TestCase):
-    def test_a_crate_holds_a_plate_down(self):
+class TestCrateOnLever(unittest.TestCase):
+    def test_a_crate_holds_a_lever_down(self):
+        """Object transportation: park a crate on a lever to free up an agent."""
         room = two_region_room(
-            door_requirement=PlateRequirement(("plate_0",), TriggerMode.ALL),
+            door_requirement=SwitchRequirement(("switch_0",), TriggerMode.ALL),
+            latching=False,
             extra_entities=(
-                PressurePlate(id="plate_0", pos=LEFT_TILE, controls=("door_0",)),
+                Switch(id="switch_0", pos=LEFT_TILE, mode=SwitchMode.HOLD,
+                       controls=("door_0",)),
                 PushableBlock(id="block_0", pos=LEFT_TILE_B),
             ),
         )
         state = EpisodeState.from_room(room)
-        self.assertFalse(state.is_plate_pressed("plate_0"))
+        self.assertFalse(state.is_switch_active("switch_0"))
         state.place_block("block_0", LEFT_TILE)
-        self.assertTrue(state.is_plate_pressed("plate_0"))
+        self.assertTrue(state.is_switch_active("switch_0"))
         self.assertTrue(state.is_door_open("door_0"))
+
+        state.place_block("block_0", LEFT_TILE_B)
+        self.assertFalse(state.is_door_open("door_0"), "lever releases with the crate")
 
 
 class TestPlatformTiming(unittest.TestCase):
@@ -188,8 +193,6 @@ class TestReset(unittest.TestCase):
             state.collect_key(key.id)
         for switch in room.switches:
             state.set_switch(switch.id, True)
-        for plate in room.plates:
-            state.set_plate(plate.id, True)
         for checkpoint in room.checkpoints:
             state.reach_checkpoint(checkpoint.id)
         for block in room.blocks:

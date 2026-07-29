@@ -19,14 +19,12 @@ from coop_env.entities import (  # noqa: E402
     ExitDoor,
     Key,
     LockedDoor,
-    PressurePlate,
     Switch,
     SwitchMode,
 )
 from coop_env.requirements import (  # noqa: E402
     AlwaysOpen,
     KeyRequirement,
-    PlateRequirement,
     Requirement,
     SwitchRequirement,
     TriggerMode,
@@ -128,13 +126,21 @@ def sealed_key_room() -> Room:
     )
 
 
-def paired_plate_room() -> Room:
-    """Door needs two plates pressed at the same instant: needs both slots."""
+def paired_lever_room() -> Room:
+    """Door needs two hold-levers held at the same instant: needs both slots.
+
+    The door latches, so once the pair triggers it, it stays open and neither
+    agent ends up stranded.
+    """
     return two_region_room(
-        door_requirement=PlateRequirement(("plate_0", "plate_1"), TriggerMode.SIMULTANEOUS),
+        door_requirement=SwitchRequirement(
+            ("switch_0", "switch_1"), TriggerMode.SIMULTANEOUS
+        ),
         extra_entities=(
-            PressurePlate(id="plate_0", pos=LEFT_TILE, group="pair", controls=("door_0",)),
-            PressurePlate(id="plate_1", pos=LEFT_TILE_B, group="pair", controls=("door_0",)),
+            Switch(id="switch_0", pos=LEFT_TILE, mode=SwitchMode.HOLD,
+                   group="pair", controls=("door_0",)),
+            Switch(id="switch_1", pos=LEFT_TILE_B, mode=SwitchMode.HOLD,
+                   group="pair", controls=("door_0",)),
         ),
     )
 

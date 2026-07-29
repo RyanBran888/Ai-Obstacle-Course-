@@ -34,7 +34,6 @@ class StateView(Protocol):
 
     def is_key_collected(self, key_id: str) -> bool: ...
     def is_switch_active(self, switch_id: str) -> bool: ...
-    def is_plate_pressed(self, plate_id: str) -> bool: ...
     def is_checkpoint_reached(self, checkpoint_id: str) -> bool: ...
 
 
@@ -93,6 +92,13 @@ class KeyRequirement(Requirement):
 
 @dataclass(frozen=True, slots=True)
 class SwitchRequirement(Requirement):
+    """Levers. SIMULTANEOUS switches are the two-agent lock.
+
+    With `SIMULTANEOUS`, every listed switch must be active at the same instant,
+    which only works if they are HOLD switches -- toggles would simply stay on
+    and let one agent flip them in sequence.
+    """
+
     switch_ids: tuple[str, ...]
     mode: TriggerMode = TriggerMode.ALL
 
@@ -106,7 +112,7 @@ class SwitchRequirement(Requirement):
         return frozenset(self.switch_ids)
 
     def needs_simultaneity(self) -> bool:
-        return self.mode is TriggerMode.SIMULTANEOUS
+        return self.mode is TriggerMode.SIMULTANEOUS and len(self.switch_ids) > 1
 
     def describe(self) -> str:
         joiner = {
@@ -115,30 +121,6 @@ class SwitchRequirement(Requirement):
             TriggerMode.SIMULTANEOUS: " & ",
         }[self.mode]
         return f"switch({joiner.join(self.switch_ids)})"
-
-
-@dataclass(frozen=True, slots=True)
-class PlateRequirement(Requirement):
-    """Pressure plates. SIMULTANEOUS plates are the classic two-agent lock."""
-
-    plate_ids: tuple[str, ...]
-    mode: TriggerMode = TriggerMode.SIMULTANEOUS
-
-    def is_satisfied(self, state: StateView) -> bool:
-        checks = [state.is_plate_pressed(p) for p in self.plate_ids]
-        if self.mode is TriggerMode.ANY:
-            return any(checks)
-        return all(checks)
-
-    def referenced_ids(self) -> frozenset[str]:
-        return frozenset(self.plate_ids)
-
-    def needs_simultaneity(self) -> bool:
-        return self.mode is TriggerMode.SIMULTANEOUS and len(self.plate_ids) > 1
-
-    def describe(self) -> str:
-        joiner = " & " if self.mode is TriggerMode.SIMULTANEOUS else " + "
-        return f"plate({joiner.join(self.plate_ids)})"
 
 
 @dataclass(frozen=True, slots=True)

@@ -22,7 +22,6 @@ from typing import Any, Iterable
 from .entities import (
     LockedDoor,
     MovingPlatform,
-    PressurePlate,
     PushableBlock,
     Switch,
     SwitchMode,
@@ -48,8 +47,8 @@ class EpisodeState:
     exit_open: bool = False
 
     # internal bookkeeping
-    _plates_external: set[str] = field(default_factory=set, repr=False)
-    _plates_pressed: dict[str, bool] = field(default_factory=dict, repr=False)
+    _switches_held: set[str] = field(default_factory=set, repr=False)
+    """HOLD switches held by something other than a crate."""
     _door_latched: dict[str, bool] = field(default_factory=dict, repr=False)
     _door_timers: dict[str, int] = field(default_factory=dict, repr=False)
     _door_spent: set[str] = field(default_factory=set, repr=False)
@@ -70,8 +69,7 @@ class EpisodeState:
         self.checkpoints_reached = set()
         self.switches_active = {s.id: False for s in self.room.switches}
         self.block_positions = {b.id: b.pos for b in self.room.blocks}
-        self._plates_external = set()
-        self._plates_pressed = {p.id: False for p in self.room.plates}
+        self._switches_held = set()
         self._door_latched = {d.id: False for d in self.room.doors}
         self._door_timers = {}
         self._door_spent = set()
@@ -87,9 +85,6 @@ class EpisodeState:
 
     def is_switch_active(self, switch_id: str) -> bool:
         return self.switches_active.get(switch_id, False)
-
-    def is_plate_pressed(self, plate_id: str) -> bool:
-        return self._plates_pressed.get(plate_id, False)
 
     def is_checkpoint_reached(self, checkpoint_id: str) -> bool:
         return checkpoint_id in self.checkpoints_reached
@@ -113,17 +108,16 @@ class EpisodeState:
             raise KeyError(f"no switch {switch_id!r} in this room")
         if switch.mode is SwitchMode.ONESHOT and self.switches_active.get(switch_id):
             return  # one-shot switches never turn back off
-        self.switches_active[switch_id] = active
-        self.refresh()
-
-    def set_plate(self, plate_id: str, pressed: bool) -> None:
-        plate = self.room.find(plate_id)
-        if not isinstance(plate, PressurePlate):
-            raise KeyError(f"no pressure plate {plate_id!r} in this room")
-        if pressed:
-            self._plates_external.add(plate_id)
+        if switch.mode is SwitchMode.HOLD:
+            # HOLD switches read from whatever is currently on them, so record
+            # the intent and let refresh() decide -- a crate may also be holding
+            # it down, and releasing by hand must not override that.
+            if active:
+                self._switches_held.add(switch_id)
+            else:
+                self._switches_held.discard(switch_id)
         else:
-            self._plates_external.discard(plate_id)
+            self.switches_active[switch_id] = active
         self.refresh()
 
     def reach_checkpoint(self, checkpoint_id: str) -> None:
@@ -168,23 +162,23 @@ class EpisodeState:
 
     def refresh(self) -> None:
         """Recompute everything that follows from the primary state."""
-        self._refresh_plates()
+        self._refresh_hold_switches()
         self._refresh_doors()
         self.exit_open = self.room.exit.requirement.is_satisfied(self)
 
-    def _refresh_plates(self) -> None:
+    def _refresh_hold_switches(self) -> None:
+        """A HOLD switch is active while held by hand or weighed down by a crate."""
         weighted = {
-            pos for bid, pos in self.block_positions.items() if self._block_is_weight(bid)
+            pos
+            for block_id, pos in self.block_positions.items()
+            if isinstance(self.room.find(block_id), PushableBlock)
         }
-        for plate in self.room.plates:
-            pressed = plate.id in self._plates_external
-            if plate.accepts_block and plate.pos in weighted:
-                pressed = True
-            self._plates_pressed[plate.id] = pressed
-
-    def _block_is_weight(self, block_id: str) -> bool:
-        block = self.room.find(block_id)
-        return isinstance(block, PushableBlock)
+        for switch in self.room.switches:
+            if switch.mode is not SwitchMode.HOLD:
+                continue
+            self.switches_active[switch.id] = (
+                switch.id in self._switches_held or switch.pos in weighted
+            )
 
     def _refresh_doors(self) -> None:
         for door in self.room.doors:
@@ -279,7 +273,6 @@ class EpisodeState:
             done = (
                 self.is_key_collected(entity_id)
                 or self.is_switch_active(entity_id)
-                or self.is_plate_pressed(entity_id)
                 or self.is_checkpoint_reached(entity_id)
             )
             if not done:
@@ -296,7 +289,7 @@ class EpisodeState:
             "switches_active": dict(sorted(self.switches_active.items())),
             "checkpoints_reached": sorted(self.checkpoints_reached),
             "block_positions": {k: tuple(v) for k, v in sorted(self.block_positions.items())},
-            "plates_external": sorted(self._plates_external),
+            "switches_held": sorted(self._switches_held),
             "door_latched": dict(sorted(self._door_latched.items())),
             "door_timers": dict(sorted(self._door_timers.items())),
             "door_spent": sorted(self._door_spent),
@@ -310,7 +303,7 @@ class EpisodeState:
         self.block_positions = {
             k: Vec2(*v) for k, v in snapshot["block_positions"].items()
         }
-        self._plates_external = set(snapshot["plates_external"])
+        self._switches_held = set(snapshot["switches_held"])
         self._door_latched = dict(snapshot["door_latched"])
         self._door_timers = dict(snapshot["door_timers"])
         self._door_spent = set(snapshot.get("door_spent", ()))

@@ -8,7 +8,7 @@ ordering rather than a script:
    processed, compute which regions are still reachable with `e` **and every
    not-yet-processed gate** treated as closed. That set is the gate's
    *prerequisite zone*.
-3. Place whatever `e` needs -- a key, a lever, a pair of plates -- somewhere
+3. Place whatever `e` needs -- a key, a lever, a pair of levers -- somewhere
    inside that prerequisite zone, and only there.
 
 Because a gate's trigger always lives in territory that is open before the gate
@@ -16,9 +16,9 @@ is, the room is solvable by construction. That is a structural argument, not a
 solution: nothing here records an order of operations, and the validator
 re-derives solvability from scratch rather than trusting this stage.
 
-Cooperative pressure comes from the *kind* of gate chosen -- paired plates that
-must be held at the same instant, or a hold-lever that keeps a door open only
-while it is weighed down. The layout makes two agents useful; it never says how
+Cooperative pressure comes from the *kind* of gate chosen -- a pair of levers
+that must be held at the same instant, or a single hold-lever that keeps a door
+open only while it is weighed down. The layout makes two agents useful; it never says how
 they should coordinate.
 """
 
@@ -38,7 +38,6 @@ from ..entities import (
     LockedDoor,
     MovingPlatform,
     PlatformCycle,
-    PressurePlate,
     PushableBlock,
     ResetZone,
     Switch,
@@ -49,7 +48,6 @@ from ..requirements import (
     AlwaysOpen,
     CheckpointRequirement,
     KeyRequirement,
-    PlateRequirement,
     Requirement,
     SwitchRequirement,
     TriggerMode,
@@ -75,10 +73,10 @@ class GateKind(str, Enum):
     SWITCH = "switch"
     TIMED_SWITCH = "timed_switch"
     HOLD_SWITCH = "hold_switch"        # cooperative: someone must stay behind
-    PAIRED_PLATES = "paired_plates"    # cooperative: two plates, same instant
+    PAIRED_LEVERS = "paired_levers"    # cooperative: two hold-levers, same instant
 
 
-COOPERATIVE_GATES = frozenset({GateKind.HOLD_SWITCH, GateKind.PAIRED_PLATES})
+COOPERATIVE_GATES = frozenset({GateKind.HOLD_SWITCH, GateKind.PAIRED_LEVERS})
 
 
 @dataclass(slots=True)
@@ -208,14 +206,13 @@ def populate_mechanisms(
     budgets = _Budgets(
         keys=rng.derive("budget").in_range(config.num_keys),
         switches=rng.derive("budget").in_range(config.num_switches),
-        plates=rng.derive("budget").in_range(config.num_pressure_plates),
         cooperative=config.required_cooperative_actions,
     )
     if budgets.cooperative > 0 and config.exit_requires_both_agents:
-        # Hold-levers are unavailable in this mode, so paired plates are the only
-        # cooperative gate left. Guarantee enough plates to build one rather than
-        # silently under-delivering on required_cooperative_actions.
-        budgets.plates = max(budgets.plates, 2)
+        # Single hold-levers are unavailable in this mode, so paired levers are
+        # the only cooperative gate left. Guarantee enough levers to build one
+        # rather than silently under-delivering on required_cooperative_actions.
+        budgets.switches = max(budgets.switches, 2)
 
     entities: list[Entity] = []
     resolved: set[PortalKey] = set()
@@ -411,7 +408,6 @@ def _choose_gate_edges(
 class _Budgets:
     keys: int
     switches: int
-    plates: int
     cooperative: int
 
 
@@ -442,8 +438,8 @@ def _pick_gate_kind(
     """
     coop_possible: list[GateKind] = []
     if budgets.cooperative > 0:
-        if budgets.plates >= 2:
-            coop_possible.append(GateKind.PAIRED_PLATES)
+        if budgets.switches >= 2:
+            coop_possible.append(GateKind.PAIRED_LEVERS)
         already_split = any(r in hold_gated_regions for r in edge)
         # A hold-lever always strands one agent behind it, so it is off the
         # table when the room is meant to end with both of them at the exit.
@@ -555,21 +551,28 @@ def _install_gate(
         budgets.switches -= 1
         budgets.cooperative -= 1
 
-    elif kind is GateKind.PAIRED_PLATES:
+    elif kind is GateKind.PAIRED_LEVERS:
+        # Two hold-levers in different regions, wired to a latching door: both
+        # must be weighed down at the same instant, and once that happens the
+        # door stays open so neither agent is stranded behind it.
         tiles = placer.take_spread(available, 2)
         if len(tiles) < 2:
             return None
-        plate_ids = [counter.next("plate") for _ in tiles]
+        lever_ids = [counter.next("switch") for _ in tiles]
         group = f"pair_{edge[0]}_{edge[1]}"
-        for plate_id, tile in zip(plate_ids, tiles):
+        for lever_id, tile in zip(lever_ids, tiles):
             entities.append(
-                PressurePlate(
-                    id=plate_id, pos=tile, group=group, controls=tuple(door_ids)
+                Switch(
+                    id=lever_id,
+                    pos=tile,
+                    mode=SwitchMode.HOLD,
+                    group=group,
+                    controls=tuple(door_ids),
                 )
             )
-        trigger_ids.extend(plate_ids)
-        requirement = PlateRequirement(tuple(plate_ids), TriggerMode.SIMULTANEOUS)
-        budgets.plates -= 2
+        trigger_ids.extend(lever_ids)
+        requirement = SwitchRequirement(tuple(lever_ids), TriggerMode.SIMULTANEOUS)
+        budgets.switches -= 2
         budgets.cooperative -= 1
 
     else:  # pragma: no cover - exhaustive above

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..entities import AgentSpawn, EntityKind, LockedDoor, PressurePlate, Switch, SwitchMode
+from ..entities import AgentSpawn, EntityKind, LockedDoor, Switch, SwitchMode
 from ..room import Room
 from ..state import EpisodeState
 from ..tiles import Tile, glyph
@@ -76,9 +76,11 @@ def _glyph_for(entity, state: EpisodeState | None) -> str | None:
         # lowercase for hold-doors, so a door is never confused with its lever
         return "D" if entity.latching else "d"
     if isinstance(entity, Switch):
-        return "H" if entity.mode is SwitchMode.HOLD else "S"
-    if isinstance(entity, PressurePlate):
-        return "O" if entity.group.startswith("pair") else "o"
+        if entity.mode is not SwitchMode.HOLD:
+            return "S"
+        # paired levers get their own mark: they only work if held together.
+        # '&' echoes how a SIMULTANEOUS requirement prints itself.
+        return "&" if entity.group.startswith("pair") else "H"
     if entity.kind is EntityKind.KEY and state is not None:
         if state.is_key_collected(entity.id):
             return None
@@ -138,10 +140,13 @@ def _legend(room: Room) -> str:
         labels.append(("T", "timed door"))
     if EntityKind.SWITCH in kinds:
         labels.append(("S", "switch"))
-        if any(s.mode is SwitchMode.HOLD for s in room.switches):
+        if any(
+            s.mode is SwitchMode.HOLD and not s.group.startswith("pair")
+            for s in room.switches
+        ):
             labels.append(("H", "hold-lever"))
-    if EntityKind.PRESSURE_PLATE in kinds:
-        labels.append(("o/O", "plate / paired plate"))
+        if any(s.group.startswith("pair") for s in room.switches):
+            labels.append(("&", "paired lever (both held at once)"))
     if EntityKind.MOVING_PLATFORM in kinds:
         labels.append(("P", "moving platform"))
     if EntityKind.PUSHABLE_BLOCK in kinds:
@@ -171,10 +176,6 @@ def render_mechanism_report(room: Room) -> str:
         *(
             f"  switch {s.id} @ {tuple(s.pos)} [{s.mode.value}]"
             for s in room.switches
-        ),
-        *(
-            f"  plate {p.id} @ {tuple(p.pos)} group={p.group or '-'}"
-            for p in room.plates
         ),
     ]
     if triggers:

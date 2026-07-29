@@ -19,7 +19,7 @@ from helpers import (  # noqa: E402
     RIGHT_TILE,
     RIGHT_TILE_B,
     hold_switch_room,
-    paired_plate_room,
+    paired_lever_room,
     sealed_key_room,
     solvable_key_room,
     two_region_room,
@@ -28,7 +28,6 @@ from helpers import (  # noqa: E402
 from coop_env import GenerationConfig, RoomGenerator  # noqa: E402
 from coop_env.entities import (  # noqa: E402
     Key,
-    PressurePlate,
     PushableBlock,
     Switch,
     SwitchMode,
@@ -36,7 +35,6 @@ from coop_env.entities import (  # noqa: E402
 from coop_env.requirements import (  # noqa: E402
     CompositeRequirement,
     KeyRequirement,
-    PlateRequirement,
     SwitchRequirement,
     TriggerMode,
 )
@@ -124,8 +122,8 @@ class TestRejectsBadPlacement(unittest.TestCase):
 
 
 class TestCooperativeAnalysis(unittest.TestCase):
-    def test_paired_plates_are_flagged_as_cooperative(self):
-        room = paired_plate_room()
+    def test_paired_levers_are_flagged_as_cooperative(self):
+        room = paired_lever_room()
         report = validate_room(room)
         self.assertTrue(report.ok, report.report_lines())
         self.assertEqual(len(report.solvability.cooperative_clusters), 1)
@@ -162,27 +160,27 @@ class TestCooperativeAnalysis(unittest.TestCase):
         self.assertEqual(len(report.solvability.cooperative_clusters), 0)
         self.assertTrue(report.solvability.exit_jointly_reachable)
 
-    def test_paired_plate_room_still_lets_both_agents_through(self):
+    def test_paired_lever_room_still_lets_both_agents_through(self):
         """A latching co-op door stays open, so the pair is not split up."""
-        report = validate_room(paired_plate_room())
+        report = validate_room(paired_lever_room())
         self.assertTrue(report.solvability.exit_jointly_reachable)
 
-    def test_two_plates_out_of_reach_of_two_agents(self):
-        """Three simultaneous plates cannot be covered by two agent slots."""
+    def test_three_simultaneous_levers_exceed_two_agents(self):
+        """Three levers held at once cannot be covered by two agent slots."""
         room = two_region_room(
-            door_requirement=PlateRequirement(
-                ("plate_0", "plate_1", "plate_2"), TriggerMode.SIMULTANEOUS
+            door_requirement=SwitchRequirement(
+                ("switch_0", "switch_1", "switch_2"), TriggerMode.SIMULTANEOUS
             ),
             exit_requirement=KeyRequirement(("key_0",)),
             extra_entities=(
-                PressurePlate(id="plate_0", pos=LEFT_TILE, group="trio"),
-                PressurePlate(id="plate_1", pos=LEFT_TILE_B, group="trio"),
-                PressurePlate(id="plate_2", pos=Vec2(5, 5), group="trio"),
+                Switch(id="switch_0", pos=LEFT_TILE, mode=SwitchMode.HOLD, group="trio"),
+                Switch(id="switch_1", pos=LEFT_TILE_B, mode=SwitchMode.HOLD, group="trio"),
+                Switch(id="switch_2", pos=Vec2(5, 5), mode=SwitchMode.HOLD, group="trio"),
                 Key(id="key_0", pos=RIGHT_TILE, opens=("exit",)),
             ),
         )
         report = validate_room(room)
-        self.assertFalse(report.ok, "three simultaneous plates need three agents")
+        self.assertFalse(report.ok, "three simultaneous levers need three agents")
 
 
 class TestConnectivityModel(unittest.TestCase):

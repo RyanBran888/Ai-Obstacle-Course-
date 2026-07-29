@@ -42,7 +42,6 @@ from ..requirements import (
     CompositeRequirement,
     KeyRequirement,
     NeverOpen,
-    PlateRequirement,
     Requirement,
     SwitchRequirement,
     TriggerMode,
@@ -235,11 +234,8 @@ def _satisfiable(
         results = [_satisfiable(p, slots, reach, model) for p in requirement.parts]
         return any(results) if requirement.mode is TriggerMode.ANY else all(results)
 
-    if isinstance(requirement, PlateRequirement) and requirement.needs_simultaneity():
-        return _has_simultaneous_cover(requirement.plate_ids, slots, reach, model)
-
     if isinstance(
-        requirement, (KeyRequirement, SwitchRequirement, PlateRequirement, CheckpointRequirement)
+        requirement, (KeyRequirement, SwitchRequirement, CheckpointRequirement)
     ):
         ids = sorted(requirement.referenced_ids())
         mode = getattr(requirement, "mode", TriggerMode.ALL)

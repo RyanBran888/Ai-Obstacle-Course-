@@ -23,7 +23,6 @@ from ..entities import (
     Key,
     LockedDoor,
     MovingPlatform,
-    PressurePlate,
     PushableBlock,
     ResetZone,
     Switch,
@@ -134,7 +133,7 @@ def rule_exit(room: Room, model: ConnectivityModel) -> list[Issue]:
 def rule_entity_placement(room: Room, model: ConnectivityModel) -> list[Issue]:
     """Every object sits somewhere it makes sense."""
     issues: list[Issue] = []
-    floor_bound = (Key, Switch, PressurePlate, Checkpoint, PushableBlock, AgentSpawn, ExitDoor)
+    floor_bound = (Key, Switch, Checkpoint, PushableBlock, AgentSpawn, ExitDoor)
     for entity in room.entities:
         for tile in entity.footprint():
             if not room.terrain.in_bounds(tile):
@@ -170,7 +169,7 @@ def rule_entity_placement(room: Room, model: ConnectivityModel) -> list[Issue]:
 def rule_no_stacking(room: Room, model: ConnectivityModel) -> list[Issue]:
     """Interactive objects should not be piled onto the same tile."""
     issues: list[Issue] = []
-    exclusive = (Key, Switch, PressurePlate, LockedDoor, ExitDoor, AgentSpawn, PushableBlock)
+    exclusive = (Key, Switch, LockedDoor, ExitDoor, AgentSpawn, PushableBlock)
     seen: dict[Any, str] = {}
     for entity in room.entities:
         if not isinstance(entity, exclusive):

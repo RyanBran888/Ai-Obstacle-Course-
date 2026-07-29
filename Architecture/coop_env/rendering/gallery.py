@@ -97,7 +97,6 @@ def render_gallery(
             f"<b>doors</b> {counts.get('locked_door', 0)}",
             f"<b>keys</b> {counts.get('key', 0)}",
             f"<b>switches</b> {counts.get('switch', 0)}",
-            f"<b>plates</b> {counts.get('pressure_plate', 0)}",
             f"<b>platforms</b> {counts.get('moving_platform', 0)}",
             f"<b>attempts</b> {room.metadata.get('attempts', 1)}",
         ]

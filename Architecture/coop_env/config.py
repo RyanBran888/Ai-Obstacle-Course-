@@ -106,7 +106,6 @@ class GenerationConfig:
     num_keys: IntRange = (1, 3)
     num_locked_doors: IntRange = (1, 3)
     num_switches: IntRange = (1, 3)
-    num_pressure_plates: IntRange = (0, 2)
     num_moving_platforms: IntRange = (0, 2)
     num_pushable_blocks: IntRange = (0, 2)
     num_checkpoints: IntRange = (0, 2)
@@ -119,7 +118,7 @@ class GenerationConfig:
     exit_objective_count: int = 1
     """How many separate objectives the exit door demands."""
     required_cooperative_actions: int = 1
-    """Gates that structurally need two agents (held switch / paired plates)."""
+    """Gates that structurally need two agents (hold-lever, or paired levers)."""
     timed_door_probability: float = 0.15
     platform_bridge_probability: float = 0.35
     """Chance a region link is severed by a hazard gap and bridged by a platform."""
@@ -148,8 +147,7 @@ class GenerationConfig:
             "num_keys",
             "num_locked_doors",
             "num_switches",
-            "num_pressure_plates",
-            "num_moving_platforms",
+                "num_moving_platforms",
             "num_pushable_blocks",
             "num_checkpoints",
             "num_reset_zones",
@@ -256,7 +254,6 @@ class GenerationConfig:
             num_keys=_lerp_range((0, 1), (3, 5), t),
             num_locked_doors=_lerp_range((0, 1), (4, 6), t),
             num_switches=_lerp_range((0, 1), (3, 5), t),
-            num_pressure_plates=_lerp_range((0, 1), (2, 4), t),
             num_moving_platforms=_lerp_range((0, 1), (2, 4), t),
             num_pushable_blocks=_lerp_range((0, 1), (1, 3), t),
             num_checkpoints=_lerp_range((0, 0), (2, 3), t),

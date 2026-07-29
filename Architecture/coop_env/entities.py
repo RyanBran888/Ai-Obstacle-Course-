@@ -28,7 +28,8 @@ class EntityKind(IntEnum):
     KEY = 3
     LOCKED_DOOR = 4
     SWITCH = 5
-    PRESSURE_PLATE = 6
+    # 6 is retired (pressure plates). Values are stable for encoding, so the
+    # gap stays rather than renumbering everything below it.
     MOVING_PLATFORM = 7
     PUSHABLE_BLOCK = 8
     CHECKPOINT = 9
@@ -140,7 +141,11 @@ class ExitDoor(Entity):
 
 @dataclass(frozen=True, slots=True)
 class Switch(Entity):
-    """A lever. HOLD switches need continuous occupancy to stay active."""
+    """A lever. HOLD switches need continuous occupancy to stay active.
+
+    A pair of HOLD switches sharing a `group` behind a SIMULTANEOUS requirement
+    is the two-agent lock: both must be weighed down at the same instant.
+    """
 
     mode: SwitchMode = SwitchMode.TOGGLE
     group: str = ""
@@ -149,19 +154,6 @@ class Switch(Entity):
     @property
     def kind(self) -> EntityKind:
         return EntityKind.SWITCH
-
-
-@dataclass(frozen=True, slots=True)
-class PressurePlate(Entity):
-    """Active only while weighed down -- by a future agent or a pushable block."""
-
-    group: str = ""
-    controls: tuple[str, ...] = ()
-    accepts_block: bool = True
-
-    @property
-    def kind(self) -> EntityKind:
-        return EntityKind.PRESSURE_PLATE
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,7 +202,11 @@ class MovingPlatform(Entity):
 
 @dataclass(frozen=True, slots=True)
 class PushableBlock(Entity):
-    """A crate. The environment tracks where it is; nothing here decides to push it."""
+    """A crate. The environment tracks where it is; nothing here decides to push it.
+
+    Crates weigh down a HOLD switch, which is what lets one be parked on a lever
+    to free up an agent.
+    """
 
     heavy: bool = False
 

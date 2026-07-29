@@ -89,25 +89,25 @@ in `EpisodeState`:
 | `ExitDoor` | The objective. Opens when its requirement is met. |
 | `Key` | Portable token. May open more than one door (shared keys). |
 | `LockedDoor` | Blocks a doorway. Latching, hold-open, or timed. |
-| `Switch` | Lever. `TOGGLE`, `ONESHOT`, or `HOLD` (active only while weighed down). |
-| `PressurePlate` | Active while occupied — by an agent slot or a crate. |
+| `Switch` | Lever. `TOGGLE`, `ONESHOT`, or `HOLD` (active only while weighed down by an agent slot or a crate). |
 | `MovingPlatform` | Shuttles a fixed track; position is a pure function of the tick. |
-| `PushableBlock` | Crate. Can weigh down a plate. |
+| `PushableBlock` | Crate. Can weigh down a hold-lever, freeing an agent. |
 | `Checkpoint` | Progress marker; can feed a door requirement. |
 | `ResetZone` | Area that returns whatever enters it to a spawn or checkpoint. |
 | `TemporaryBridge` | Hazard tiles that phase solid on a fixed cycle. |
 
 Unlock conditions are declarative `Requirement` objects (`KeyRequirement`,
-`SwitchRequirement`, `PlateRequirement`, `CheckpointRequirement`,
-`CompositeRequirement`), combined with `ALL`, `ANY`, or `SIMULTANEOUS`.
+`SwitchRequirement`, `CheckpointRequirement`, `CompositeRequirement`), combined
+with `ALL`, `ANY`, or `SIMULTANEOUS`.
 
 ## How cooperation arises
 
 The generator never scripts a solution. It places mechanisms whose *structure*
 can make two agents useful, and lets the layout speak:
 
-- **Paired plates** — one door, two plates, `SIMULTANEOUS`. Both must be held at
-  the same instant, then the door latches open for good.
+- **Paired levers** — one door, two `HOLD` levers, `SIMULTANEOUS`. Both must be
+  weighed down at the same instant, then the door latches open for good. Toggle
+  switches would not work here: one agent could just flip them in sequence.
 - **Hold-levers** — a non-latching door that stays open only while its lever is
   weighed down. One slot holds, the other passes; the passage is one-way.
 - **Shared keys** — a single key gating two different doors.
@@ -134,8 +134,7 @@ GenerationConfig.preset("hard", hazard_density=0.02, num_keys=(4, 4))  # overrid
 Every parameter can also be set directly: `width`, `height`, `shape_weights`,
 `region_count`, `branching_factor`, `corridor_width`, `obstacle_density`,
 `hazard_density`, `hazard_weights`, `hazard_blob_size`, `num_keys`,
-`num_locked_doors`, `num_switches`, `num_pressure_plates`,
-`num_moving_platforms`, `num_pushable_blocks`, `num_checkpoints`,
+`num_locked_doors`, `num_switches`, `num_moving_platforms`, `num_pushable_blocks`, `num_checkpoints`,
 `num_reset_zones`, `num_temporary_bridges`, `puzzle_chain_length`,
 `exit_objective_count`, `required_cooperative_actions`,
 `timed_door_probability`, `platform_bridge_probability`,
@@ -240,7 +239,7 @@ Already in place for whoever builds that layer:
 - `Tile` / `EntityKind` — stable integer ids for encoding
 - `Room.spawns` — the two start tiles
 - `EpisodeState.is_walkable(pos)` — the movement rule a physics layer enforces
-- `EpisodeState.collect_key/set_switch/set_plate/place_block` — mechanism seams
+- `EpisodeState.collect_key/set_switch/place_block` — mechanism seams
 - `EpisodeState.snapshot()/restore()` — serialisable episode state
 - `EnvironmentSession.on_reset` — observer hook for a wrapper
 - `session.advance_time(n)` — clock only; platforms and timers, nobody moving

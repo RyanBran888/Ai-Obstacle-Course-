@@ -99,7 +99,7 @@ The generator roots the region graph at the spawn region and processes candidate
 gates **in order of increasing depth**. When it processes gate `e`, it computes
 which regions are still reachable from the spawn with `e` *and every
 not-yet-processed gate* treated as closed. That set is the gate's
-**prerequisite zone**, and the gate's trigger — key, lever, plate pair — is
+**prerequisite zone**, and the gate's trigger — key, lever, lever pair — is
 placed only inside it.
 
 Because a gate's trigger always lives in territory that opens before the gate
