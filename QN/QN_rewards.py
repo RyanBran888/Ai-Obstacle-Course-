@@ -18,6 +18,47 @@ def running_mean(values: list[float], window: int) -> list[float]:
     return out
 
 
+class LivePlot:
+    def __init__(self, cfg=None, window: int = 50, every: int = 10) -> None:
+        self.cfg = cfg
+        self.window = window
+        self.every = every
+        self.on = plt.get_backend().lower() != "agg"
+        if not self.on:
+            return
+
+        plt.ion()
+        self.fig, self.ax = plt.subplots(figsize=(9, 5))
+        (self.raw,) = self.ax.plot([], [], lw=0.6, alpha=0.30, color="#4c8dff",
+                                   label="episode return")
+        (self.mean,) = self.ax.plot([], [], lw=2.0, color="#12356b",
+                                    label=f"{window}-episode mean")
+        self.ax.axhline(0.0, lw=0.8, color="#999", ls=":")
+        self.ax.set_xlabel("episode")
+        self.ax.set_ylabel("return")
+        self.ax.set_title("Training reward (live)")
+        self.ax.grid(alpha=0.25)
+        self.ax.legend(loc="lower right", framealpha=0.9)
+        self.fig.tight_layout()
+        self.fig.show()
+
+    def update(self, history: list[float]) -> None:
+        if not self.on or not history or len(history) % self.every:
+            return
+        x = range(len(history))
+        self.raw.set_data(x, history)
+        self.mean.set_data(x, running_mean(history, self.window))
+        self.ax.relim()
+        self.ax.autoscale_view()
+        self.fig.canvas.draw_idle()
+        self.fig.canvas.flush_events()
+
+    def close(self) -> None:
+        if self.on:
+            plt.ioff()
+            plt.close(self.fig)
+
+
 def plot_rewards(
     history: list[float],
     cfg=None,

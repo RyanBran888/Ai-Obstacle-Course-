@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 VIEW = 5
-CHANNELS = 8
+CHANNELS = 7
 GLOBALS = 16
 OBS_DIM = VIEW * VIEW * CHANNELS + GLOBALS
 

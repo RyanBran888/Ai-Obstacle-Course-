@@ -6,8 +6,9 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
+from env_bridge import CoopEnvBridge, GenerationConfig
 from QN_model import HIDDEN, N_ACTIONS, OBS_DIM, QNetwork
-from QN_rewards import plot_rewards
+from QN_rewards import LivePlot, plot_rewards
 
 N_AGENTS = 2
 
@@ -98,7 +99,7 @@ def build_agents(n: int = N_AGENTS, **kwargs) -> list[Agent]:
     return [Agent(**kwargs) for _ in range(n)]
 
 
-def train(env, cfg: Config | None = None):
+def train(env, cfg: Config | None = None, live: bool = False):
     cfg = cfg or Config()
     random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
@@ -114,6 +115,7 @@ def train(env, cfg: Config | None = None):
 
     history: list[float] = []
     steps = 0
+    plot = LivePlot(cfg) if live else None
 
     for episode in range(cfg.episodes):
         obs = env.reset()
@@ -139,63 +141,21 @@ def train(env, cfg: Config | None = None):
                 break
 
         history.append(total)
+        if plot is not None:
+            plot.update(history)
 
+    if plot is not None:
+        plot.close()
     return agents, history
 
 
-# Temporary training target
-# A small grid the two agents share
-
-MOVES = ((0, -1), (1, 0), (0, 1), (-1, 0))
-
-
-class ToyGrid:
-    obs_dim = 4
-    n_actions = N_ACTIONS
-
-    def __init__(self, size: int = 8, max_steps: int = 200) -> None:
-        self.size = size
-        self.max_steps = max_steps
-        self.goal = (size // 2, size // 2)
-        self.pos: list[tuple[int, int]] = []
-        self.steps = 0
-
-    def reset(self) -> list[list[float]]:
-        self.pos = [
-            (random.randrange(self.size), random.randrange(self.size))
-            for _ in range(N_AGENTS)
-        ]
-        self.steps = 0
-        return [self._obs(i) for i in range(N_AGENTS)]
-
-    def step(self, actions: list[int]):
-        for i, action in enumerate(actions):
-            if action >= 8:
-                continue
-            dx, dy = MOVES[action % 4]
-            far = 2 if action >= 4 else 1
-            x, y = self.pos[i]
-            x = max(0, min(self.size - 1, x + dx * far))
-            y = max(0, min(self.size - 1, y + dy * far))
-            self.pos[i] = (x, y)
-
-        self.steps += 1
-        done = any(p == self.goal for p in self.pos)
-        cut = not done and self.steps >= self.max_steps
-        reward = 1.0 if done else -0.01
-        return [self._obs(i) for i in range(N_AGENTS)], [reward] * N_AGENTS, done, cut, {}
-
-    def _obs(self, i: int) -> list[float]:
-        x, y = self.pos[i]
-        return [
-            (self.goal[0] - x) / self.size,
-            (self.goal[1] - y) / self.size,
-            x / self.size,
-            y / self.size,
-        ]
-
-
 if __name__ == "__main__":
-    cfg = Config(episodes=1500, eps_decay=600)
-    agents, history = train(ToyGrid(), cfg)
+    cfg = Config(episodes=2000, eps_decay=800, max_steps=200)
+    env = CoopEnvBridge(
+        GenerationConfig.preset("easy"), seed=0, max_steps=cfg.max_steps
+    )
+    agents, history = train(env, cfg, live=True)
+
+    for i, a in enumerate(agents):
+        a.save(f"agent{i}.pt")
     plot_rewards(history, cfg)
