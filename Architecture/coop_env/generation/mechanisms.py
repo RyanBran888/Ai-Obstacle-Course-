@@ -1,0 +1,870 @@
+"""Stage 6: install mechanisms onto the region graph.
+
+This is where a floor plan becomes a puzzle. The method is a dependency
+ordering rather than a script:
+
+1. Root the region graph at the spawn region and walk its edges outward.
+2. Process candidate gates in order of increasing depth. When gate `e` is
+   processed, compute which regions are still reachable with `e` **and every
+   not-yet-processed gate** treated as closed. That set is the gate's
+   *prerequisite zone*.
+3. Place whatever `e` needs -- a key, a lever, a pair of plates -- somewhere
+   inside that prerequisite zone, and only there.
+
+Because a gate's trigger always lives in territory that is open before the gate
+is, the room is solvable by construction. That is a structural argument, not a
+solution: nothing here records an order of operations, and the validator
+re-derives solvability from scratch rather than trusting this stage.
+
+Cooperative pressure comes from the *kind* of gate chosen -- paired plates that
+must be held at the same instant, or a hold-lever that keeps a door open only
+while it is weighed down. The layout makes two agents useful; it never says how
+they should coordinate.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field, replace
+from enum import Enum
+from typing import Any, Iterable, Sequence
+
+from ..config import GenerationConfig
+from ..entities import (
+    AgentSpawn,
+    Checkpoint,
+    Entity,
+    ExitDoor,
+    Key,
+    LockedDoor,
+    MovingPlatform,
+    PlatformCycle,
+    PressurePlate,
+    PushableBlock,
+    ResetZone,
+    Switch,
+    SwitchMode,
+    TemporaryBridge,
+)
+from ..requirements import (
+    AlwaysOpen,
+    CheckpointRequirement,
+    KeyRequirement,
+    PlateRequirement,
+    Requirement,
+    SwitchRequirement,
+    TriggerMode,
+    combine,
+)
+from ..rng import SeededRandom
+from ..room import PortalKey
+from ..tiles import Tile, is_hazard
+from ..utils.geometry import Rect, Vec2
+from ..utils.grid import Grid, distance_field
+from .layout import Layout
+from .terrain import Decoration
+from .topology import Topology
+
+KEY_COLORS = ("gold", "azure", "crimson", "emerald", "violet", "amber")
+
+
+class GateKind(str, Enum):
+    """The mechanism styles a locked edge can use."""
+
+    KEY = "key"
+    SHARED_KEY = "shared_key"          # reuses a key an earlier door already needs
+    SWITCH = "switch"
+    TIMED_SWITCH = "timed_switch"
+    HOLD_SWITCH = "hold_switch"        # cooperative: someone must stay behind
+    PAIRED_PLATES = "paired_plates"    # cooperative: two plates, same instant
+
+
+COOPERATIVE_GATES = frozenset({GateKind.HOLD_SWITCH, GateKind.PAIRED_PLATES})
+
+
+@dataclass(slots=True)
+class GateRecord:
+    """Bookkeeping for one locked edge -- reporting and rendering only."""
+
+    edge: PortalKey
+    kind: GateKind
+    door_ids: tuple[str, ...]
+    trigger_ids: tuple[str, ...]
+    prerequisite_regions: tuple[int, ...]
+    depth: int
+
+
+@dataclass(slots=True)
+class MechanismResult:
+    entities: list[Entity] = field(default_factory=list)
+    spawn_regions: tuple[int, ...] = ()
+    exit_region: int = 0
+    depths: dict[int, int] = field(default_factory=dict)
+    gates: list[GateRecord] = field(default_factory=list)
+    stats: dict[str, Any] = field(default_factory=dict)
+
+
+class _Placer:
+    """Hands out floor tiles, never the same one twice."""
+
+    def __init__(self, terrain: Grid, topology: Topology, rng: SeededRandom) -> None:
+        self.terrain = terrain
+        self.topology = topology
+        self.rng = rng
+        self.reserved: set[Vec2] = set()
+        for tiles in topology.portals.values():
+            self.reserved.update(tiles)
+            for tile in tiles:
+                self.reserved.update(tile.neighbors4())
+        for track in topology.platform_links.values():
+            self.reserved.update(track.path)
+            self.reserved.add(track.dock_a)
+            self.reserved.add(track.dock_b)
+
+    def free_tiles(self, region_ids: Iterable[int]) -> list[Vec2]:
+        out: list[Vec2] = []
+        for rid in sorted(set(region_ids)):
+            region = self.topology.regions.get(rid)
+            if region is None:
+                continue
+            for tile in region.sorted_tiles():
+                if tile in self.reserved:
+                    continue
+                if self.terrain[tile] != Tile.FLOOR:
+                    continue
+                out.append(tile)
+        return out
+
+    def take(self, region_ids: Iterable[int]) -> Vec2 | None:
+        options = self.free_tiles(region_ids)
+        if not options:
+            return None
+        pick = self.rng.choice(options)
+        self.reserved.add(pick)
+        return pick
+
+    def take_spread(self, region_ids: Sequence[int], count: int) -> list[Vec2]:
+        """Take `count` tiles, preferring one per region so triggers sit apart."""
+        picks: list[Vec2] = []
+        regions = [r for r in region_ids if self.free_tiles([r])]
+        regions = self.rng.shuffled(regions)
+        for rid in regions:
+            if len(picks) >= count:
+                break
+            tile = self.take([rid])
+            if tile is not None:
+                picks.append(tile)
+        while len(picks) < count:
+            tile = self.take(region_ids)
+            if tile is None:
+                break
+            picks.append(tile)
+        return picks
+
+    def take_far_from(self, region_ids: Iterable[int], anchors: Sequence[Vec2]) -> Vec2 | None:
+        """Take the free tile furthest (by step count) from `anchors`.
+
+        This is a static spread measurement over the finished map, used to keep
+        the exit away from the spawn. It moves nothing.
+        """
+        options = self.free_tiles(region_ids)
+        if not options:
+            return None
+        if not anchors:
+            return self.take(region_ids)
+        walkable = lambda p: self.terrain.in_bounds(p) and self.terrain[p] in (
+            Tile.FLOOR,
+        )
+        field_map = distance_field(anchors, walkable, self.terrain.bounds)
+        scored = sorted(
+            options, key=lambda p: (-field_map.get(p, -1), p[1], p[0])
+        )
+        top = scored[: max(1, len(scored) // 6)]
+        pick = self.rng.choice(top)
+        self.reserved.add(pick)
+        return pick
+
+
+def populate_mechanisms(
+    layout: Layout,
+    topology: Topology,
+    decoration: Decoration,
+    config: GenerationConfig,
+    rng: SeededRandom,
+) -> MechanismResult:
+    """Place spawns, gates, triggers, the exit, and the optional extras."""
+    result = MechanismResult()
+    if not topology.regions:
+        return result
+
+    placer = _Placer(layout.terrain, topology, rng.derive("placement"))
+    counter = _IdCounter()
+
+    spawn_region = _choose_spawn_region(topology, rng.derive("spawn"))
+    depths = topology.graph.depths(spawn_region)
+    result.depths = depths
+
+    gate_edges = _choose_gate_edges(topology, spawn_region, depths, config, rng.derive("gates"))
+
+    budgets = _Budgets(
+        keys=rng.derive("budget").in_range(config.num_keys),
+        switches=rng.derive("budget").in_range(config.num_switches),
+        plates=rng.derive("budget").in_range(config.num_pressure_plates),
+        cooperative=config.required_cooperative_actions,
+    )
+    if budgets.cooperative > 0 and config.exit_requires_both_agents:
+        # Hold-levers are unavailable in this mode, so paired plates are the only
+        # cooperative gate left. Guarantee enough plates to build one rather than
+        # silently under-delivering on required_cooperative_actions.
+        budgets.plates = max(budgets.plates, 2)
+
+    entities: list[Entity] = []
+    resolved: set[PortalKey] = set()
+    unresolved = set(gate_edges)
+    hold_gated_regions: set[int] = set()
+
+    for edge in gate_edges:
+        available = topology.graph.reachable_from(spawn_region, blocked_edges=unresolved)
+        if not available:
+            continue
+        # A key already sitting in unlocked territory can gate a second door --
+        # the "shared resource" case, where one token matters in two places.
+        reusable_keys = [
+            entity
+            for entity in entities
+            if isinstance(entity, Key)
+            and topology.tile_region.get(entity.pos) in available
+        ]
+        kind = _pick_gate_kind(
+            budgets,
+            config,
+            edge,
+            depths,
+            hold_gated_regions,
+            bool(reusable_keys),
+            rng.derive("gate_kind"),
+        )
+        if kind is None:
+            continue
+        record = _install_gate(
+            kind=kind,
+            edge=edge,
+            available=sorted(available),
+            reusable_keys=reusable_keys,
+            topology=topology,
+            layout=layout,
+            placer=placer,
+            counter=counter,
+            budgets=budgets,
+            config=config,
+            rng=rng.derive(f"gate_{edge[0]}_{edge[1]}"),
+            entities=entities,
+            depth=max(depths.get(edge[0], 0), depths.get(edge[1], 0)),
+        )
+        if record is None:
+            continue
+        result.gates.append(record)
+        resolved.add(edge)
+        unresolved.discard(edge)
+        if kind is GateKind.HOLD_SWITCH:
+            # everything past a hold-gate is one-way for a single agent
+            beyond = set(topology.graph.nodes) - set(available)
+            hold_gated_regions.update(beyond)
+
+    # Regions we could not gate stay open; drop them from the blocked set.
+    unresolved.clear()
+
+    exit_region = _choose_exit_region(topology, spawn_region, depths, resolved, placer)
+    result.exit_region = exit_region
+
+    spawn_zone = topology.graph.reachable_from(spawn_region, blocked_edges=resolved)
+    result.spawn_regions = _place_spawns(
+        spawn_zone, spawn_region, placer, config, rng.derive("spawn_tiles"), entities
+    )
+
+    _place_exit(
+        exit_region=exit_region,
+        all_regions=sorted(topology.regions),
+        spawn_tiles=[e.pos for e in entities if isinstance(e, AgentSpawn)],
+        placer=placer,
+        counter=counter,
+        budgets=budgets,
+        config=config,
+        rng=rng.derive("exit"),
+        entities=entities,
+        result=result,
+    )
+
+    _place_platforms(topology, decoration, counter, rng.derive("platform_entities"), entities)
+    _place_extras(
+        layout, topology, config, placer, counter, rng.derive("extras"), entities, result
+    )
+
+    result.entities = entities
+    result.stats.update(
+        {
+            "spawn_region": spawn_region,
+            "gate_count": len(result.gates),
+            "cooperative_gates": sum(
+                1 for g in result.gates if g.kind in COOPERATIVE_GATES
+            ),
+            "chain_depth": max((g.depth for g in result.gates), default=0),
+        }
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# region selection
+# ---------------------------------------------------------------------------
+
+
+def _choose_spawn_region(topology: Topology, rng: SeededRandom) -> int:
+    """Prefer a dead-end region so the room unfolds away from the start."""
+    regions = sorted(topology.regions)
+    if not regions:
+        return 0
+    leaves = [r for r in regions if topology.graph.degree(r) == 1 and len(topology.regions[r].tiles) >= 4]
+    pool = leaves or [r for r in regions if len(topology.regions[r].tiles) >= 4] or regions
+    return rng.choice(pool)
+
+
+def _choose_exit_region(
+    topology: Topology,
+    spawn_region: int,
+    depths: dict[int, int],
+    gated: set[PortalKey],
+    placer: _Placer,
+) -> int:
+    """Deepest region that still has somewhere to put the exit door."""
+    candidates = [
+        rid
+        for rid in sorted(topology.regions)
+        if placer.free_tiles([rid])
+    ]
+    if not candidates:
+        return spawn_region
+    behind_gate = {rid for edge in gated for rid in edge}
+    candidates.sort(
+        key=lambda rid: (
+            -depths.get(rid, 0),
+            -(1 if rid in behind_gate else 0),
+            -len(topology.regions[rid].tiles),
+            rid,
+        )
+    )
+    return candidates[0]
+
+
+def _choose_gate_edges(
+    topology: Topology,
+    spawn_region: int,
+    depths: dict[int, int],
+    config: GenerationConfig,
+    rng: SeededRandom,
+) -> list[PortalKey]:
+    """Pick which region links become locked, shallowest first.
+
+    Edges on the spawn-to-deepest-region route are favoured, because gating
+    them in sequence is what produces a multi-step chain rather than several
+    independent one-step locks.
+    """
+    tree = topology.graph.bfs_tree(spawn_region)
+    tree_edges: list[PortalKey] = []
+    for child, parent in sorted(tree.items()):
+        if parent is None:
+            continue
+        key = (child, parent) if child <= parent else (parent, child)
+        if key in topology.portals and key not in topology.platform_links:
+            tree_edges.append(key)
+
+    if not tree_edges:
+        return []
+
+    deepest = max(depths, key=lambda r: (depths[r], r))
+    critical = set()
+    for node in topology.graph.path_to_root(deepest, tree):
+        parent = tree.get(node)
+        if parent is not None:
+            key = (node, parent) if node <= parent else (parent, node)
+            critical.add(key)
+
+    def sort_key(edge: PortalKey) -> tuple[int, int, int, int]:
+        depth = max(depths.get(edge[0], 0), depths.get(edge[1], 0))
+        return (0 if edge in critical else 1, depth, edge[0], edge[1])
+
+    ordered = sorted(set(tree_edges), key=sort_key)
+    wanted = rng.in_range(config.num_locked_doors)
+    wanted = min(wanted, len(ordered))
+    if config.puzzle_chain_length > 0:
+        wanted = max(wanted, min(config.puzzle_chain_length, len(ordered)))
+        wanted = min(wanted, config.num_locked_doors[1], len(ordered))
+    chosen = ordered[:wanted]
+    return sorted(chosen, key=lambda e: (max(depths.get(e[0], 0), depths.get(e[1], 0)), e))
+
+
+# ---------------------------------------------------------------------------
+# gate installation
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class _Budgets:
+    keys: int
+    switches: int
+    plates: int
+    cooperative: int
+
+
+class _IdCounter:
+    def __init__(self) -> None:
+        self._counts: dict[str, int] = {}
+
+    def next(self, prefix: str) -> str:
+        index = self._counts.get(prefix, 0)
+        self._counts[prefix] = index + 1
+        return f"{prefix}_{index}"
+
+
+def _pick_gate_kind(
+    budgets: _Budgets,
+    config: GenerationConfig,
+    edge: PortalKey,
+    depths: dict[int, int],
+    hold_gated_regions: set[int],
+    reusable_keys: bool,
+    rng: SeededRandom,
+) -> GateKind | None:
+    """Choose a mechanism style this gate can afford.
+
+    Cooperative styles are spent first while the budget lasts. A hold-lever is
+    refused past another hold-lever: with only two agents, a second one would
+    leave nobody free to move on.
+    """
+    coop_possible: list[GateKind] = []
+    if budgets.cooperative > 0:
+        if budgets.plates >= 2:
+            coop_possible.append(GateKind.PAIRED_PLATES)
+        already_split = any(r in hold_gated_regions for r in edge)
+        # A hold-lever always strands one agent behind it, so it is off the
+        # table when the room is meant to end with both of them at the exit.
+        if (
+            budgets.switches >= 1
+            and not already_split
+            and not config.exit_requires_both_agents
+        ):
+            coop_possible.append(GateKind.HOLD_SWITCH)
+    if coop_possible:
+        return rng.choice(coop_possible)
+
+    plain: list[GateKind] = []
+    if budgets.keys >= 1:
+        plain.append(GateKind.KEY)
+    if budgets.switches >= 1:
+        plain.append(GateKind.SWITCH)
+        if rng.chance(config.timed_door_probability):
+            plain.append(GateKind.TIMED_SWITCH)
+    if reusable_keys:
+        # Costs no budget, which is also what makes it the fallback when the
+        # mechanism budget is spent but there are still links worth locking.
+        plain.append(GateKind.SHARED_KEY)
+    if not plain:
+        return None
+    return rng.choice(plain)
+
+
+def _install_gate(
+    kind: GateKind,
+    edge: PortalKey,
+    available: list[int],
+    reusable_keys: list[Key],
+    topology: Topology,
+    layout: Layout,
+    placer: _Placer,
+    counter: _IdCounter,
+    budgets: _Budgets,
+    config: GenerationConfig,
+    rng: SeededRandom,
+    entities: list[Entity],
+    depth: int,
+) -> GateRecord | None:
+    """Create the door(s) for `edge` and the trigger(s) inside `available`."""
+    portal_tiles = topology.portals.get(edge, ())
+    if not portal_tiles:
+        return None
+
+    door_ids = [counter.next("door") for _ in portal_tiles]
+    trigger_ids: list[str] = []
+    requirement: Requirement
+    latching = True
+    timer: int | None = None
+
+    if kind is GateKind.KEY:
+        tile = placer.take(available)
+        if tile is None:
+            return None
+        key_id = counter.next("key")
+        color = KEY_COLORS[len(trigger_ids) % len(KEY_COLORS)]
+        entities.append(Key(id=key_id, pos=tile, color=color, opens=tuple(door_ids)))
+        trigger_ids.append(key_id)
+        requirement = KeyRequirement((key_id,))
+        budgets.keys -= 1
+
+    elif kind is GateKind.SHARED_KEY:
+        if not reusable_keys:
+            return None
+        existing = rng.choice(sorted(reusable_keys, key=lambda k: k.id))
+        # record the extra doors on the key itself, so the blueprint stays honest
+        entities[entities.index(existing)] = replace(
+            existing, opens=existing.opens + tuple(door_ids)
+        )
+        trigger_ids.append(existing.id)
+        requirement = KeyRequirement((existing.id,))
+
+    elif kind in (GateKind.SWITCH, GateKind.TIMED_SWITCH):
+        tile = placer.take(available)
+        if tile is None:
+            return None
+        switch_id = counter.next("switch")
+        mode = SwitchMode.ONESHOT if kind is GateKind.TIMED_SWITCH else SwitchMode.TOGGLE
+        entities.append(
+            Switch(id=switch_id, pos=tile, mode=mode, controls=tuple(door_ids))
+        )
+        trigger_ids.append(switch_id)
+        requirement = SwitchRequirement((switch_id,))
+        budgets.switches -= 1
+        if kind is GateKind.TIMED_SWITCH:
+            timer = rng.randint(18, 44)
+
+    elif kind is GateKind.HOLD_SWITCH:
+        tile = placer.take(available)
+        if tile is None:
+            return None
+        switch_id = counter.next("switch")
+        entities.append(
+            Switch(
+                id=switch_id,
+                pos=tile,
+                mode=SwitchMode.HOLD,
+                group="hold",
+                controls=tuple(door_ids),
+            )
+        )
+        trigger_ids.append(switch_id)
+        requirement = SwitchRequirement((switch_id,))
+        latching = False  # closes the moment the lever is released
+        budgets.switches -= 1
+        budgets.cooperative -= 1
+
+    elif kind is GateKind.PAIRED_PLATES:
+        tiles = placer.take_spread(available, 2)
+        if len(tiles) < 2:
+            return None
+        plate_ids = [counter.next("plate") for _ in tiles]
+        group = f"pair_{edge[0]}_{edge[1]}"
+        for plate_id, tile in zip(plate_ids, tiles):
+            entities.append(
+                PressurePlate(
+                    id=plate_id, pos=tile, group=group, controls=tuple(door_ids)
+                )
+            )
+        trigger_ids.extend(plate_ids)
+        requirement = PlateRequirement(tuple(plate_ids), TriggerMode.SIMULTANEOUS)
+        budgets.plates -= 2
+        budgets.cooperative -= 1
+
+    else:  # pragma: no cover - exhaustive above
+        return None
+
+    for door_id, tile in zip(door_ids, portal_tiles):
+        candidate = layout.doorways.get(tile)
+        entities.append(
+            LockedDoor(
+                id=door_id,
+                pos=tile,
+                requirement=requirement,
+                latching=latching,
+                timer=timer,
+                horizontal=bool(candidate and not candidate.vertical),
+                region_a=edge[0],
+                region_b=edge[1],
+            )
+        )
+
+    return GateRecord(
+        edge=edge,
+        kind=kind,
+        door_ids=tuple(door_ids),
+        trigger_ids=tuple(trigger_ids),
+        prerequisite_regions=tuple(available),
+        depth=depth,
+    )
+
+
+# ---------------------------------------------------------------------------
+# spawns, exit, extras
+# ---------------------------------------------------------------------------
+
+
+def _place_spawns(
+    spawn_zone: set[int],
+    spawn_region: int,
+    placer: _Placer,
+    config: GenerationConfig,
+    rng: SeededRandom,
+    entities: list[Entity],
+) -> tuple[int, ...]:
+    """Reserve two start tiles inside the initially-open zone.
+
+    Both spawns sit in territory that is open before any gate, so neither agent
+    starts sealed away from the other. They may still be in different regions
+    of that zone -- separate routes that reconnect later.
+    """
+    zone = sorted(spawn_zone) or [spawn_region]
+    regions_with_space = [r for r in zone if placer.free_tiles([r])]
+    if not regions_with_space:
+        regions_with_space = zone
+
+    chosen_regions: list[int] = []
+    if len(regions_with_space) >= 2 and rng.chance(config.separate_spawns_probability):
+        chosen_regions = rng.sample(regions_with_space, 2)
+    else:
+        home = spawn_region if spawn_region in regions_with_space else regions_with_space[0]
+        chosen_regions = [home, home]
+
+    placed: list[int] = []
+    for index, rid in enumerate(chosen_regions):
+        tile = placer.take([rid])
+        if tile is None:
+            tile = placer.take(regions_with_space)
+        if tile is None:
+            continue
+        entities.append(AgentSpawn(id=f"spawn_{index}", pos=tile, index=index))
+        placed.append(rid)
+    return tuple(placed)
+
+
+def _place_exit(
+    exit_region: int,
+    all_regions: list[int],
+    spawn_tiles: list[Vec2],
+    placer: _Placer,
+    counter: _IdCounter,
+    budgets: _Budgets,
+    config: GenerationConfig,
+    rng: SeededRandom,
+    entities: list[Entity],
+    result: MechanismResult,
+) -> None:
+    """Install the exit and the objectives that unlock it."""
+    tile = placer.take_far_from([exit_region], spawn_tiles)
+    if tile is None:
+        tile = placer.take(all_regions)
+    if tile is None:
+        return
+
+    parts: list[Requirement] = []
+    objective_ids: list[str] = []
+    wanted = max(0, config.exit_objective_count)
+
+    for _ in range(wanted):
+        style = _pick_objective_style(budgets, rng)
+        target = placer.take(all_regions)
+        if target is None:
+            break
+        if style == "key":
+            key_id = counter.next("key")
+            color = KEY_COLORS[len(objective_ids) % len(KEY_COLORS)]
+            entities.append(Key(id=key_id, pos=target, color=color, opens=("exit",)))
+            parts.append(KeyRequirement((key_id,)))
+            objective_ids.append(key_id)
+            budgets.keys -= 1
+        elif style == "switch":
+            switch_id = counter.next("switch")
+            entities.append(
+                Switch(id=switch_id, pos=target, mode=SwitchMode.ONESHOT, controls=("exit",))
+            )
+            parts.append(SwitchRequirement((switch_id,)))
+            objective_ids.append(switch_id)
+            budgets.switches -= 1
+        else:
+            checkpoint_id = counter.next("checkpoint")
+            entities.append(
+                Checkpoint(id=checkpoint_id, pos=target, order=len(objective_ids), group="exit")
+            )
+            parts.append(CheckpointRequirement((checkpoint_id,)))
+            objective_ids.append(checkpoint_id)
+
+    requirement = combine(parts, TriggerMode.ALL) if parts else AlwaysOpen()
+    entities.append(ExitDoor(id="exit", pos=tile, requirement=requirement))
+    result.stats["exit_objectives"] = tuple(objective_ids)
+
+
+def _pick_objective_style(budgets: _Budgets, rng: SeededRandom) -> str:
+    """Exit objectives may overdraw the scatter budget -- the exit comes first."""
+    options: list[str] = []
+    if budgets.keys > 0:
+        options.append("key")
+    if budgets.switches > 0:
+        options.append("switch")
+    options.append("checkpoint")
+    if not options:
+        return "key"
+    return rng.choice(options)
+
+
+def _place_platforms(
+    topology: Topology,
+    decoration: Decoration,
+    counter: _IdCounter,
+    rng: SeededRandom,
+    entities: list[Entity],
+) -> None:
+    for track in decoration.tracks:
+        if len(track.path) < 1:
+            continue
+        entities.append(
+            MovingPlatform(
+                id=counter.next("platform"),
+                pos=track.path[0],
+                path=tuple(track.path),
+                ticks_per_step=rng.randint(2, 4),
+                phase=rng.randint(0, max(1, len(track.path) - 1)),
+                cycle=PlatformCycle.PINGPONG,
+            )
+        )
+
+
+def _place_extras(
+    layout: Layout,
+    topology: Topology,
+    config: GenerationConfig,
+    placer: _Placer,
+    counter: _IdCounter,
+    rng: SeededRandom,
+    entities: list[Entity],
+    result: MechanismResult,
+) -> None:
+    """Optional objects: crates, checkpoints, reset zones, temporary bridges.
+
+    None of these gate progress, so they can be scattered freely once the
+    solvable skeleton exists.
+    """
+    regions = sorted(topology.regions)
+
+    # Crates count as solid to the validator, so one dropped in a one-tile
+    # corridor could wall off a region. Keeping them in open ground avoids that
+    # and puts them somewhere they can actually be pushed around.
+    for _ in range(rng.in_range(config.num_pushable_blocks)):
+        tile = _take_open_tile(layout.terrain, placer, regions, rng)
+        if tile is None:
+            break
+        entities.append(PushableBlock(id=counter.next("block"), pos=tile))
+
+    for index in range(rng.in_range(config.num_checkpoints)):
+        tile = placer.take(regions)
+        if tile is None:
+            break
+        entities.append(
+            Checkpoint(id=counter.next("checkpoint"), pos=tile, order=index, group="route")
+        )
+
+    for _ in range(rng.in_range(config.num_reset_zones)):
+        zone = _find_reset_zone(layout.terrain, placer, rng)
+        if zone is None:
+            break
+        entities.append(
+            ResetZone(id=counter.next("reset"), pos=Vec2(zone.x, zone.y), rect=zone)
+        )
+
+    used_bridge_tiles: set[Vec2] = set()
+    for entity in entities:
+        if isinstance(entity, MovingPlatform):
+            used_bridge_tiles.update(entity.path)
+    for _ in range(rng.in_range(config.num_temporary_bridges)):
+        run = _find_bridge_run(layout.terrain, used_bridge_tiles, rng)
+        if not run:
+            break
+        used_bridge_tiles.update(run)
+        period = rng.randint(10, 20)
+        entities.append(
+            TemporaryBridge(
+                id=counter.next("bridge"),
+                pos=run[0],
+                tiles=tuple(run),
+                period=period,
+                on_ticks=max(3, period // 2),
+                phase=rng.randint(0, period - 1),
+            )
+        )
+
+
+def _take_open_tile(
+    terrain: Grid, placer: _Placer, regions: list[int], rng: SeededRandom
+) -> Vec2 | None:
+    """Claim a free tile that has open floor on at least three sides."""
+    options = [
+        tile
+        for tile in placer.free_tiles(regions)
+        if sum(1 for n in tile.neighbors4() if terrain.get(n, Tile.VOID) == Tile.FLOOR) >= 3
+    ]
+    if not options:
+        return placer.take(regions)
+    pick = rng.choice(options)
+    placer.reserved.add(pick)
+    return pick
+
+
+def _find_reset_zone(terrain: Grid, placer: _Placer, rng: SeededRandom) -> Rect | None:
+    """A small patch of floor next to a hazard, used as a 'sent back' area."""
+    options = [
+        p
+        for p in terrain.positions()
+        if terrain[p] == Tile.FLOOR
+        and p not in placer.reserved
+        and any(is_hazard(terrain.get(n, Tile.VOID)) for n in terrain.neighbors4(p))
+    ]
+    if not options:
+        options = [
+            p for p in terrain.positions() if terrain[p] == Tile.FLOOR and p not in placer.reserved
+        ]
+    if not options:
+        return None
+    origin = rng.choice(options)
+    for size in ((2, 2), (2, 1), (1, 2), (1, 1)):
+        rect = Rect(origin[0], origin[1], size[0], size[1])
+        tiles = list(rect.positions())
+        if all(
+            terrain.get(t, Tile.VOID) == Tile.FLOOR and t not in placer.reserved
+            for t in tiles
+        ):
+            placer.reserved.update(tiles)
+            return rect
+    return None
+
+
+def _find_bridge_run(
+    terrain: Grid, used: set[Vec2], rng: SeededRandom
+) -> list[Vec2]:
+    """A straight hazard run that a temporary bridge can phase across."""
+    hazards = [
+        p
+        for p in terrain.positions()
+        if is_hazard(terrain[p]) and p not in used
+    ]
+    if not hazards:
+        return []
+    for seed in rng.shuffled(hazards)[:24]:
+        for direction in (Vec2(1, 0), Vec2(0, 1)):
+            run = [seed]
+            cursor = seed + direction
+            while (
+                terrain.in_bounds(cursor)
+                and is_hazard(terrain[cursor])
+                and cursor not in used
+                and len(run) < 5
+            ):
+                run.append(cursor)
+                cursor = cursor + direction
+            if len(run) >= 2:
+                return run
+    return []
