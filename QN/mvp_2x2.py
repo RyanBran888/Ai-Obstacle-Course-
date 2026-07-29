@@ -1,9 +1,4 @@
-"""Minimum viable proof that the Q-learning stack actually learns.
-
-A 2x2 room, walled, both agents spawned in it, exit already open. No keys, no
-doors, no hazards. The only thing to learn is "walk to the exit tile", which
-makes this the cleanest possible check that environment -> observation ->
-network -> reward -> policy is wired up correctly end to end.
+"""Train a minimal open-room navigation task.
 
 Runs in a few seconds:
 
@@ -55,7 +50,7 @@ def main() -> None:
     env = CoopEnvBridge(micro=SIZE, max_steps=MAX_STEPS)
     cfg = T.Config(
         episodes=EPISODES,
-        eps_decay=int(EPISODES * 0.5),
+        eps_decay_steps=int(EPISODES * MAX_STEPS * 0.35),
         max_steps=MAX_STEPS,
         replay_warmup=300,
     )
@@ -84,9 +79,7 @@ def main() -> None:
           f"{statistics.mean(lengths[-n:]):>12.1f}")
     print(f"{'return':16}{sum(history[:n]) / n:>+12.2f}{sum(history[-n:]) / n:>+12.2f}")
 
-    # Steps-to-solve is the metric that matters here. In a room this small a
-    # random walk finds the exit anyway, so solve rate saturates immediately
-    # and says nothing about whether anything was learned.
+    # Step count is more useful than solve rate in a tiny room.
     before, after = statistics.mean(lengths[:n]), statistics.mean(lengths[-n:])
     print(f"\n-> {before / max(after, 1e-9):.1f}x fewer steps to reach the exit")
 
