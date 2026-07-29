@@ -106,7 +106,6 @@ class GenerationConfig:
     num_keys: IntRange = (1, 3)
     num_locked_doors: IntRange = (1, 3)
     num_switches: IntRange = (1, 3)
-    num_moving_platforms: IntRange = (0, 2)
     num_pushable_blocks: IntRange = (0, 2)
     num_checkpoints: IntRange = (0, 2)
     num_reset_zones: IntRange = (0, 1)
@@ -120,8 +119,6 @@ class GenerationConfig:
     required_cooperative_actions: int = 1
     """Gates that structurally need two agents (hold-lever, or paired levers)."""
     timed_door_probability: float = 0.15
-    platform_bridge_probability: float = 0.35
-    """Chance a region link is severed by a hazard gap and bridged by a platform."""
     separate_spawns_probability: float = 0.3
     """Chance the two spawn points are placed in different regions."""
     exit_requires_both_agents: bool = False
@@ -147,7 +144,6 @@ class GenerationConfig:
             "num_keys",
             "num_locked_doors",
             "num_switches",
-                "num_moving_platforms",
             "num_pushable_blocks",
             "num_checkpoints",
             "num_reset_zones",
@@ -169,7 +165,6 @@ class GenerationConfig:
         for name in (
             "branching_factor",
             "timed_door_probability",
-            "platform_bridge_probability",
             "separate_spawns_probability",
         ):
             value = getattr(self, name)
@@ -254,7 +249,6 @@ class GenerationConfig:
             num_keys=_lerp_range((0, 1), (3, 5), t),
             num_locked_doors=_lerp_range((0, 1), (4, 6), t),
             num_switches=_lerp_range((0, 1), (3, 5), t),
-            num_moving_platforms=_lerp_range((0, 1), (2, 4), t),
             num_pushable_blocks=_lerp_range((0, 1), (1, 3), t),
             num_checkpoints=_lerp_range((0, 0), (2, 3), t),
             num_reset_zones=_lerp_range((0, 0), (1, 2), t),
@@ -263,7 +257,6 @@ class GenerationConfig:
             exit_objective_count=_lerp_int(1, 3, t),
             required_cooperative_actions=_lerp_int(0, 3, t),
             timed_door_probability=_lerp(0.05, 0.35, t),
-            platform_bridge_probability=_lerp(0.10, 0.55, t),
             separate_spawns_probability=_lerp(0.10, 0.60, t),
             complexity=t,
         )

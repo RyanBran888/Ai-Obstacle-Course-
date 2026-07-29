@@ -36,8 +36,6 @@ from ..entities import (
     ExitDoor,
     Key,
     LockedDoor,
-    MovingPlatform,
-    PlatformCycle,
     PushableBlock,
     ResetZone,
     Switch,
@@ -113,10 +111,6 @@ class _Placer:
             self.reserved.update(tiles)
             for tile in tiles:
                 self.reserved.update(tile.neighbors4())
-        for track in topology.platform_links.values():
-            self.reserved.update(track.path)
-            self.reserved.add(track.dock_a)
-            self.reserved.add(track.dock_b)
 
     def free_tiles(self, region_ids: Iterable[int]) -> list[Vec2]:
         out: list[Vec2] = []
@@ -291,7 +285,6 @@ def populate_mechanisms(
         result=result,
     )
 
-    _place_platforms(topology, decoration, counter, rng.derive("platform_entities"), entities)
     _place_extras(
         layout, topology, config, placer, counter, rng.derive("extras"), entities, result
     )
@@ -371,7 +364,7 @@ def _choose_gate_edges(
         if parent is None:
             continue
         key = (child, parent) if child <= parent else (parent, child)
-        if key in topology.portals and key not in topology.platform_links:
+        if key in topology.portals:
             tree_edges.append(key)
 
     if not tree_edges:
@@ -715,28 +708,6 @@ def _pick_objective_style(budgets: _Budgets, rng: SeededRandom) -> str:
     return rng.choice(options)
 
 
-def _place_platforms(
-    topology: Topology,
-    decoration: Decoration,
-    counter: _IdCounter,
-    rng: SeededRandom,
-    entities: list[Entity],
-) -> None:
-    for track in decoration.tracks:
-        if len(track.path) < 1:
-            continue
-        entities.append(
-            MovingPlatform(
-                id=counter.next("platform"),
-                pos=track.path[0],
-                path=tuple(track.path),
-                ticks_per_step=rng.randint(2, 4),
-                phase=rng.randint(0, max(1, len(track.path) - 1)),
-                cycle=PlatformCycle.PINGPONG,
-            )
-        )
-
-
 def _place_extras(
     layout: Layout,
     topology: Topology,
@@ -780,9 +751,6 @@ def _place_extras(
         )
 
     used_bridge_tiles: set[Vec2] = set()
-    for entity in entities:
-        if isinstance(entity, MovingPlatform):
-            used_bridge_tiles.update(entity.path)
     for _ in range(rng.in_range(config.num_temporary_bridges)):
         run = _find_bridge_run(layout.terrain, used_bridge_tiles, rng)
         if not run:

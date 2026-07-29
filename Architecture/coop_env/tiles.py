@@ -2,7 +2,7 @@
 
 Terrain is everything that never changes during an episode: void, floor, walls,
 static obstacles, and hazard surfaces. Anything with mutable state (doors,
-switches, keys, platforms, blocks) is an *entity* and lives in `entities.py`.
+switches, keys, blocks) is an *entity* and lives in `entities.py`.
 Keeping that split means the terrain grid can be handed to a future observation
 encoder as a plain integer array with no special cases.
 """

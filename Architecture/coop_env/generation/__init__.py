@@ -6,7 +6,7 @@ without touching the others:
     shapes      room silhouette
     partition   BSP split into sub-areas
     layout      walls and doorways
-    terrain     obstacles, hazards, platform gaps
+    terrain     obstacles and hazards
     topology    region graph derived from the finished terrain
     mechanisms  spawns, gates, triggers, exit, extras
     generator   orchestration, retries, fallback
@@ -17,7 +17,7 @@ from .layout import Layout, build_layout
 from .mechanisms import GateKind, MechanismResult, populate_mechanisms
 from .partition import Partition, partition_area
 from .shapes import SHAPE_BUILDERS, build_silhouette
-from .terrain import Decoration, PlatformTrack, decorate_terrain
+from .terrain import Decoration, decorate_terrain
 from .topology import Topology, build_topology
 
 __all__ = [
@@ -32,7 +32,6 @@ __all__ = [
     "Layout",
     "decorate_terrain",
     "Decoration",
-    "PlatformTrack",
     "build_topology",
     "Topology",
     "populate_mechanisms",

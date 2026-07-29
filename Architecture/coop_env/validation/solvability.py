@@ -20,7 +20,7 @@ cooperative layouts verifiable:
   also walk through.
 
 Deliberately conservative choices: hazards are never crossable without a
-platform, crates never move, and a trigger counts only if some slot can reach
+bridge, crates never move, and a trigger counts only if some slot can reach
 it. A room this analysis accepts is completable; a room it rejects might still
 be completable in some cleverer way, and is simply regenerated. Erring that
 direction keeps the guarantee meaningful.

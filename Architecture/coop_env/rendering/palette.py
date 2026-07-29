@@ -59,7 +59,6 @@ DARK = Theme(
         EntityKind.KEY: "#ffcc4d",
         EntityKind.LOCKED_DOOR: "#c9a227",
         EntityKind.SWITCH: "#4fd6e8",
-        EntityKind.MOVING_PLATFORM: "#9ed35a",
         EntityKind.PUSHABLE_BLOCK: "#b98a5e",
         EntityKind.CHECKPOINT: "#dfe4ee",
         EntityKind.RESET_ZONE: "#6b5ce0",
@@ -113,7 +112,6 @@ ENTITY_GLYPHS: dict[EntityKind, str] = {
     EntityKind.KEY: "k",
     EntityKind.LOCKED_DOOR: "D",
     EntityKind.SWITCH: "S",
-    EntityKind.MOVING_PLATFORM: "P",
     EntityKind.PUSHABLE_BLOCK: "B",
     EntityKind.CHECKPOINT: "C",
     EntityKind.RESET_ZONE: ",",
@@ -124,7 +122,6 @@ ENTITY_GLYPHS: dict[EntityKind, str] = {
 ENTITY_DRAW_ORDER: tuple[EntityKind, ...] = (
     EntityKind.RESET_ZONE,
     EntityKind.TEMPORARY_BRIDGE,
-    EntityKind.MOVING_PLATFORM,
     EntityKind.CHECKPOINT,
     EntityKind.KEY,
     EntityKind.SWITCH,

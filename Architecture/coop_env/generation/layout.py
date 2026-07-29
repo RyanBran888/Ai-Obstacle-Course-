@@ -194,7 +194,7 @@ def _carve_doorways(
         options = candidates[edge]
         pick = rng.choice(options)
         _open_tile(terrain, pick, opened)
-        # a wider corridor reads better and gives platforms room to dock
+        # a wider corridor reads better
         if rng.randint(*config.corridor_width) > 1:
             neighbours = [
                 c

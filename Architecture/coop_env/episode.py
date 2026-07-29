@@ -173,7 +173,7 @@ class EnvironmentSession:
     # -- clock -------------------------------------------------------------
 
     def advance_time(self, ticks: int = 1) -> EpisodeState:
-        """Advance only the time-driven mechanics (platforms, bridges, timers)."""
+        """Advance only the time-driven mechanics (bridges, timers)."""
         return self.state.advance(ticks)
 
     # -- reporting ---------------------------------------------------------

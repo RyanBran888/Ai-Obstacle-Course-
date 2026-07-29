@@ -34,7 +34,7 @@ seed
  └─> shapes.py      silhouette: rectangle, L, T, plus, donut, diamond, cavern, terrace
      partition.py   BSP split into sub-areas, each split reserving a wall line
      layout.py      paint dividers as wall, carve doorways (spanning tree + branches)
-     terrain.py     obstacles, hazard pools, deliberate platform gaps
+     terrain.py     obstacles and hazard pools
      topology.py    region graph derived from the finished terrain
      mechanisms.py  spawns, gates, triggers, exit, optional extras
      validator.py   accept, or throw the room away and retry
@@ -73,12 +73,8 @@ change took brutal-preset generation from ~2.7 s to ~130 ms per room.
 Doorway tiles and their approaches are protected from scatter, so a hazard pool
 can never quietly seal a link.
 
-The platform-gap pass is the **only** stage allowed to disconnect the floor, and
-it repays the debt in the same step: it widens a doorway into a three-tile
-hazard gap with a dock on each side and records a platform track spanning it. It
-then verifies that the gap severed *exactly* the two sides the platform
-reconnects, and rolls back otherwise. Without that check, a side passage running
-through those tiles would leave a region nothing could enter.
+Because nothing is allowed to sever the floor, the walkable area stays a
+single connected piece from this stage onward.
 
 ### Topology
 
@@ -88,7 +84,7 @@ the BSP leaves, so obstacles and hazard pools that reshaped an area are
 reflected honestly. Touching doorway tiles are grouped into one link, so a
 widened corridor counts once.
 
-Edges are doorways plus platform crossings. If the graph comes out
+Edges are doorways. If the graph comes out
 disconnected, the attempt is rejected before mechanisms are placed.
 
 ## How solvability is constructed
@@ -154,7 +150,7 @@ Derived measurements, all computed from the finished room:
 
 The model refuses to assume anything clever:
 
-- hazards are never crossable without a platform
+- hazards are never crossable without a bridge
 - crates never move
 - a trigger counts only if some slot can reach it
 - an unrecognised requirement type is treated as unsatisfiable
@@ -203,7 +199,7 @@ identically.
 Time-driven mechanics are pure functions of the tick:
 
 ```python
-platform.position_at(tick)   # total, deterministic, no simulation loop
+bridge.is_solid_at(tick)     # total, deterministic, no simulation loop
 bridge.is_solid_at(tick)
 ```
 

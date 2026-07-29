@@ -88,8 +88,6 @@ def _glyph_for(entity, state: EpisodeState | None) -> str | None:
 
 
 def _draw_tiles(entity, state: EpisodeState | None) -> tuple[Vec2, ...]:
-    if entity.kind is EntityKind.MOVING_PLATFORM and state is not None:
-        return (entity.position_at(state.tick),)
     return entity.footprint()
 
 
@@ -147,8 +145,6 @@ def _legend(room: Room) -> str:
             labels.append(("H", "hold-lever"))
         if any(s.group.startswith("pair") for s in room.switches):
             labels.append(("&", "paired lever (both held at once)"))
-    if EntityKind.MOVING_PLATFORM in kinds:
-        labels.append(("P", "moving platform"))
     if EntityKind.PUSHABLE_BLOCK in kinds:
         labels.append(("B", "pushable block"))
     if EntityKind.CHECKPOINT in kinds:
@@ -181,9 +177,4 @@ def render_mechanism_report(room: Room) -> str:
     if triggers:
         lines.append("triggers:")
         lines.extend(triggers)
-    if room.platforms:
-        lines.append("platforms:")
-        for platform in room.platforms:
-            path = " -> ".join(str(tuple(p)) for p in platform.path)
-            lines.append(f"  {platform.id} period={platform.period} {path}")
     return "\n".join(lines)

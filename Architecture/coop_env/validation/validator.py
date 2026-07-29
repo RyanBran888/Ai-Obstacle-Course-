@@ -22,7 +22,6 @@ from ..entities import (
     ExitDoor,
     Key,
     LockedDoor,
-    MovingPlatform,
     PushableBlock,
     ResetZone,
     Switch,
@@ -152,9 +151,6 @@ def rule_entity_placement(room: Room, model: ConnectivityModel) -> list[Issue]:
         if isinstance(entity, LockedDoor):
             if not is_walkable(room.terrain_at(entity.pos)):
                 issues.append(_error("door_terrain", f"door {entity.id} is embedded in solid terrain"))
-        if isinstance(entity, MovingPlatform):
-            if not entity.path:
-                issues.append(_error("platform_path", f"platform {entity.id} has an empty track"))
         if isinstance(entity, TemporaryBridge):
             if entity.on_ticks <= 0 or entity.on_ticks > entity.period:
                 issues.append(

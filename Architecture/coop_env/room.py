@@ -25,7 +25,6 @@ from .entities import (
     ExitDoor,
     Key,
     LockedDoor,
-    MovingPlatform,
     PushableBlock,
     ResetZone,
     Switch,
@@ -86,7 +85,6 @@ class RoomTopology:
     spawn_regions: tuple[int, ...]
     exit_region: int
     depths: Mapping[int, int]
-    platform_links: tuple[PortalKey, ...] = ()
 
     def region_of(self, pos: Vec2) -> int | None:
         for rid, region in self.regions.items():
@@ -197,10 +195,6 @@ class Room:
     @property
     def switches(self) -> tuple[Switch, ...]:
         return self.of_type(Switch)
-
-    @property
-    def platforms(self) -> tuple[MovingPlatform, ...]:
-        return self.of_type(MovingPlatform)
 
     @property
     def blocks(self) -> tuple[PushableBlock, ...]:

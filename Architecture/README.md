@@ -90,7 +90,6 @@ in `EpisodeState`:
 | `Key` | Portable token. May open more than one door (shared keys). |
 | `LockedDoor` | Blocks a doorway. Latching, hold-open, or timed. |
 | `Switch` | Lever. `TOGGLE`, `ONESHOT`, or `HOLD` (active only while weighed down by an agent slot or a crate). |
-| `MovingPlatform` | Shuttles a fixed track; position is a pure function of the tick. |
 | `PushableBlock` | Crate. Can weigh down a hold-lever, freeing an agent. |
 | `Checkpoint` | Progress marker; can feed a door requirement. |
 | `ResetZone` | Area that returns whatever enters it to a spawn or checkpoint. |
@@ -113,7 +112,7 @@ can make two agents useful, and lets the layout speak:
 - **Shared keys** — a single key gating two different doors.
 - **Split routes** — the two spawns may start in different regions of the
   initially-open zone, on branches that reconnect later.
-- **Hazard crossings** — platform-bridged gaps that must be timed.
+- **Hazard crossings** — temporary bridges that phase in and out on a cycle.
 
 The validator reports which doors *no single agent slot could have opened
 alone* (`cooperative_clusters`) and whether the exit is reachable by both slots
@@ -134,10 +133,10 @@ GenerationConfig.preset("hard", hazard_density=0.02, num_keys=(4, 4))  # overrid
 Every parameter can also be set directly: `width`, `height`, `shape_weights`,
 `region_count`, `branching_factor`, `corridor_width`, `obstacle_density`,
 `hazard_density`, `hazard_weights`, `hazard_blob_size`, `num_keys`,
-`num_locked_doors`, `num_switches`, `num_moving_platforms`, `num_pushable_blocks`, `num_checkpoints`,
+`num_locked_doors`, `num_switches`, `num_pushable_blocks`, `num_checkpoints`,
 `num_reset_zones`, `num_temporary_bridges`, `puzzle_chain_length`,
 `exit_objective_count`, `required_cooperative_actions`,
-`timed_door_probability`, `platform_bridge_probability`,
+`timed_door_probability`,
 `separate_spawns_probability`, `exit_requires_both_agents`, `max_attempts`,
 `raise_on_failure`.
 
@@ -176,7 +175,7 @@ report.solvability   # reachable regions, co-op doors, chain length
 ```
 
 The analysis is deliberately pessimistic: hazards are never crossable without a
-platform, crates never move, and a trigger only counts if some slot can reach
+bridge, crates never move, and a trigger only counts if some slot can reach
 it. A room it accepts is completable; a room it rejects might have been fine and
 is simply regenerated. That trade keeps the guarantee meaningful.
 
@@ -242,6 +241,6 @@ Already in place for whoever builds that layer:
 - `EpisodeState.collect_key/set_switch/place_block` — mechanism seams
 - `EpisodeState.snapshot()/restore()` — serialisable episode state
 - `EnvironmentSession.on_reset` — observer hook for a wrapper
-- `session.advance_time(n)` — clock only; platforms and timers, nobody moving
+- `session.advance_time(n)` — clock only; bridges and timers, nobody moving
 
 Not provided, and out of scope: observations, actions, rewards, termination.

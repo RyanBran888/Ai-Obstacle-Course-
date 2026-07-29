@@ -93,8 +93,7 @@ class TestConfigIsRespected(unittest.TestCase):
 
     def test_zero_hazards_means_zero_hazard_tiles(self):
         config = GenerationConfig(
-            hazard_density=0.0, platform_bridge_probability=0.0,
-            num_moving_platforms=(0, 0), num_temporary_bridges=(0, 0),
+            hazard_density=0.0, num_temporary_bridges=(0, 0),
         )
         generator = RoomGenerator(config)
         for seed in range(20):
@@ -202,7 +201,7 @@ class TestStructure(unittest.TestCase):
             room = generator.generate(seed)
             singles = [
                 e.pos for e in room.entities
-                if e.kind.name not in ("MOVING_PLATFORM", "RESET_ZONE", "TEMPORARY_BRIDGE")
+                if e.kind.name not in ("RESET_ZONE", "TEMPORARY_BRIDGE")
             ]
             self.assertEqual(len(singles), len(set(singles)), f"seed {seed} has stacked objects")
 

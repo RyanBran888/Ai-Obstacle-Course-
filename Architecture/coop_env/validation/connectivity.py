@@ -2,7 +2,7 @@
 
 The generator already knows how it wired the room together, but a check that
 reads the generator's own notes proves nothing. This module reconstructs the
-picture from scratch -- floor tiles, door positions, platform tracks -- so the
+picture from scratch -- floor tiles, door positions, bridges -- so the
 verdict in `solvability.py` is an independent second opinion.
 
 Model: regions are patches of floor separated by doors. Doors become their own
@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ..entities import LockedDoor, MovingPlatform, PushableBlock, TemporaryBridge
+from ..entities import LockedDoor, PushableBlock, TemporaryBridge
 from ..requirements import Requirement, combine
 from ..room import Room
 from ..tiles import is_walkable
@@ -99,7 +99,7 @@ def build_connectivity(room: Room) -> ConnectivityModel:
             tile_region[pos] = index
 
     clusters = _build_door_clusters(door_tiles, tile_region)
-    free_links = _platform_links(room, tile_region)
+    free_links = _bridge_links(room, tile_region)
 
     entity_region: dict[str, int] = {}
     unreachable: list[str] = []
@@ -115,8 +115,8 @@ def build_connectivity(room: Room) -> ConnectivityModel:
                 if rid is not None:
                     break
         if rid is None:
-            # platforms and bridges sit on hazard tiles by design
-            if isinstance(entity, (MovingPlatform, TemporaryBridge)):
+            # bridges sit on hazard tiles by design
+            if isinstance(entity, TemporaryBridge):
                 continue
             unreachable.append(entity.id)
             continue
@@ -171,17 +171,14 @@ def _build_door_clusters(
     return clusters
 
 
-def _platform_links(room: Room, tile_region: dict[Vec2, int]) -> set[tuple[int, int]]:
-    """Regions joined by a platform track or a temporary bridge.
+def _bridge_links(room: Room, tile_region: dict[Vec2, int]) -> set[tuple[int, int]]:
+    """Regions joined by a temporary bridge.
 
-    A platform on a fixed cycle always returns, and a temporary bridge always
-    comes back, so both count as unconditional links between whatever they
-    touch. What they do *not* do is open a locked door.
+    A bridge always comes back, so it counts as an unconditional link between
+    whatever it touches. What it does *not* do is open a locked door.
     """
     links: set[tuple[int, int]] = set()
     spans: list[tuple[Vec2, ...]] = []
-    for platform in room.platforms:
-        spans.append(platform.footprint())
     for bridge in room.bridges:
         if bridge.on_ticks > 0:
             spans.append(bridge.footprint())

@@ -55,7 +55,7 @@ class TestAscii(unittest.TestCase):
         room = solvable_key_room()
         text = render_ascii(room)
         self.assertIn("key", text)
-        self.assertNotIn("moving platform", text)
+        self.assertNotIn("temporary bridge", text)
 
     def test_mechanism_report_names_the_lock(self):
         report = render_mechanism_report(solvable_key_room())

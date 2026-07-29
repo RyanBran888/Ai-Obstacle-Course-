@@ -19,8 +19,6 @@ from helpers import (  # noqa: E402
 
 from coop_env import GenerationConfig, RoomGenerator  # noqa: E402
 from coop_env.entities import (  # noqa: E402
-    MovingPlatform,
-    PlatformCycle,
     PushableBlock,
     Switch,
     SwitchMode,
@@ -119,30 +117,7 @@ class TestCrateOnLever(unittest.TestCase):
         self.assertFalse(state.is_door_open("door_0"), "lever releases with the crate")
 
 
-class TestPlatformTiming(unittest.TestCase):
-    def make(self, cycle: PlatformCycle) -> MovingPlatform:
-        return MovingPlatform(
-            id="p", pos=Vec2(1, 1),
-            path=(Vec2(1, 1), Vec2(2, 1), Vec2(3, 1)),
-            ticks_per_step=1, phase=0, cycle=cycle,
-        )
-
-    def test_pingpong_is_periodic_and_reversible(self):
-        platform = self.make(PlatformCycle.PINGPONG)
-        seen = [tuple(platform.position_at(t)) for t in range(6)]
-        self.assertEqual(seen, [(1, 1), (2, 1), (3, 1), (2, 1), (1, 1), (2, 1)])
-        self.assertEqual(platform.period, 4)
-
-    def test_loop_wraps(self):
-        platform = self.make(PlatformCycle.LOOP)
-        seen = [tuple(platform.position_at(t)) for t in range(4)]
-        self.assertEqual(seen, [(1, 1), (2, 1), (3, 1), (1, 1)])
-
-    def test_position_is_a_pure_function_of_tick(self):
-        platform = self.make(PlatformCycle.PINGPONG)
-        for tick in (0, 3, 17, 1000):
-            self.assertEqual(platform.position_at(tick), platform.position_at(tick))
-
+class TestBridgeTiming(unittest.TestCase):
     def test_bridge_duty_cycle(self):
         bridge = TemporaryBridge(id="b", pos=Vec2(0, 0), tiles=(Vec2(0, 0),), period=4, on_ticks=2)
         self.assertEqual([bridge.is_solid_at(t) for t in range(6)],
@@ -164,22 +139,6 @@ class TestWalkability(unittest.TestCase):
         self.assertFalse(state.is_walkable(LEFT_TILE))
         state.place_block("block_0", LEFT_TILE_B)
         self.assertTrue(state.is_walkable(LEFT_TILE))
-
-    def test_platform_makes_a_hazard_tile_crossable(self):
-        generator = RoomGenerator(GenerationConfig.preset("hard"))
-        for seed in range(30):
-            room = generator.generate(seed)
-            if not room.platforms:
-                continue
-            platform = room.platforms[0]
-            state = EpisodeState.from_room(room)
-            here = platform.position_at(state.tick)
-            if not room.terrain_at(here).name.startswith("HAZARD"):
-                continue
-            self.assertTrue(state.is_walkable(here))
-            self.assertFalse(state.is_hazardous(here))
-            return
-        self.skipTest("no platform sitting on a hazard tile in the sample")
 
 
 class TestReset(unittest.TestCase):

@@ -107,7 +107,7 @@ class Rect(NamedTuple):
 def line_between(a: Vec2, b: Vec2) -> list[Vec2]:
     """Axis-aligned L-shaped run of tiles from `a` to `b` (horizontal leg first).
 
-    Used purely as a geometry helper for carving corridors and platform tracks.
+    Used purely as a geometry helper for carving corridors.
     """
     tiles: list[Vec2] = []
     x, y = a

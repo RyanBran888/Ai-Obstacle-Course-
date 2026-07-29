@@ -1,10 +1,8 @@
-"""Stage 4: scatter obstacles, hazards, and platform crossings.
+"""Stage 4: scatter obstacles and hazards.
 
 Everything here is guarded: after each blob is written, the floor is re-checked
 for connectivity and the blob is rolled back if it cut the room in two. That
 keeps the invariant "the walkable floor is one piece" true right up until the
-platform-bridge pass, which is the one place a gap is opened *deliberately* --
-and it always installs a platform track across it in the same step.
 """
 
 from __future__ import annotations
@@ -17,41 +15,23 @@ from ..rng import SeededRandom
 from ..tiles import Tile
 from ..utils.geometry import Vec2
 from ..utils.grid import Grid
-from .layout import DoorwayCandidate, Layout
-
-
-@dataclass(frozen=True, slots=True)
-class PlatformTrack:
-    """A prepared route for a moving platform.
-
-    `bridges` is True when the track is the only way across the gap it spans,
-    which the topology stage turns into a graph edge.
-    """
-
-    path: tuple[Vec2, ...]
-    dock_a: Vec2
-    dock_b: Vec2
-    bridges: bool
+from .layout import Layout
 
 
 @dataclass(slots=True)
 class Decoration:
-    tracks: list[PlatformTrack] = field(default_factory=list)
     hazard_tiles: set[Vec2] = field(default_factory=set)
     obstacle_tiles: set[Vec2] = field(default_factory=set)
-    removed_doorways: set[Vec2] = field(default_factory=set)
 
 
 def decorate_terrain(layout: Layout, config: GenerationConfig, rng: SeededRandom) -> Decoration:
-    """Add static obstacles, hazard pools, and platform crossings in place."""
+    """Add static obstacles and hazard pools in place."""
     decoration = Decoration()
     protected = _protected_tiles(layout)
     tracker = _FloorTracker(layout.terrain)
 
     _scatter_obstacles(tracker, config, rng.derive("obstacles"), protected, decoration)
     _scatter_hazards(tracker, config, rng.derive("hazards"), protected, decoration)
-    _open_platform_gaps(layout, tracker, config, rng.derive("bridges"), decoration)
-    _add_hazard_platforms(layout, config, rng.derive("platforms"), decoration)
     return decoration
 
 
@@ -115,7 +95,7 @@ class _FloorTracker:
         return False
 
     def carve(self, tiles: Iterable[Vec2], value: Tile) -> list[tuple[Vec2, Tile]]:
-        """Unguarded write -- only for the deliberate platform gaps.
+        """Unguarded write, bypassing the connectivity guard.
 
         Returns the previous tile values so the caller can roll back.
         """
@@ -245,137 +225,3 @@ def _scatter_hazards(
         lambda: rng.weighted_choice(config.hazard_weights),
         decoration.hazard_tiles,
     )
-
-
-def _open_platform_gaps(
-    layout: Layout,
-    tracker: _FloorTracker,
-    config: GenerationConfig,
-    rng: SeededRandom,
-    decoration: Decoration,
-) -> None:
-    """Sever selected doorways into hazard gaps spanned by a platform track.
-
-    This is the only pass allowed to disconnect the floor, and it repays the
-    debt immediately by recording a `PlatformTrack` that re-links the two
-    sides. The topology stage treats that track as a graph edge.
-    """
-    if config.platform_bridge_probability <= 0 or not layout.doorways:
-        return
-    candidates = [layout.doorways[p] for p in sorted(layout.doorways)]
-    for candidate in rng.shuffled(candidates):
-        if not rng.chance(config.platform_bridge_probability):
-            continue
-        track = _try_open_gap(layout, tracker, candidate, rng)
-        if track is not None:
-            decoration.tracks.append(track)
-            decoration.removed_doorways.add(candidate.tile)
-            decoration.hazard_tiles.update(track.path)
-            layout.doorways.pop(candidate.tile, None)
-
-
-def _try_open_gap(
-    layout: Layout,
-    tracker: _FloorTracker,
-    candidate: DoorwayCandidate,
-    rng: SeededRandom,
-) -> PlatformTrack | None:
-    """Widen a doorway into a three-tile hazard gap with a dock on each side."""
-    terrain = layout.terrain
-    step = Vec2(1, 0) if candidate.vertical else Vec2(0, 1)
-    gap = (candidate.tile - step, candidate.tile, candidate.tile + step)
-    dock_a = candidate.tile - step.scaled(2)
-    dock_b = candidate.tile + step.scaled(2)
-
-    if any(terrain.get(p, Tile.VOID) != Tile.FLOOR for p in gap):
-        return None
-    if terrain.get(dock_a, Tile.VOID) != Tile.FLOOR:
-        return None
-    if terrain.get(dock_b, Tile.VOID) != Tile.FLOOR:
-        return None
-    # docks must not themselves be doorways, or the gap swallows two links
-    if dock_a in layout.doorways or dock_b in layout.doorways:
-        return None
-
-    hazard = rng.choice((Tile.HAZARD_PIT, Tile.HAZARD_LAVA, Tile.HAZARD_WATER))
-    before = len(tracker.components())
-    previous = tracker.carve(gap, hazard)
-
-    # The platform re-links exactly the two docks. If the gap severed anything
-    # else -- a side passage that happened to run through these tiles -- the
-    # room would end up with a region nothing can enter, so roll it back.
-    after = tracker.components()
-    home = {tile: index for index, group in enumerate(after) for tile in group}
-    side_a, side_b = home.get(dock_a), home.get(dock_b)
-    if side_a is None or side_b is None:
-        tracker.restore(previous)
-        return None
-    effective = len(after) - (1 if side_a != side_b else 0)
-    if effective != before:
-        tracker.restore(previous)
-        return None
-
-    return PlatformTrack(path=tuple(gap), dock_a=dock_a, dock_b=dock_b, bridges=True)
-
-
-def _add_hazard_platforms(
-    layout: Layout,
-    config: GenerationConfig,
-    rng: SeededRandom,
-    decoration: Decoration,
-) -> None:
-    """Lay decorative platform tracks along straight runs inside hazard pools.
-
-    These do not change connectivity -- they are traversal flavour, and give a
-    future policy something to time its movement against.
-    """
-    wanted = rng.in_range(config.num_moving_platforms) - len(decoration.tracks)
-    if wanted <= 0:
-        return
-    terrain = layout.terrain
-    hazards = sorted(
-        (p for p in decoration.hazard_tiles if _is_hazard_tile(terrain, p)),
-        key=lambda p: (p[1], p[0]),
-    )
-    used: set[Vec2] = set()
-    for track in decoration.tracks:
-        used.update(track.path)
-
-    for seed in rng.shuffled(hazards):
-        if wanted <= 0:
-            break
-        if seed in used:
-            continue
-        for direction in rng.shuffled([Vec2(1, 0), Vec2(0, 1)]):
-            run = _straight_hazard_run(terrain, seed, direction, used)
-            if len(run) < 2:
-                continue
-            dock_a = run[0] - direction
-            dock_b = run[-1] + direction
-            if terrain.get(dock_a, Tile.VOID) != Tile.FLOOR:
-                dock_a = run[0]
-            if terrain.get(dock_b, Tile.VOID) != Tile.FLOOR:
-                dock_b = run[-1]
-            decoration.tracks.append(
-                PlatformTrack(tuple(run), dock_a, dock_b, bridges=False)
-            )
-            used.update(run)
-            wanted -= 1
-            break
-
-
-def _is_hazard_tile(terrain: Grid, pos: Vec2) -> bool:
-    from ..tiles import is_hazard
-
-    return terrain.in_bounds(pos) and is_hazard(terrain[pos])
-
-
-def _straight_hazard_run(
-    terrain: Grid, start: Vec2, direction: Vec2, used: set[Vec2]
-) -> list[Vec2]:
-    run = [start]
-    cursor = start + direction
-    while _is_hazard_tile(terrain, cursor) and cursor not in used and len(run) < 6:
-        run.append(cursor)
-        cursor = cursor + direction
-    return run

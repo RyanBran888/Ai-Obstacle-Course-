@@ -28,9 +28,8 @@ class EntityKind(IntEnum):
     KEY = 3
     LOCKED_DOOR = 4
     SWITCH = 5
-    # 6 is retired (pressure plates). Values are stable for encoding, so the
-    # gap stays rather than renumbering everything below it.
-    MOVING_PLATFORM = 7
+    # 6 (pressure plates) and 7 (moving platforms) are retired. Values are
+    # stable for encoding, so the gaps stay rather than renumbering.
     PUSHABLE_BLOCK = 8
     CHECKPOINT = 9
     RESET_ZONE = 10
@@ -41,11 +40,6 @@ class SwitchMode(str, Enum):
     TOGGLE = "toggle"  # flips and stays flipped
     HOLD = "hold"      # active only while something rests on it
     ONESHOT = "oneshot"  # can be turned on once, never off
-
-
-class PlatformCycle(str, Enum):
-    LOOP = "loop"          # ... -> last -> first -> ...
-    PINGPONG = "pingpong"  # ... -> last -> last-1 -> ... -> first -> ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,50 +151,6 @@ class Switch(Entity):
 
 
 @dataclass(frozen=True, slots=True)
-class MovingPlatform(Entity):
-    """A tile that shuttles along a fixed track, usually over a hazard.
-
-    Its position is a pure function of the tick (see `position_at`), so the
-    whole mechanic is deterministic and needs no simulation loop.
-    """
-
-    path: tuple[Vec2, ...] = ()
-    ticks_per_step: int = 2
-    phase: int = 0
-    cycle: PlatformCycle = PlatformCycle.PINGPONG
-
-    @property
-    def kind(self) -> EntityKind:
-        return EntityKind.MOVING_PLATFORM
-
-    def footprint(self) -> tuple[Vec2, ...]:
-        return self.path or (self.pos,)
-
-    def position_at(self, tick: int) -> Vec2:
-        """Where the platform sits at `tick`. Pure, total, and reproducible."""
-        if not self.path:
-            return self.pos
-        if len(self.path) == 1:
-            return self.path[0]
-        step = (tick // max(1, self.ticks_per_step)) + self.phase
-        n = len(self.path)
-        if self.cycle is PlatformCycle.LOOP:
-            return self.path[step % n]
-        span = 2 * (n - 1)
-        offset = step % span
-        return self.path[offset] if offset < n else self.path[span - offset]
-
-    @property
-    def period(self) -> int:
-        """Full cycle length in ticks -- handy for future timing features."""
-        n = len(self.path)
-        if n <= 1:
-            return 1
-        steps = n if self.cycle is PlatformCycle.LOOP else 2 * (n - 1)
-        return steps * max(1, self.ticks_per_step)
-
-
-@dataclass(frozen=True, slots=True)
 class PushableBlock(Entity):
     """A crate. The environment tracks where it is; nothing here decides to push it.
 
@@ -246,7 +196,7 @@ class ResetZone(Entity):
 class TemporaryBridge(Entity):
     """Tiles that phase in and out on a fixed cycle -- a timed crossing.
 
-    Like `MovingPlatform`, its state is a pure function of the tick.
+    Its state is a pure function of the tick, so no simulation loop is needed.
     """
 
     tiles: tuple[Vec2, ...] = ()

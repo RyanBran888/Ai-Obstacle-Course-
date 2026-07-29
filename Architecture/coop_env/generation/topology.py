@@ -6,7 +6,7 @@ carried over from the BSP leaves, so obstacles and hazard pools that reshaped
 an area are reflected honestly.
 
 The resulting graph is what the puzzle layer gates: nodes are regions, edges are
-doorways (or platform crossings), and locking an edge is what makes part of the
+doorways, and locking an edge is what makes part of the
 room conditional.
 """
 
@@ -20,7 +20,7 @@ from ..utils.geometry import Vec2
 from ..utils.graph import Graph
 from ..utils.grid import connected_components
 from .layout import Layout
-from .terrain import Decoration, PlatformTrack
+from .terrain import Decoration
 
 
 @dataclass(slots=True)
@@ -29,7 +29,6 @@ class Topology:
     graph: Graph[int]
     portals: dict[PortalKey, tuple[Vec2, ...]]
     """Doorway tiles per region pair -- the only places a door may be installed."""
-    platform_links: dict[PortalKey, PlatformTrack] = field(default_factory=dict)
     tile_region: dict[Vec2, int] = field(default_factory=dict)
 
     def region_of(self, pos: Vec2) -> int | None:
@@ -39,7 +38,7 @@ class Topology:
         return self.graph.is_connected()
 
     def gateable_edges(self) -> list[PortalKey]:
-        """Region pairs joined by a real doorway (platform links can't hold a door)."""
+        """Region pairs joined by a real doorway."""
         return sorted(self.portals)
 
 
@@ -93,17 +92,6 @@ def build_topology(layout: Layout, decoration: Decoration) -> Topology:
     for (a, b) in portals:
         graph.add_edge(a, b)
 
-    platform_links: dict[PortalKey, PlatformTrack] = {}
-    for track in decoration.tracks:
-        if not track.bridges:
-            continue
-        ra = tile_region.get(track.dock_a)
-        rb = tile_region.get(track.dock_b)
-        if ra is None or rb is None or ra == rb:
-            continue
-        key = portal_key(ra, rb)
-        platform_links[key] = track
-        graph.add_edge(ra, rb)
 
     regions = {
         rid: Region(id=rid, tiles=frozenset(tiles))
@@ -117,7 +105,6 @@ def build_topology(layout: Layout, decoration: Decoration) -> Topology:
         regions=regions,
         graph=graph,
         portals=deduped,
-        platform_links=platform_links,
         tile_region=tile_region,
     )
 

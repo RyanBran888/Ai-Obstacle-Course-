@@ -7,7 +7,7 @@ which is why reset is exact by construction -- there is no accumulated drift to
 undo.
 
 Scope note: this module implements *mechanism* behaviour only -- how a door
-reacts to its own requirement, where a platform is at tick N, whether a plate
+reacts to its own requirement, whether a bridge is solid at tick N
 under a crate reads as pressed. It contains no agents, no movement, no
 decision-making, and nothing that chooses to press anything. The mutator
 methods (`collect_key`, `set_switch`, ...) are the seams a future control layer
@@ -21,7 +21,6 @@ from typing import Any, Iterable
 
 from .entities import (
     LockedDoor,
-    MovingPlatform,
     PushableBlock,
     Switch,
     SwitchMode,
@@ -138,7 +137,7 @@ class EpisodeState:
     def advance(self, ticks: int = 1) -> "EpisodeState":
         """Step the environment clock.
 
-        Only time-driven mechanics respond: platform tracks, temporary bridges,
+        Only time-driven mechanics respond: temporary bridges
         and timed-door countdowns. Nothing moves through the room as a result.
         """
         if ticks < 0:
@@ -198,15 +197,6 @@ class EpisodeState:
             else:
                 self.doors_open[door.id] = satisfied
 
-    def platform_position(self, platform_id: str) -> Vec2:
-        platform = self.room.find(platform_id)
-        if not isinstance(platform, MovingPlatform):
-            raise KeyError(f"no moving platform {platform_id!r} in this room")
-        return platform.position_at(self.tick)
-
-    def platform_positions(self) -> dict[str, Vec2]:
-        return {p.id: p.position_at(self.tick) for p in self.room.platforms}
-
     def solid_bridge_tiles(self) -> set[Vec2]:
         tiles: set[Vec2] = set()
         for bridge in self.room.bridges:
@@ -215,10 +205,8 @@ class EpisodeState:
         return tiles
 
     def supported_hazard_tiles(self) -> set[Vec2]:
-        """Hazard tiles currently made crossable by a platform or bridge."""
-        supported = set(self.platform_positions().values())
-        supported |= self.solid_bridge_tiles()
-        return supported
+        """Hazard tiles currently made crossable by a temporary bridge."""
+        return self.solid_bridge_tiles()
 
     # -- occupancy queries -------------------------------------------------
 
@@ -236,7 +224,7 @@ class EpisodeState:
         """Can this tile currently be stood on?
 
         Terrain rules first, then dynamic overrides: closed doors and crates
-        block otherwise-open floor, platforms and bridges make hazard tiles
+        block otherwise-open floor, bridges make hazard tiles
         temporarily crossable.
         """
         if not self.room.terrain.in_bounds(pos):

@@ -154,7 +154,6 @@ class RoomGenerator:
             spawn_regions=mechanisms.spawn_regions,
             exit_region=mechanisms.exit_region,
             depths=mechanisms.depths,
-            platform_links=tuple(sorted(topology.platform_links)),
         )
 
         metadata: dict[str, Any] = {
@@ -174,7 +173,6 @@ class RoomGenerator:
             "cooperative_gates": sum(
                 1 for gate in mechanisms.gates if gate.kind in COOPERATIVE_GATES
             ),
-            "platform_bridges": len(topology.platform_links),
             "hazard_tiles": len(decoration.hazard_tiles),
             "obstacle_tiles": len(decoration.obstacle_tiles),
             **mechanisms.stats,

@@ -1,8 +1,8 @@
 """SVG rendering, for looking at rooms during development.
 
 Produces a standalone SVG string: no external assets, no dependencies, opens in
-any browser. Pass an `EpisodeState` to draw the live picture (platforms at their
-current position, doors open, keys already taken) instead of the blueprint.
+any browser. Pass an `EpisodeState` to draw the live picture (doors open, keys
+already taken) instead of the blueprint.
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ from ..entities import (
     ExitDoor,
     Key,
     LockedDoor,
-    MovingPlatform,
     PushableBlock,
     ResetZone,
     Switch,
@@ -182,7 +181,6 @@ def _entity_layer(
     order = {
         EntityKind.RESET_ZONE: 0,
         EntityKind.TEMPORARY_BRIDGE: 1,
-        EntityKind.MOVING_PLATFORM: 2,
         EntityKind.CHECKPOINT: 3,
         EntityKind.KEY: 5,
         EntityKind.SWITCH: 6,
@@ -222,24 +220,6 @@ def _draw_entity(
                 f'fill-opacity="{0.85 if on else 0.2}" stroke="{color}" '
                 f'stroke-width="1" stroke-dasharray="3 2"/>'
             )
-        return out
-
-    if isinstance(entity, MovingPlatform):
-        out = []
-        if len(entity.path) > 1:
-            pts = " ".join(
-                f"{p[0] * cell + cell / 2},{p[1] * cell + cell / 2}" for p in entity.path
-            )
-            out.append(
-                f'<polyline points="{pts}" fill="none" stroke="{color}" '
-                f'stroke-width="2" stroke-opacity="0.4" stroke-dasharray="3 3"/>'
-            )
-        current = entity.position_at(state.tick) if state else entity.path[0] if entity.path else entity.pos
-        out.append(
-            f'<rect x="{current[0] * cell + 2}" y="{current[1] * cell + 2}" '
-            f'width="{cell - 4}" height="{cell - 4}" rx="3" fill="{color}" '
-            f'stroke="{_shade(color, 0.7)}" stroke-width="1.5"/>'
-        )
         return out
 
     px, py = entity.pos[0] * cell, entity.pos[1] * cell
@@ -443,8 +423,6 @@ def _legend_entries(room: Room) -> list[tuple[str, str]]:
             entries.append((theme.accents["lock_paired"], "paired-lever door"))
     if EntityKind.SWITCH in kinds:
         entries.append((theme.entity_color(EntityKind.SWITCH), "switch"))
-    if EntityKind.MOVING_PLATFORM in kinds:
-        entries.append((theme.entity_color(EntityKind.MOVING_PLATFORM), "platform"))
     if EntityKind.PUSHABLE_BLOCK in kinds:
         entries.append((theme.entity_color(EntityKind.PUSHABLE_BLOCK), "block"))
     if EntityKind.CHECKPOINT in kinds:
