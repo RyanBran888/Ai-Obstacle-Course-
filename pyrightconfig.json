@@ -1,0 +1,4 @@
+{
+  "extraPaths": ["Architecture"],
+  "reportMissingImports": "warning"
+}
