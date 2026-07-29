@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from curriculum import make_runner
-from QN_train import Config
+from DQN.DQN_train import Config
 from room_manifest import save_manifest
 
 

@@ -12,9 +12,9 @@ import statistics
 
 import torch
 
-import QN_train as T
+import DQN.DQN_train as T
 from env_bridge import CoopEnvBridge, micro_room
-from QN_rewards import plot_rewards
+from DQN.DQN_rewards import plot_rewards
 
 SIZE = 6
 EPISODES = 600

@@ -29,7 +29,7 @@ from coop_env.room import Room
 from coop_env.state import EpisodeState
 from coop_env.tiles import Tile, is_hazard
 
-from QN_model import CHANNELS, N_ACTIONS, OBS_DIM, VIEW
+from DQN.DQN_model import CHANNELS, N_ACTIONS, OBS_DIM, VIEW
 
 N_AGENTS = 2
 RADIUS = VIEW // 2

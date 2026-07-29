@@ -5,7 +5,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from env_bridge import CoopEnvBridge, GenerationConfig
-from QN_train import (
+from DQN.DQN_train import (
     Config,
     Evaluation,
     EvaluationEpisode,
@@ -249,7 +249,7 @@ class CurriculumRunner:
         return self.room_manifest
 
     def run(self) -> list[StageResult]:
-        from QN_rewards import CurriculumPlot
+        from DQN.DQN_rewards import CurriculumPlot
 
         if self.results:
             raise RuntimeError("this curriculum runner has already trained")
