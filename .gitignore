@@ -69,3 +69,4 @@ Desktop.ini
 
 # Training reward plots (regenerate by running QN_train.py)
 training_rewards*.png
+mvp_*_rewards.png
