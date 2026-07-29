@@ -1,6 +1,4 @@
-"""
-A smaller DQN to test how scaling within the models affects the efficacy with data sets
-"""
+"""Dueling Q-network for the cooperative room environment."""
 from __future__ import annotations
 
 import random
@@ -9,29 +7,24 @@ from collections.abc import Sequence
 import torch
 import torch.nn as nn
 
-VIEW = 5
-CHANNELS = 7
-GLOBALS = 16
+VIEW = 7
+CHANNELS = 12
+GLOBALS = 30
 OBS_DIM = VIEW * VIEW * CHANNELS + GLOBALS
 
 #: Action layout, in index order:
 #:   0-3  step one tile   north / east / south / west
-#:   4-7  step two tiles  north / east / south / west
-#:   8    interact with whatever is underfoot or adjacent
+#:   4    interact with whatever is underfoot
 ACTIONS: tuple[str, ...] = (
     "north",
     "east",
     "south",
     "west",
-    "north_long",
-    "east_long",
-    "south_long",
-    "west_long",
     "interact",
 )
 N_ACTIONS = len(ACTIONS)
 
-HIDDEN: tuple[int, ...] = (128, 64, 32)
+HIDDEN: tuple[int, ...] = (256, 128, 64)
 
 
 class QNetwork(nn.Module):
@@ -55,11 +48,7 @@ class QNetwork(nn.Module):
             size = width
         self.trunk = nn.Sequential(*layers)
 
-        # Dueling head. A plain head has to express "how good is this state"
-        # and "which action is better" in one number, and the state term is far
-        # larger -- so the action term gets swamped and every action ends up
-        # with nearly the same Q-value. Splitting them gives the advantage
-        # stream its own gradient.
+        # Separate state value from action advantage.
         self.value = nn.Linear(size, 1)
         self.advantage = nn.Linear(size, n_actions)
 
@@ -67,7 +56,6 @@ class QNetwork(nn.Module):
         h = self.trunk(x)
         value = self.value(h)
         advantage = self.advantage(h)
-        # subtracting the mean advantage keeps the split identifiable
         return value + advantage - advantage.mean(dim=-1, keepdim=True)
 
     @torch.no_grad()
@@ -81,6 +69,8 @@ class QNetwork(nn.Module):
         return int(self.q_values(obs).argmax().item())
 
     def act(self, obs: torch.Tensor, eps: float) -> int:
+        if eps <= 0.0:
+            return self.best(obs)
         if random.random() < eps:
             return random.randrange(self.n_actions)
         return self.best(obs)

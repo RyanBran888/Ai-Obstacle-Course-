@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import random
+from collections import deque
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
@@ -9,7 +12,6 @@ import torch.nn as nn
 
 from env_bridge import CoopEnvBridge, GenerationConfig
 from QN_model import HIDDEN, N_ACTIONS, OBS_DIM, QNetwork
-from QN_rewards import LivePlot, plot_rewards
 
 N_AGENTS = 2
 
@@ -20,36 +22,29 @@ class Config:
     max_steps: int = 200
     device: str = "auto"
 
-    lr: float = 1e-3
-    # 1/(1-gamma) is the effective horizon. 0.99 gives 100 steps for tasks
-    # whose median solution is 18-40, so credit takes far longer to
-    # propagate than needed. 0.98 -> 50 steps, still clear of the longest.
-    gamma: float = 0.98
+    lr: float = 5e-4
+    gamma: float = 0.99
+    n_step: int = 3
 
     eps_start: float = 1.0
-    eps_min: float = 0.20
-    eps_decay: int = 2_000
+    eps_min: float = 0.05
+    eps_decay_steps: int = 50_000
 
     clip: float = 10.0
-    sync_every: int = 200
-    # Large batches are near-free here (dispatch-bound, not compute-bound), but
-    # 256 every 8 steps replays each transition ~16x -- double the DQN norm.
-    # 128 keeps the same update frequency at the standard replay ratio of 8.
+    target_sync_updates: int = 1_000
     batch_size: int = 128
     replay_capacity: int = 50_000
     replay_warmup: int = 1_000
     train_every: int = 8
-    # One network for both agents. The observation already carries the agent
-    # index, so a shared net can still tell them apart -- and it halves the
-    # gradient cost while doubling the data each update sees.
+    important_fraction: float = 0.25
     shared_net: bool = True
     seed: int = 0
 
 
-def eps_at(episode: int, cfg: Config) -> float:
-    if episode >= cfg.eps_decay:
+def eps_at(step: int, cfg: Config) -> float:
+    if step >= cfg.eps_decay_steps:
         return cfg.eps_min
-    t = episode / max(1, cfg.eps_decay)
+    t = step / max(1, cfg.eps_decay_steps)
     return cfg.eps_start + t * (cfg.eps_min - cfg.eps_start)
 
 
@@ -73,7 +68,9 @@ class ReplayBuffer:
         self.actions = np.empty(capacity, dtype=np.int64)
         self.rewards = np.empty(capacity, dtype=np.float32)
         self.next_obs = np.empty((capacity, obs_dim), dtype=np.float32)
-        self.done = np.empty(capacity, dtype=np.float32)
+        self.terminal = np.empty(capacity, dtype=np.float32)
+        self.discount = np.empty(capacity, dtype=np.float32)
+        self.important = np.empty(capacity, dtype=np.bool_)
         self.index = 0
         self.size = 0
         self.rng = np.random.default_rng(seed)
@@ -81,25 +78,55 @@ class ReplayBuffer:
     def __len__(self) -> int:
         return self.size
 
-    def add(self, obs, action: int, reward: float, next_obs, done: bool) -> None:
+    def clear(self) -> None:
+        self.index = 0
+        self.size = 0
+
+    def add(
+        self,
+        obs,
+        action: int,
+        reward: float,
+        next_obs,
+        terminal: bool,
+        discount: float,
+        important: bool,
+    ) -> None:
         self.obs[self.index] = obs
         self.actions[self.index] = action
         self.rewards[self.index] = reward
         self.next_obs[self.index] = next_obs
-        self.done[self.index] = float(done)
+        self.terminal[self.index] = float(terminal)
+        self.discount[self.index] = discount
+        self.important[self.index] = important
         self.index = (self.index + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
-    def sample(self, batch_size: int):
+    def sample(self, batch_size: int, important_fraction: float):
         if batch_size < 1 or batch_size > self.size:
             raise ValueError("batch size must be between 1 and the buffer size")
-        indices = self.rng.choice(self.size, size=batch_size, replace=False)
+
+        wanted = int(round(batch_size * important_fraction))
+        important_indices = np.flatnonzero(self.important[: self.size])
+        n_important = min(wanted, len(important_indices))
+        selected = (
+            self.rng.choice(important_indices, size=n_important, replace=False)
+            if n_important
+            else np.empty(0, dtype=np.int64)
+        )
+        rest = self.rng.choice(
+            self.size, size=batch_size - n_important, replace=False
+        )
+        indices = np.concatenate((selected, rest))
+        self.rng.shuffle(indices)
+
         return (
             self.obs[indices],
             self.actions[indices],
             self.rewards[indices],
             self.next_obs[indices],
-            self.done[indices],
+            self.terminal[indices],
+            self.discount[indices],
         )
 
 
@@ -115,10 +142,12 @@ class Agent:
         device: torch.device | str = "cpu",
         replay_capacity: int = 20_000,
         replay_seed: int = 0,
+        important_fraction: float = 0.25,
     ) -> None:
         self.device = torch.device(device)
         self.gamma = gamma
         self.clip = clip
+        self.important_fraction = important_fraction
         self.replay = ReplayBuffer(replay_capacity, obs_dim, replay_seed)
 
         self.net = QNetwork(obs_dim, n_actions, hidden).to(self.device)
@@ -126,35 +155,43 @@ class Agent:
         self.sync()
 
         self.opt = torch.optim.Adam(self.net.parameters(), lr=lr)
-        # Huber: rewards span a wide range, and squaring a large TD error
-        # produces a gradient big enough to wreck the network
         self.loss_fn = nn.SmoothL1Loss()
 
     def sync(self) -> None:
         self.target.load_state_dict(self.net.state_dict())
 
     def act(self, obs, eps: float) -> int:
-        return self.net.act(self._t(obs), eps)
+        return self.net.act(self._tensor(obs), eps)
 
-    def remember(self, obs, action: int, reward: float, next_obs, done: bool) -> None:
-        self.replay.add(obs, action, reward, next_obs, done)
+    def remember(
+        self,
+        obs,
+        action: int,
+        reward: float,
+        next_obs,
+        terminal: bool,
+        discount: float,
+        important: bool,
+    ) -> None:
+        self.replay.add(
+            obs, action, reward, next_obs, terminal, discount, important
+        )
 
     def learn_batch(self, batch_size: int) -> float:
-        obs, actions, rewards, next_obs, done = self.replay.sample(batch_size)
+        batch = self.replay.sample(batch_size, self.important_fraction)
+        obs, actions, rewards, next_obs, terminal, discount = batch
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
         actions_t = torch.as_tensor(actions, dtype=torch.int64, device=self.device)
         rewards_t = torch.as_tensor(rewards, dtype=torch.float32, device=self.device)
         next_obs_t = torch.as_tensor(next_obs, dtype=torch.float32, device=self.device)
-        done_t = torch.as_tensor(done, dtype=torch.float32, device=self.device)
+        terminal_t = torch.as_tensor(terminal, dtype=torch.float32, device=self.device)
+        discount_t = torch.as_tensor(discount, dtype=torch.float32, device=self.device)
 
         q = self.net(obs_t).gather(1, actions_t.unsqueeze(1)).squeeze(1)
-
         with torch.no_grad():
-            # Double DQN: online net picks the action, target net scores it.
-            # Using the target net for both overestimates systematically.
             best = self.net(next_obs_t).argmax(dim=1, keepdim=True)
             next_q = self.target(next_obs_t).gather(1, best).squeeze(1)
-            target = rewards_t + self.gamma * next_q * (1.0 - done_t)
+            target = rewards_t + discount_t * next_q * (1.0 - terminal_t)
 
         loss = self.loss_fn(q, target)
         self.opt.zero_grad(set_to_none=True)
@@ -164,15 +201,25 @@ class Agent:
         return float(loss.item())
 
     def save(self, path: str) -> None:
-        torch.save({"net": self.net.state_dict(), "opt": self.opt.state_dict()}, path)
+        torch.save(
+            {
+                "net": self.net.state_dict(),
+                "target": self.target.state_dict(),
+                "opt": self.opt.state_dict(),
+            },
+            path,
+        )
 
     def load(self, path: str) -> None:
-        ckpt = torch.load(path, map_location=self.device)
-        self.net.load_state_dict(ckpt["net"])
-        self.sync()
-        self.opt.load_state_dict(ckpt["opt"])
+        checkpoint = torch.load(path, map_location=self.device)
+        self.net.load_state_dict(checkpoint["net"])
+        if "target" in checkpoint:
+            self.target.load_state_dict(checkpoint["target"])
+        else:
+            self.sync()
+        self.opt.load_state_dict(checkpoint["opt"])
 
-    def _t(self, obs) -> torch.Tensor:
+    def _tensor(self, obs) -> torch.Tensor:
         if isinstance(obs, torch.Tensor):
             return obs.to(dtype=torch.float32, device=self.device)
         return torch.as_tensor(obs, dtype=torch.float32, device=self.device)
@@ -183,95 +230,419 @@ def build_agents(n: int = N_AGENTS, **kwargs) -> list[Agent]:
     return [Agent(**kwargs, replay_seed=replay_seed + i) for i in range(n)]
 
 
-def train(env, cfg: Config | None = None, live: bool = False):
-    cfg = cfg or Config()
-    if cfg.batch_size < 1:
-        raise ValueError("batch_size must be at least 1")
-    if cfg.replay_capacity < cfg.batch_size:
-        raise ValueError("replay_capacity must be at least batch_size")
-    if cfg.replay_warmup < 0:
-        raise ValueError("replay_warmup cannot be negative")
-    if cfg.train_every < 1 or cfg.sync_every < 1:
-        raise ValueError("train_every and sync_every must be at least 1")
+@dataclass(slots=True)
+class EpisodeResult:
+    reward: float
+    completed: bool
+    timed_out: bool
+    steps: int
+    metrics: dict[str, Any]
 
-    random.seed(cfg.seed)
-    torch.manual_seed(cfg.seed)
-    device = resolve_device(cfg.device)
 
-    def make_agent() -> Agent:
-        return Agent(
-            obs_dim=env.obs_dim,
-            n_actions=env.n_actions,
-            lr=cfg.lr,
-            gamma=cfg.gamma,
-            clip=cfg.clip,
-            device=device,
-            replay_capacity=cfg.replay_capacity,
-            replay_seed=cfg.seed,
+@dataclass(slots=True)
+class Evaluation:
+    episodes: int
+    completed: int
+    timeouts: int
+    mean_return: float
+    mean_steps: float
+    mean_keys: float
+    mean_doors: float
+    mean_switches: float
+    mean_checkpoints: float
+    exit_open_rate: float
+    exit_open_not_reached: int
+
+    @property
+    def success_rate(self) -> float:
+        return self.completed / self.episodes if self.episodes else 0.0
+
+    def as_dict(self) -> dict[str, float | int]:
+        return {
+            "episodes": self.episodes,
+            "success_rate": self.success_rate,
+            "mean_return": self.mean_return,
+            "mean_steps": self.mean_steps,
+            "mean_keys": self.mean_keys,
+            "mean_doors": self.mean_doors,
+            "mean_switches": self.mean_switches,
+            "mean_checkpoints": self.mean_checkpoints,
+            "exit_open_rate": self.exit_open_rate,
+            "timeouts": self.timeouts,
+            "exit_open_not_reached": self.exit_open_not_reached,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationEpisode:
+    seed: int
+    completed: bool
+    timed_out: bool
+    reward: float
+    steps: int
+    keys: int
+    doors: int
+    switches: int
+    checkpoints: int
+    exit_open: bool
+
+    def as_dict(self) -> dict[str, float | int | bool]:
+        return {
+            "seed": self.seed,
+            "completed": self.completed,
+            "timed_out": self.timed_out,
+            "reward": self.reward,
+            "steps": self.steps,
+            "keys": self.keys,
+            "doors": self.doors,
+            "switches": self.switches,
+            "checkpoints": self.checkpoints,
+            "exit_open": self.exit_open,
+        }
+
+
+Transition = tuple[Any, int, float, Any, bool, bool]
+
+
+class Trainer:
+    def __init__(self, env, cfg: Config | None = None) -> None:
+        self.cfg = cfg or Config()
+        self._validate(self.cfg)
+        random.seed(self.cfg.seed)
+        np.random.seed(self.cfg.seed)
+        torch.manual_seed(self.cfg.seed)
+
+        self.device = resolve_device(self.cfg.device)
+        self.env = env
+        self._configure_env(env)
+
+        def make_agent(replay_seed: int) -> Agent:
+            return Agent(
+                obs_dim=env.obs_dim,
+                n_actions=env.n_actions,
+                lr=self.cfg.lr,
+                gamma=self.cfg.gamma,
+                clip=self.cfg.clip,
+                device=self.device,
+                replay_capacity=self.cfg.replay_capacity,
+                replay_seed=replay_seed,
+                important_fraction=self.cfg.important_fraction,
+            )
+
+        if self.cfg.shared_net:
+            shared = make_agent(self.cfg.seed)
+            self.agents = [shared] * N_AGENTS
+            self.learners = [shared]
+        else:
+            self.agents = [
+                make_agent(self.cfg.seed + index) for index in range(N_AGENTS)
+            ]
+            self.learners = self.agents
+
+        self.history: list[float] = []
+        self.env_steps = 0
+        self.updates = 0
+        self.episodes = 0
+        self._pending = [deque() for _ in range(N_AGENTS)]
+        self._reheat_step = 0
+        self._reheat_from = 0.0
+        self._reheat_steps = 0
+
+    @staticmethod
+    def _validate(cfg: Config) -> None:
+        if cfg.batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+        if cfg.replay_capacity < cfg.batch_size:
+            raise ValueError("replay_capacity must be at least batch_size")
+        if cfg.replay_warmup < 0:
+            raise ValueError("replay_warmup cannot be negative")
+        if cfg.train_every < 1 or cfg.target_sync_updates < 1:
+            raise ValueError("training intervals must be at least 1")
+        if cfg.n_step < 1:
+            raise ValueError("n_step must be at least 1")
+        if not 0.0 <= cfg.important_fraction <= 1.0:
+            raise ValueError("important_fraction must be between 0 and 1")
+
+    def _configure_env(self, env) -> None:
+        if getattr(env, "max_steps", self.cfg.max_steps) != self.cfg.max_steps:
+            raise ValueError("trainer and environment max_steps must match")
+        if hasattr(env, "shaping_gamma"):
+            env.shaping_gamma = self.cfg.gamma
+
+    def set_env(self, env, clear_replay: bool = False) -> None:
+        if env.obs_dim != self.env.obs_dim or env.n_actions != self.env.n_actions:
+            raise ValueError("new environment has a different observation or action size")
+        self._configure_env(env)
+        self.env = env
+        if clear_replay:
+            self.clear_replay()
+
+    def clear_replay(self) -> None:
+        for learner in self.learners:
+            learner.replay.clear()
+        for pending in self._pending:
+            pending.clear()
+
+    def reheat_exploration(self, start: float = 0.30, steps: int = 20_000) -> None:
+        self._reheat_step = self.env_steps
+        self._reheat_from = max(self.cfg.eps_min, min(1.0, start))
+        self._reheat_steps = max(0, steps)
+
+    def epsilon(self) -> float:
+        base = eps_at(self.env_steps, self.cfg)
+        elapsed = self.env_steps - self._reheat_step
+        if self._reheat_steps <= 0 or elapsed >= self._reheat_steps:
+            return base
+        t = elapsed / self._reheat_steps
+        reheated = self._reheat_from + t * (self.cfg.eps_min - self._reheat_from)
+        return max(base, reheated)
+
+    def _emit_transition(self, agent_index: int) -> None:
+        pending = self._pending[agent_index]
+        count = min(self.cfg.n_step, len(pending))
+        reward = 0.0
+        terminal = False
+        important = False
+        last_next_obs = pending[0][3]
+        used = 0
+        for used, transition in enumerate(list(pending)[:count], start=1):
+            _, _, step_reward, next_obs, step_terminal, step_important = transition
+            reward += (self.cfg.gamma ** (used - 1)) * step_reward
+            last_next_obs = next_obs
+            terminal = terminal or step_terminal
+            important = important or step_important
+            if step_terminal:
+                break
+
+        first_obs, first_action = pending[0][0], pending[0][1]
+        self.agents[agent_index].remember(
+            first_obs,
+            first_action,
+            reward,
+            last_next_obs,
+            terminal,
+            self.cfg.gamma ** used,
+            important,
         )
+        pending.popleft()
 
-    if cfg.shared_net:
-        shared = make_agent()
-        agents = [shared] * N_AGENTS   # both slots drive the same network
-        learners = [shared]            # ...so it is only updated once per step
-    else:
-        agents = [make_agent() for _ in range(N_AGENTS)]
-        learners = agents
+    def _remember(
+        self,
+        obs,
+        actions,
+        rewards,
+        next_obs,
+        terminal: bool,
+        important: bool,
+    ) -> None:
+        for index in range(N_AGENTS):
+            self._pending[index].append(
+                (
+                    obs[index],
+                    actions[index],
+                    rewards[index],
+                    next_obs[index],
+                    terminal,
+                    important,
+                )
+            )
+            if len(self._pending[index]) >= self.cfg.n_step:
+                self._emit_transition(index)
+            if terminal:
+                while self._pending[index]:
+                    self._emit_transition(index)
 
-    history: list[float] = []
-    steps = 0
-    plot = LivePlot(cfg) if live else None
-
-    for episode in range(cfg.episodes):
-        obs = env.reset()
-        eps = eps_at(episode, cfg)
+    def run_episode(
+        self,
+        *,
+        seed: int | None = None,
+        learn: bool = True,
+        epsilon: float | None = None,
+        env=None,
+    ) -> EpisodeResult:
+        active_env = env or self.env
+        self._configure_env(active_env)
+        obs = active_env.reset(seed=seed) if seed is not None else active_env.reset()
         total = 0.0
+        final_info: dict[str, Any] = {}
 
-        for _ in range(cfg.max_steps):
-            actions = [a.act(obs[i], eps) for i, a in enumerate(agents)]
-            next_obs, rewards, done, cut, _ = env.step(actions)
+        for _ in range(self.cfg.max_steps):
+            eps = self.epsilon() if epsilon is None else epsilon
+            actions = [
+                agent.act(obs[index], eps)
+                for index, agent in enumerate(self.agents)
+            ]
+            next_obs, rewards, done, cut, info = active_env.step(actions)
+            terminal = done or cut
 
-            for i, a in enumerate(agents):
-                # `done` only, never `cut`: a step-limit timeout is not a real
-                # terminal state, and masking the bootstrap there teaches the
-                # network the world ends with zero future value
-                a.remember(obs[i], actions[i], rewards[i], next_obs[i], done)
+            if learn:
+                important = bool(info["progress_events"]) or done
+                self._remember(
+                    obs, actions, rewards, next_obs, terminal, important
+                )
+                self.env_steps += 1
+                ready = max(self.cfg.batch_size, self.cfg.replay_warmup)
+                if (
+                    self.env_steps % self.cfg.train_every == 0
+                    and len(self.learners[0].replay) >= ready
+                ):
+                    for learner in self.learners:
+                        learner.learn_batch(self.cfg.batch_size)
+                    self.updates += 1
+                    if self.updates % self.cfg.target_sync_updates == 0:
+                        for learner in self.learners:
+                            learner.sync()
 
             obs = next_obs
             total += rewards[0]
-            steps += 1
-
-            ready = max(cfg.batch_size, cfg.replay_warmup)
-            if steps % cfg.train_every == 0 and len(agents[0].replay) >= ready:
-                for a in learners:
-                    a.learn_batch(cfg.batch_size)
-
-            if steps % cfg.sync_every == 0:
-                for a in learners:
-                    a.sync()
-
-            if plot is not None and steps % 250 == 0:
-                plot.pump()
-
-            if done or cut:
+            final_info = info
+            if terminal:
                 break
+        else:
+            raise RuntimeError("environment did not terminate at max_steps")
 
-        history.append(total)
+        metrics = dict(final_info["episode"])
+        if learn:
+            self.history.append(total)
+            self.episodes += 1
+        return EpisodeResult(
+            reward=total,
+            completed=bool(metrics["completed"]),
+            timed_out=bool(metrics["timed_out"]),
+            steps=int(metrics["steps"]),
+            metrics=metrics,
+        )
+
+    def fit(
+        self,
+        episodes: int | None = None,
+        *,
+        seed_sampler: Callable[[int], int | None] | None = None,
+        live: bool = False,
+    ) -> list[float]:
+        count = self.cfg.episodes if episodes is None else episodes
+        if live:
+            from QN_rewards import LivePlot
+
+            plot = LivePlot(self.cfg)
+        else:
+            plot = None
+        for _ in range(count):
+            seed = seed_sampler(self.episodes) if seed_sampler else None
+            self.run_episode(seed=seed)
+            if plot is not None:
+                plot.update(self.history)
+                if self.env_steps % 250 == 0:
+                    plot.pump()
         if plot is not None:
-            plot.update(history)
+            plot.close()
+        return self.history
 
-    if plot is not None:
-        plot.close()
-    return agents, history
+
+def evaluate_detailed(
+    agents: Sequence[Agent],
+    env,
+    seeds: Sequence[int],
+) -> tuple[Evaluation, tuple[EvaluationEpisode, ...]]:
+    if len(seeds) != len(set(seeds)):
+        raise ValueError("evaluation seeds must be unique")
+
+    episodes: list[EvaluationEpisode] = []
+    for seed in seeds:
+        obs = env.reset(seed=seed)
+        episode_return = 0.0
+        for _ in range(env.max_steps):
+            actions = [
+                agent.act(obs[index], 0.0)
+                for index, agent in enumerate(agents)
+            ]
+            obs, rewards, done, cut, info = env.step(actions)
+            episode_return += float(rewards[0])
+            if done or cut:
+                metrics = info["episode"]
+                episodes.append(
+                    EvaluationEpisode(
+                        seed=int(seed),
+                        completed=bool(done),
+                        timed_out=bool(cut),
+                        reward=episode_return,
+                        steps=int(metrics["steps"]),
+                        keys=int(metrics["keys_collected"]),
+                        doors=int(metrics["doors_opened"]),
+                        switches=int(metrics["switches_activated"]),
+                        checkpoints=int(metrics["checkpoints_reached"]),
+                        exit_open=bool(metrics["exit_opened"]),
+                    )
+                )
+                break
+        else:
+            raise RuntimeError(f"evaluation seed {seed} did not terminate")
+
+    count = len(episodes)
+    successful_steps = [episode.steps for episode in episodes if episode.completed]
+    evaluation = Evaluation(
+        episodes=count,
+        completed=sum(episode.completed for episode in episodes),
+        timeouts=sum(episode.timed_out for episode in episodes),
+        mean_return=(
+            sum(episode.reward for episode in episodes) / count if count else 0.0
+        ),
+        mean_steps=(
+            sum(successful_steps) / len(successful_steps)
+            if successful_steps
+            else 0.0
+        ),
+        mean_keys=(
+            sum(episode.keys for episode in episodes) / count if count else 0.0
+        ),
+        mean_doors=(
+            sum(episode.doors for episode in episodes) / count if count else 0.0
+        ),
+        mean_switches=(
+            sum(episode.switches for episode in episodes) / count
+            if count
+            else 0.0
+        ),
+        mean_checkpoints=(
+            sum(episode.checkpoints for episode in episodes) / count
+            if count
+            else 0.0
+        ),
+        exit_open_rate=(
+            sum(episode.exit_open for episode in episodes) / count
+            if count
+            else 0.0
+        ),
+        exit_open_not_reached=sum(
+            episode.exit_open and not episode.completed for episode in episodes
+        ),
+    )
+    return evaluation, tuple(episodes)
+
+
+def evaluate(agents: Sequence[Agent], env, seeds: Sequence[int]) -> Evaluation:
+    evaluation, _ = evaluate_detailed(agents, env, seeds)
+    return evaluation
+
+
+def train(env, cfg: Config | None = None, live: bool = False):
+    trainer = Trainer(env, cfg)
+    trainer.fit(live=live)
+    return trainer.agents, trainer.history
 
 
 if __name__ == "__main__":
-    cfg = Config(episodes=2000, eps_decay=800, max_steps=300)
+    from QN_rewards import plot_rewards
+
+    cfg = Config(episodes=2_000, max_steps=300, eps_decay_steps=120_000)
     env = CoopEnvBridge(
-        GenerationConfig.preset("easy"), seed=0, max_steps=cfg.max_steps
+        GenerationConfig.preset("easy"),
+        seed=0,
+        max_steps=cfg.max_steps,
+        shaping_gamma=cfg.gamma,
     )
     agents, history = train(env, cfg, live=True)
 
-    for i, a in enumerate(agents):
-        a.save(f"agent{i}.pt")
+    for index, agent in enumerate(dict.fromkeys(agents)):
+        agent.save(f"agent{index}.pt")
     plot_rewards(history, cfg)
