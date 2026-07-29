@@ -15,7 +15,7 @@ class DQN1(nn.Module):
   def forward(self, x):
     return DQS_seq1(x)
 
-class DQS2(nn.Module):
+class DQN2(nn.Module):
   def __init(self):
     super().__init__(self)
     DQS_seq2 = nn.Sequential()
