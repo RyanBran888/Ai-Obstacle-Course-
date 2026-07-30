@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import tempfile
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--episodes-per-seed", type=int, default=50)
     parser.add_argument("--max-rounds", type=int, default=8)
+    parser.add_argument(
+        "--recovery-rounds",
+        type=int,
+        default=8,
+        help="extra rounds after restoring the best failed round",
+    )
+    parser.add_argument(
+        "--recovery-pool-max",
+        type=int,
+        default=128,
+        help="largest adaptive training pool used for validation failures",
+    )
+    parser.add_argument(
+        "--recovery-expansions",
+        type=int,
+        default=2,
+        help="maximum adaptive pool doublings per curriculum pool",
+    )
     parser.add_argument(
         "--promotion-passes",
         type=int,
@@ -54,6 +73,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--graph-output", default="curriculum_training.png")
     parser.add_argument("--manifest-output", default="curriculum_rooms.json")
     parser.add_argument("--report-output", default="curriculum_report.json")
+    parser.add_argument(
+        "--progress-output",
+        default=None,
+        help="atomic recovery state (defaults beside --output)",
+    )
+    parser.add_argument(
+        "--resume-from",
+        default=None,
+        help="continue a compatible recovery state",
+    )
+    parser.add_argument(
+        "--extend-stopped-rounds",
+        type=int,
+        default=0,
+        help="explicit extra tuning rounds for an exhausted stopped state",
+    )
     parser.add_argument(
         "--maps-output",
         default=None,
@@ -125,6 +160,12 @@ def _write_report(path: str | Path, payload: dict[str, Any]) -> None:
     temporary.replace(target)
 
 
+def _save_agent(agent, path: Path) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    agent.save(str(temporary))
+    temporary.replace(path)
+
+
 def main() -> None:
     args = parse_args()
     checkpoint = Path(args.output).expanduser()
@@ -132,6 +173,20 @@ def main() -> None:
     manifest_path = Path(args.manifest_output).expanduser()
     report_path = Path(args.report_output).expanduser()
     maps_path = Path(args.maps_output).expanduser() if args.maps_output else None
+    resume_path = (
+        Path(args.resume_from).expanduser() if args.resume_from else None
+    )
+    if args.extend_stopped_rounds and resume_path is None:
+        raise ValueError("--extend-stopped-rounds requires --resume-from")
+    progress_path = (
+        Path(args.progress_output).expanduser()
+        if args.progress_output
+        else (
+            resume_path
+            if resume_path is not None
+            else checkpoint.with_name(f"{checkpoint.stem}.progress.pt")
+        )
+    )
     if args.map_cell < 4:
         raise ValueError("--map-cell must be at least 4")
     artifacts = {
@@ -139,6 +194,7 @@ def main() -> None:
         "graph": graph_path,
         "manifest": manifest_path,
         "report": report_path,
+        "progress": progress_path,
     }
     normalized: dict[Path, str] = {}
     for label, path in artifacts.items():
@@ -151,6 +207,12 @@ def main() -> None:
         if path.exists() and not path.is_file():
             raise IsADirectoryError(f"{path} is not a file")
         path.parent.mkdir(parents=True, exist_ok=True)
+    if (
+        resume_path is not None
+        and resume_path.resolve() in normalized
+        and normalized[resume_path.resolve()] != "progress"
+    ):
+        raise ValueError("the resume input cannot also be another output")
     if maps_path is not None:
         if maps_path.resolve() in normalized:
             raise ValueError("maps output must differ from file outputs")
@@ -159,9 +221,21 @@ def main() -> None:
                 f"{maps_path} already exists; choose a new --maps-output"
             )
         maps_path.parent.mkdir(parents=True, exist_ok=True)
-    if checkpoint.exists():
+    if resume_path is not None and not resume_path.is_file():
+        raise FileNotFoundError(f"recovery state does not exist: {resume_path}")
+    if (
+        progress_path.exists()
+        and (
+            resume_path is None
+            or progress_path.resolve() != resume_path.resolve()
+        )
+    ):
+        raise FileExistsError(
+            f"{progress_path} already exists; choose a new --progress-output"
+        )
+    if checkpoint.exists() and resume_path is None:
         raise FileExistsError(f"{checkpoint} already exists; choose a new --output")
-    if manifest_path.exists():
+    if manifest_path.exists() and resume_path is None:
         raise FileExistsError(
             f"{manifest_path} already exists; choose a new --manifest-output"
         )
@@ -189,25 +263,91 @@ def main() -> None:
         plot_max_points=args.plot_max_points,
         graph_path=str(graph_path),
         promotion_passes=args.promotion_passes,
+        recovery_rounds=args.recovery_rounds,
+        recovery_pool_max=args.recovery_pool_max,
+        recovery_expansions=args.recovery_expansions,
+        progress_path=str(progress_path),
+        resume_from=str(resume_path) if resume_path is not None else None,
+        progress_contract={"source_sha256": source_hashes},
+        extend_stopped_rounds=args.extend_stopped_rounds,
     )
+    checkpoint_preexisting = checkpoint.is_file()
+    finalization_statuses = {"completed", "test_started", "tested"}
+    if checkpoint_preexisting:
+        if runner.recovery_status not in finalization_statuses:
+            raise FileExistsError(
+                f"{checkpoint} exists but this recovery state is still training"
+            )
+        expected_model_hash = runner.model_sha256
+        runner.trainer.learners[0].load(str(checkpoint))
+        if runner.model_sha256 != expected_model_hash:
+            raise ValueError(
+                f"{checkpoint} does not match the frozen recovery model"
+            )
+    if (
+        manifest_path.exists()
+        and runner.recovery_status not in finalization_statuses
+    ):
+        raise FileExistsError(
+            f"{manifest_path} exists but this recovery state is still training"
+        )
     print(f"Training on {runner.trainer.device}")
-    results = runner.run()
+    if runner.recovery_status == "test_started" and not args.final_test:
+        raise ValueError(
+            "this recovery state has a sealed partial final test; "
+            "resume it with --final-test"
+        )
+    try:
+        results = runner.run()
+    except KeyboardInterrupt as error:
+        if progress_path.is_file():
+            print(
+                "No model/report/manifest/test artifacts were finalized. "
+                f"Recovery state: {progress_path}"
+            )
+        else:
+            print(
+                "Interrupted before the first recovery checkpoint; restart "
+                "with the same command."
+            )
+        raise SystemExit(130) from error
     final = results[-1]
     print(
         f"\nStopped after {final.stage} pool={final.pool_size}; "
         f"promoted={final.promoted}"
     )
-    runner.trainer.learners[0].save(str(checkpoint))
+    if not runner.completed:
+        if final.failure_reasons:
+            print("Unmet requirements:")
+            for reason in final.failure_reasons:
+                print(f"  - {reason}")
+        print(
+            f"Best evaluated state is recoverable from {progress_path}. "
+            "No final checkpoint, report, manifest, maps, or test data were written."
+        )
+        raise SystemExit(2)
+    if not checkpoint_preexisting:
+        _save_agent(runner.trainer.learners[0], checkpoint)
     checkpoint_hash = _file_sha256(checkpoint)
-    print(f"Frozen checkpoint saved to {checkpoint}")
+    print(f"Frozen checkpoint ready at {checkpoint}")
 
-    if runner.completed and args.final_test:
+    if runner.completed and (
+        args.final_test
+        or runner.recovery_status in {"test_started", "tested"}
+    ):
         if _source_hashes() != source_hashes:
             raise RuntimeError("training source files changed during training")
         if len(runner.trainer.learners) != 1:
             raise RuntimeError("final testing requires the shared-network trainer")
         runner.trainer.learners[0].load(str(checkpoint))
-        runner.evaluate_final_test()
+        try:
+            runner.evaluate_final_test()
+        except KeyboardInterrupt as error:
+            print(
+                "Final test paused at its last completed stage. Resume with "
+                f"--resume-from {progress_path} and --final-test."
+            )
+            raise SystemExit(130) from error
     elif runner.completed:
         print("Final test remains unevaluated; use --final-test only for the chosen run.")
     else:
@@ -239,16 +379,23 @@ def main() -> None:
     designer_maps = None
     if maps_path is not None:
         manifest_data = load_manifest(manifest_path)
+        temporary_maps = Path(
+            tempfile.mkdtemp(
+                prefix=f".{maps_path.name}.",
+                dir=maps_path.parent,
+            )
+        )
         map_rooms, map_pages = export_manifest_site(
             manifest_path,
             manifest_data,
-            maps_path,
+            temporary_maps,
             splits=map_splits,
             stage_name=None,
             count=None,
             cell=args.map_cell,
             limits=map_limits,
         )
+        temporary_maps.replace(maps_path)
         print(
             f"Designer maps saved to {maps_path / 'index.html'} "
             f"({map_rooms} rooms, {map_pages} pages)"
@@ -268,9 +415,12 @@ def main() -> None:
     if _source_hashes() != source_hashes:
         raise RuntimeError("training source files changed during the run")
     report = {
-        "schema_version": 4,
+        "schema_version": 5,
         "curriculum_completed": runner.completed,
-        "final_test_requested": args.final_test,
+        "final_test_requested": (
+            args.final_test
+            or runner.recovery_status in {"test_started", "tested"}
+        ),
         "final_test_evaluated": bool(runner.test_results),
         "run_seed": args.seed,
         "data_seed": args.data_seed,
@@ -297,6 +447,14 @@ def main() -> None:
             ],
         },
         "designer_maps": designer_maps,
+        "graph": {
+            "path": str(graph_path) if graph_path.is_file() else None,
+            "scope": (
+                "post_resume_segment"
+                if resume_path is not None
+                else "full_run"
+            ),
+        },
         "checkpoint": {
             "path": str(checkpoint),
             "sha256": checkpoint_hash,
@@ -305,8 +463,13 @@ def main() -> None:
             {
                 "stage": result.stage,
                 "pool_size": result.pool_size,
+                "scheduled_pool_size": result.scheduled_pool_size,
                 "rounds": result.rounds,
+                "recovery_rounds": result.recovery_rounds,
+                "best_round": result.best_round,
+                "adaptive_expansions": list(result.expansions),
                 "promoted": result.promoted,
+                "failure_reasons": list(result.failure_reasons),
                 "training": result.training.as_dict(),
                 "validation": (
                     result.validation.as_dict()
@@ -336,6 +499,17 @@ def main() -> None:
             "minimum_success_rate": 0.50,
         },
         "promotion_passes": runner.promotion_passes,
+        "recovery": {
+            "state": str(progress_path),
+            "replay_restored": False,
+            "resumed_from": (
+                str(resume_path) if resume_path is not None else None
+            ),
+            "loaded_status": runner.recovery_status,
+            "rounds_per_phase": runner.recovery_rounds,
+            "maximum_pool_size": runner.recovery_pool_max,
+            "maximum_expansions": runner.recovery_expansions,
+        },
         "final_test": (
             [
                 {

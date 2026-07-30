@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import random
 from array import array
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from collections import Counter
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from dataclasses import asdict, dataclass, fields
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import torch
 
 from env_bridge import CoopEnvBridge, GenerationConfig
 from DQN.DQN_train import (
@@ -19,6 +25,7 @@ from DQN.DQN_train import (
 from room_manifest import (
     CurriculumRoomManifest,
     LazyRoomManifestBuilder,
+    manifest_from_dict,
     verify_training_coverage,
 )
 
@@ -72,6 +79,11 @@ class StageResult:
     validation: Evaluation | None
     promoted: bool
     retention: tuple[tuple[str, float], ...] = ()
+    scheduled_pool_size: int | None = None
+    recovery_rounds: int = 0
+    best_round: int = 0
+    expansions: tuple[int, ...] = ()
+    failure_reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +91,115 @@ class StageTestResult:
     stage: str
     evaluation: Evaluation
     episodes: tuple[EvaluationEpisode, ...]
+
+
+def _evaluation_payload(evaluation: Evaluation | None) -> dict[str, Any] | None:
+    if evaluation is None:
+        return None
+    return {
+        field.name: getattr(evaluation, field.name)
+        for field in fields(Evaluation)
+    }
+
+
+def _evaluation_from_payload(payload: Mapping[str, Any] | None) -> Evaluation | None:
+    if payload is None:
+        return None
+    return Evaluation(
+        **{
+            field.name: payload[field.name]
+            for field in fields(Evaluation)
+        }
+    )
+
+
+def _result_payload(result: StageResult) -> dict[str, Any]:
+    return {
+        "stage": result.stage,
+        "pool_size": result.pool_size,
+        "scheduled_pool_size": result.scheduled_pool_size,
+        "rounds": result.rounds,
+        "recovery_rounds": result.recovery_rounds,
+        "best_round": result.best_round,
+        "expansions": list(result.expansions),
+        "training": _evaluation_payload(result.training),
+        "validation": _evaluation_payload(result.validation),
+        "promoted": result.promoted,
+        "retention": [list(item) for item in result.retention],
+        "failure_reasons": list(result.failure_reasons),
+    }
+
+
+def _result_from_payload(payload: Mapping[str, Any]) -> StageResult:
+    training = _evaluation_from_payload(payload["training"])
+    if training is None:
+        raise ValueError("recovery result is missing its training evaluation")
+    return StageResult(
+        stage=str(payload["stage"]),
+        pool_size=int(payload["pool_size"]),
+        scheduled_pool_size=(
+            int(payload["scheduled_pool_size"])
+            if payload.get("scheduled_pool_size") is not None
+            else None
+        ),
+        rounds=int(payload["rounds"]),
+        recovery_rounds=int(payload.get("recovery_rounds", 0)),
+        best_round=int(payload.get("best_round", 0)),
+        expansions=tuple(int(value) for value in payload.get("expansions", ())),
+        training=training,
+        validation=_evaluation_from_payload(payload.get("validation")),
+        promoted=bool(payload["promoted"]),
+        retention=tuple(
+            (str(name), float(rate))
+            for name, rate in payload.get("retention", ())
+        ),
+        failure_reasons=tuple(
+            str(reason) for reason in payload.get("failure_reasons", ())
+        ),
+    )
+
+
+def _test_result_payload(result: StageTestResult) -> dict[str, Any]:
+    return {
+        "stage": result.stage,
+        "evaluation": _evaluation_payload(result.evaluation),
+        "episodes": [
+            {
+                field.name: getattr(episode, field.name)
+                for field in fields(EvaluationEpisode)
+            }
+            for episode in result.episodes
+        ],
+    }
+
+
+def _test_result_from_payload(payload: Mapping[str, Any]) -> StageTestResult:
+    evaluation = _evaluation_from_payload(payload["evaluation"])
+    if evaluation is None:
+        raise ValueError("recovery test result is missing its evaluation")
+    episodes = tuple(
+        EvaluationEpisode(
+            **{
+                field.name: episode[field.name]
+                for field in fields(EvaluationEpisode)
+            }
+        )
+        for episode in payload.get("episodes", ())
+    )
+    return StageTestResult(
+        stage=str(payload["stage"]),
+        evaluation=evaluation,
+        episodes=episodes,
+    )
+
+
+def _hash_payload(payload: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _base_config() -> GenerationConfig:
@@ -1040,6 +1161,13 @@ class CurriculumRunner:
         require_full_coverage: bool = True,
         retention_size: int = 8,
         retention_margin: float = 0.15,
+        recovery_rounds: int = 8,
+        recovery_pool_max: int = 128,
+        recovery_expansions: int = 2,
+        progress_path: str | None = None,
+        resume_from: str | None = None,
+        progress_contract: Mapping[str, Any] | None = None,
+        extend_stopped_rounds: int = 0,
     ) -> None:
         if not pool_sizes or any(size < 1 for size in pool_sizes):
             raise ValueError("pool_sizes must contain positive values")
@@ -1056,6 +1184,13 @@ class CurriculumRunner:
             raise ValueError("promotion_passes must be positive")
         if retention_size < 1 or not 0.0 <= retention_margin <= 1.0:
             raise ValueError("retention settings are invalid")
+        if (
+            recovery_rounds < 0
+            or recovery_pool_max < 1
+            or recovery_expansions < 0
+            or extend_stopped_rounds < 0
+        ):
+            raise ValueError("recovery settings are invalid")
         self.trainer = trainer
         self.stages = tuple(stages or default_stages())
         self.pool_sizes = tuple(sorted(set(pool_sizes)))
@@ -1077,6 +1212,14 @@ class CurriculumRunner:
         self.require_full_coverage = require_full_coverage
         self.retention_size = retention_size
         self.retention_margin = retention_margin
+        self.recovery_rounds = recovery_rounds
+        self.recovery_pool_max = recovery_pool_max
+        self.recovery_expansions = recovery_expansions
+        self.progress_path = (
+            Path(progress_path).expanduser() if progress_path else None
+        )
+        self._external_progress_contract = dict(progress_contract or {})
+        self.extend_stopped_rounds = extend_stopped_rounds
         self.results: list[StageResult] = []
         self.test_results: list[StageTestResult] = []
         self._manifest_builder = LazyRoomManifestBuilder(
@@ -1089,6 +1232,12 @@ class CurriculumRunner:
         self.training_features: tuple[str, ...] = ()
         self._test_started = False
         self._plot: CurriculumPlot | None = None
+        self._resume_active: dict[str, Any] | None = None
+        self._resume_status: str | None = None
+        self._test_model_sha256: str | None = None
+        self._force_replay_refill = False
+        if resume_from is not None:
+            self._load_progress(Path(resume_from).expanduser())
 
     @property
     def completed(self) -> bool:
@@ -1100,15 +1249,432 @@ class CurriculumRunner:
             and all(result.promoted for result in self.results)
         )
 
+    @property
+    def recovery_status(self) -> str | None:
+        return self._resume_status
+
+    @property
+    def model_sha256(self) -> str:
+        return self._model_sha256()
+
     def prepare_room_manifest(self) -> CurriculumRoomManifest:
         self.room_manifest = self._manifest_builder.snapshot()
         return self.room_manifest
 
+    def _progress_contract(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "trainer": asdict(self.trainer.cfg),
+            "device": self.trainer.device.type,
+            "run_seed": self.run_seed,
+            "data_seed": self.data_seed,
+            "pool_sizes": list(self.pool_sizes),
+            "validation_size": self.validation_size,
+            "test_size": self.test_size,
+            "episodes_per_seed": self.episodes_per_seed,
+            "max_rounds": self.max_rounds,
+            "promotion_passes": self.promotion_passes,
+            "retention_size": self.retention_size,
+            "retention_margin": self.retention_margin,
+            "recovery_rounds": self.recovery_rounds,
+            "recovery_pool_max": self.recovery_pool_max,
+            "recovery_expansions": self.recovery_expansions,
+            "stages": [
+                {
+                    "name": stage.name,
+                    "config": stage.config.to_dict(),
+                    "pool_sizes": list(stage.pool_sizes or self.pool_sizes),
+                    "train_threshold": stage.train_threshold,
+                    "validation_threshold": stage.validation_threshold,
+                    "max_wipeout_death_rate": stage.max_wipeout_death_rate,
+                    "objective": stage.objective,
+                    "required_features": list(stage.required_features),
+                }
+                for stage in self.stages
+            ],
+            "external": self._external_progress_contract,
+        }
+
+    def _model_sha256(self) -> str:
+        digest = hashlib.sha256()
+        for learner_index, learner in enumerate(self.trainer.learners):
+            digest.update(str(learner_index).encode("ascii"))
+            for name, tensor in learner.net.state_dict().items():
+                value = tensor.detach().cpu().contiguous()
+                digest.update(name.encode("utf-8"))
+                digest.update(str(value.dtype).encode("ascii"))
+                digest.update(str(tuple(value.shape)).encode("ascii"))
+                digest.update(value.numpy().tobytes())
+        return digest.hexdigest()
+
+    @staticmethod
+    def _active_payload(active: Mapping[str, Any] | None) -> dict[str, Any] | None:
+        if active is None:
+            return None
+        return {
+            "stage_index": int(active["stage_index"]),
+            "pool_index": int(active["pool_index"]),
+            "scheduled_pool_size": int(active["scheduled_pool_size"]),
+            "active_pool_size": int(active["active_pool_size"]),
+            "total_rounds": int(active["total_rounds"]),
+            "normal_rounds": int(active["normal_rounds"]),
+            "recovery_rounds": int(active["recovery_rounds"]),
+            "phase": str(active["phase"]),
+            "phase_rounds": int(active["phase_rounds"]),
+            "streak": int(active["streak"]),
+            "expansions": list(active["expansions"]),
+            "rng_state": active["rng_state"],
+            "best_rank": list(active["best_rank"]),
+            "best_round": int(active["best_round"]),
+            "best_training": _evaluation_payload(active["best_training"]),
+            "best_validation": _evaluation_payload(active["best_validation"]),
+            "best_retention": [
+                list(item) for item in active["best_retention"]
+            ],
+            "best_failures": list(active["best_failures"]),
+            "best_learner_state": active["best_learner_state"],
+            "phase_limit": (
+                int(active["phase_limit"])
+                if active.get("phase_limit") is not None
+                else None
+            ),
+            "needs_replay_refill": bool(active["needs_replay_refill"]),
+        }
+
+    @staticmethod
+    def _active_from_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+        training = _evaluation_from_payload(payload["best_training"])
+        if training is None:
+            raise ValueError("active recovery state is missing training metrics")
+        return {
+            "stage_index": int(payload["stage_index"]),
+            "pool_index": int(payload["pool_index"]),
+            "scheduled_pool_size": int(payload["scheduled_pool_size"]),
+            "active_pool_size": int(payload["active_pool_size"]),
+            "total_rounds": int(payload["total_rounds"]),
+            "normal_rounds": int(payload["normal_rounds"]),
+            "recovery_rounds": int(payload["recovery_rounds"]),
+            "phase": str(payload["phase"]),
+            "phase_rounds": int(payload["phase_rounds"]),
+            "streak": int(payload["streak"]),
+            "expansions": [
+                int(value) for value in payload.get("expansions", ())
+            ],
+            "rng_state": payload["rng_state"],
+            "best_rank": tuple(
+                float(value) for value in payload["best_rank"]
+            ),
+            "best_round": int(payload["best_round"]),
+            "best_training": training,
+            "best_validation": _evaluation_from_payload(
+                payload.get("best_validation")
+            ),
+            "best_retention": tuple(
+                (str(name), float(rate))
+                for name, rate in payload.get("best_retention", ())
+            ),
+            "best_failures": tuple(
+                str(reason) for reason in payload.get("best_failures", ())
+            ),
+            "best_learner_state": payload["best_learner_state"],
+            "phase_limit": (
+                int(payload["phase_limit"])
+                if payload.get("phase_limit") is not None
+                else None
+            ),
+            "needs_replay_refill": bool(
+                payload.get("needs_replay_refill", False)
+            ),
+        }
+
+    def _save_progress(
+        self,
+        status: str,
+        active: Mapping[str, Any] | None,
+    ) -> None:
+        if self.progress_path is None:
+            return
+        contract = self._progress_contract()
+        payload = {
+            "schema_version": 1,
+            "status": status,
+            "contract": contract,
+            "contract_sha256": _hash_payload(contract),
+            "results": [_result_payload(result) for result in self.results],
+            "test_results": [
+                _test_result_payload(result) for result in self.test_results
+            ],
+            "test_model_sha256": self._test_model_sha256,
+            "active": self._active_payload(active),
+            "manifest": self._manifest_builder.snapshot().as_dict(),
+            "trainer": self.trainer.recovery_state(),
+        }
+        target = self.progress_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f".{target.name}.tmp")
+        torch.save(payload, temporary)
+        with temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+        temporary.replace(target)
+        try:
+            directory = os.open(target.parent, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+    def _load_progress(self, path: Path) -> None:
+        if not path.is_file():
+            raise FileNotFoundError(f"recovery state does not exist: {path}")
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        if payload.get("schema_version") != 1:
+            raise ValueError("curriculum recovery schema does not match")
+        contract = self._progress_contract()
+        if (
+            payload.get("contract_sha256") != _hash_payload(contract)
+            or payload.get("contract") != contract
+        ):
+            raise ValueError(
+                "recovery state does not match this code, seed, or training config"
+            )
+        status = str(payload.get("status"))
+        if status not in {
+            "training",
+            "stopped",
+            "completed",
+            "test_started",
+            "tested",
+        }:
+            raise ValueError(f"unsupported recovery status {status!r}")
+        if self.extend_stopped_rounds and status != "stopped":
+            raise ValueError(
+                "--extend-stopped-rounds only applies to a stopped state"
+            )
+        manifest = manifest_from_dict(payload["manifest"])
+        self._manifest_builder = LazyRoomManifestBuilder(
+            self.stages,
+            data_seed=self.data_seed,
+            initial=manifest,
+        )
+        self.room_manifest = manifest
+        self.results = [
+            _result_from_payload(result)
+            for result in payload.get("results", ())
+        ]
+        self.test_results = [
+            _test_result_from_payload(result)
+            for result in payload.get("test_results", ())
+        ]
+        self.trainer.load_recovery_state(payload["trainer"])
+        self._test_model_sha256 = payload.get("test_model_sha256")
+        if (
+            status in {"test_started", "tested"}
+            and self._test_model_sha256 != self._model_sha256()
+        ):
+            raise ValueError("sealed final-test model hash does not match")
+        active_payload = payload.get("active")
+        self._resume_active = (
+            self._active_from_payload(active_payload)
+            if active_payload is not None
+            else None
+        )
+        if status == "stopped":
+            if self._resume_active is None:
+                raise ValueError("stopped recovery state has no active pool")
+            if self.extend_stopped_rounds < 1:
+                raise RuntimeError(
+                    "recovery budget is exhausted; pass "
+                    "--extend-stopped-rounds N to authorize more tuning"
+                )
+            self._resume_active["phase"] = "extension"
+            self._resume_active["phase_limit"] = self.extend_stopped_rounds
+            self._resume_active["phase_rounds"] = 0
+            self._resume_active["streak"] = 0
+            self.trainer.load_learner_state(
+                self._resume_active["best_learner_state"]
+            )
+        if status in {"test_started", "tested"}:
+            self._test_started = True
+            if self._resume_active is not None:
+                raise ValueError("sealed final-test state has an active training pool")
+        self._resume_status = status
+        if self.progress_path is None:
+            self.progress_path = path
+        print(
+            f"Resumed {status} curriculum state from {path}.",
+            flush=True,
+        )
+        if status in {"training", "stopped"}:
+            if self._resume_active is not None:
+                self._resume_active["needs_replay_refill"] = True
+            else:
+                self._force_replay_refill = True
+            print("The replay buffer will warm up again.", flush=True)
+
+    def _training_failures(
+        self,
+        stage: CurriculumStage,
+        evaluation: Evaluation,
+    ) -> tuple[str, ...]:
+        failures: list[str] = []
+        if evaluation.success_rate < stage.train_threshold:
+            failures.append(
+                "training success "
+                f"{evaluation.success_rate:.1%} < {stage.train_threshold:.1%}"
+            )
+        if evaluation.wipeout_death_rate > stage.max_wipeout_death_rate:
+            failures.append(
+                "training wipeout deaths "
+                f"{evaluation.wipeout_death_rate:.1%} > "
+                f"{stage.max_wipeout_death_rate:.1%}"
+            )
+        if (
+            stage.objective_check is not None
+            and not stage.objective_check(evaluation)
+        ):
+            failures.append(f"training objective unmet: {stage.objective}")
+        return tuple(failures)
+
+    def _validation_failures(
+        self,
+        stage: CurriculumStage,
+        evaluation: Evaluation | None,
+    ) -> tuple[str, ...]:
+        if evaluation is None:
+            return ()
+        failures: list[str] = []
+        if evaluation.success_rate < stage.validation_threshold:
+            failures.append(
+                "validation success "
+                f"{evaluation.success_rate:.1%} < "
+                f"{stage.validation_threshold:.1%}"
+            )
+        if evaluation.wipeout_death_rate > stage.max_wipeout_death_rate:
+            failures.append(
+                "validation wipeout deaths "
+                f"{evaluation.wipeout_death_rate:.1%} > "
+                f"{stage.max_wipeout_death_rate:.1%}"
+            )
+        if (
+            stage.objective_check is not None
+            and not stage.objective_check(evaluation)
+        ):
+            failures.append(f"validation objective unmet: {stage.objective}")
+        return tuple(failures)
+
+    def _retention_failures(
+        self,
+        retention: Sequence[tuple[str, float]],
+    ) -> tuple[str, ...]:
+        failures: list[str] = []
+        stage_index = {
+            stage.name: index for index, stage in enumerate(self.stages)
+        }
+        for name, rate in retention:
+            threshold = max(
+                0.50,
+                self.stages[stage_index[name]].validation_threshold
+                - self.retention_margin,
+            )
+            if rate < threshold:
+                failures.append(
+                    f"retention {name} {rate:.1%} < {threshold:.1%}"
+                )
+        return tuple(failures)
+
+    def _assessment(
+        self,
+        stage: CurriculumStage,
+        training: Evaluation,
+        validation: Evaluation | None,
+        retention: Sequence[tuple[str, float]],
+    ) -> tuple[tuple[str, ...], tuple[float, ...]]:
+        training_failures = self._training_failures(stage, training)
+        validation_failures = self._validation_failures(stage, validation)
+        retention_failures = self._retention_failures(retention)
+        failures = (
+            *training_failures,
+            *validation_failures,
+            *retention_failures,
+        )
+        deficit = max(0.0, stage.train_threshold - training.success_rate)
+        deficit += max(
+            0.0,
+            training.wipeout_death_rate - stage.max_wipeout_death_rate,
+        )
+        if any("training objective" in item for item in training_failures):
+            deficit += 1.0
+        generalization = training.success_rate
+        if validation is not None:
+            deficit += max(
+                0.0,
+                stage.validation_threshold - validation.success_rate,
+            )
+            deficit += max(
+                0.0,
+                validation.wipeout_death_rate
+                - stage.max_wipeout_death_rate,
+            )
+            if any(
+                "validation objective" in item
+                for item in validation_failures
+            ):
+                deficit += 1.0
+            generalization = validation.success_rate
+        if retention:
+            generalization = min(
+                generalization,
+                min(rate for _, rate in retention),
+            )
+        deficit += float(len(retention_failures))
+        rank = (
+            float(not failures),
+            -deficit,
+            generalization,
+            training.success_rate,
+            -training.wipeout_death_rate,
+            training.mean_return,
+        )
+        return tuple(failures), rank
+
+    def _should_expand(
+        self,
+        stage: CurriculumStage,
+        training: Evaluation,
+        validation: Evaluation | None,
+        retention: Sequence[tuple[str, float]],
+    ) -> bool:
+        return (
+            not self._training_failures(stage, training)
+            and bool(self._validation_failures(stage, validation))
+            and not self._retention_failures(retention)
+        )
+
     def run(self) -> list[StageResult]:
         from DQN.DQN_rewards import CurriculumPlot
 
-        if self.results:
+        if self.results and self._resume_status is None:
             raise RuntimeError("this curriculum runner has already trained")
+        if (
+            self._resume_status in {"completed", "test_started", "tested"}
+            and self.completed
+        ):
+            self.room_manifest = self._manifest_builder.snapshot()
+            train_limits = {stage.name: 0 for stage in self.stages}
+            for result in self.results:
+                train_limits[result.stage] = max(
+                    train_limits[result.stage],
+                    result.pool_size,
+                )
+            self.training_features = verify_training_coverage(
+                self.room_manifest,
+                train_limits,
+                require_all=self.require_full_coverage,
+            )
+            print("Recovered curriculum is already complete.", flush=True)
+            return list(self.results)
         self.prepare_room_manifest()
         plot = self._plot
         created_plot = False
@@ -1206,252 +1772,571 @@ class CurriculumRunner:
                 require_all=require_all,
             )
 
+        def record_outcome(outcome) -> None:
+            plot_returns.append(outcome.reward)
+            plot_completed.append(float(outcome.completed))
+            plot_deaths.append(
+                float(outcome.metrics["wipeout_deaths"] > 0)
+            )
+            plot_hazards.append(float(outcome.metrics["hazards"] > 0))
+            plot_bridge_falls.append(
+                float(outcome.metrics["bridge_falls"] > 0)
+            )
+            plot_crate_switches.append(
+                float(outcome.metrics["crate_switches_solved"] > 0)
+            )
+            plot_resets.append(
+                float(outcome.metrics["reset_zones"] > 0)
+            )
+            plot_steps.append(float(outcome.steps))
+            plot_epsilons.append(self.trainer.epsilon())
+            if plot is not None and plot.visible:
+                plot.update(
+                    plot_returns,
+                    plot_completed,
+                    plot_deaths,
+                    plot_steps,
+                    plot_epsilons,
+                    hazards=plot_hazards,
+                    bridge_falls=plot_bridge_falls,
+                    crate_switches=plot_crate_switches,
+                    resets=plot_resets,
+                )
+
         rehearsal: list[tuple[CoopEnvBridge, tuple[int, ...]]] = []
         retention_sets: list[
             tuple[str, CoopEnvBridge, tuple[int, ...]]
         ] = []
-        for stage_index, stage in enumerate(self.stages):
-            stage_pool_sizes = tuple(
-                sorted(set(stage.pool_sizes or self.pool_sizes))
+        result_ordinal = 0
+        resume_active = self._resume_active
+        resume_warmup_pending = self._resume_status in {"training", "stopped"}
+        resume_graph_boundary = self._resume_status is not None
+        if resume_graph_boundary:
+            print(
+                "The dashboard starts at this resume boundary; prior greedy "
+                "pool metrics remain in the recovery state and final report.",
+                flush=True,
             )
-            largest_pool = stage_pool_sizes[-1]
-            stage_marks.append((len(plot_returns), stage.name))
-            if plot is not None:
-                plot.mark_stage(len(plot_returns), stage.name)
-            if stage.lesson:
-                print(f"\n{stage.name}: {stage.lesson}", flush=True)
-            if stage.objective:
-                print(f"Promotion objective: {stage.objective}", flush=True)
-            stage_config = stage.config
-            train_seeds: tuple[int, ...] = ()
-            validation_seeds: tuple[int, ...] = ()
-
-            train_env = CoopEnvBridge(
-                stage_config,
-                seed=self.data_seed,
-                max_steps=self.trainer.cfg.max_steps,
-                shaping_gamma=self.trainer.cfg.gamma,
-                record_metrics=False,
-            )
-            train_env.set_room_cache_limit(largest_pool)
-            training_eval_env = CoopEnvBridge(
-                stage_config,
-                seed=self.data_seed,
-                max_steps=self.trainer.cfg.max_steps,
-                shaping_gamma=self.trainer.cfg.gamma,
-                record_metrics=False,
-            )
-            training_eval_env.set_room_cache_limit(largest_pool)
-            validation_eval_env = CoopEnvBridge(
-                stage_config,
-                seed=self.data_seed,
-                max_steps=self.trainer.cfg.max_steps,
-                shaping_gamma=self.trainer.cfg.gamma,
-                record_metrics=False,
-            )
-            validation_eval_env.set_room_cache_limit(self.validation_size)
-            self.trainer.set_env(train_env, clear_replay=stage_index > 0)
-            if stage_index > 0:
-                self.trainer.reheat_exploration()
-
-            for pool_size in stage_pool_sizes:
-                train_seeds, new_train_rooms = stage_rooms(
-                    stage,
-                    "train",
-                    pool_size,
-                    largest_pool,
+        try:
+            for stage_index, stage in enumerate(self.stages):
+                stage_pool_sizes = tuple(
+                    sorted(set(stage.pool_sizes or self.pool_sizes))
                 )
-                train_env.cache_rooms(new_train_rooms)
-                training_eval_env.cache_rooms(new_train_rooms)
-                if pool_size == largest_pool:
-                    validation_seeds, new_validation_rooms = stage_rooms(
+                largest_pool = stage_pool_sizes[-1]
+                cache_limit = max(largest_pool, self.recovery_pool_max)
+
+                train_env = CoopEnvBridge(
+                    stage.config,
+                    seed=self.data_seed,
+                    max_steps=self.trainer.cfg.max_steps,
+                    shaping_gamma=self.trainer.cfg.gamma,
+                    record_metrics=False,
+                )
+                train_env.set_room_cache_limit(cache_limit)
+                training_eval_env = CoopEnvBridge(
+                    stage.config,
+                    seed=self.data_seed,
+                    max_steps=self.trainer.cfg.max_steps,
+                    shaping_gamma=self.trainer.cfg.gamma,
+                    record_metrics=False,
+                )
+                training_eval_env.set_room_cache_limit(cache_limit)
+                validation_eval_env = CoopEnvBridge(
+                    stage.config,
+                    seed=self.data_seed,
+                    max_steps=self.trainer.cfg.max_steps,
+                    shaping_gamma=self.trainer.cfg.gamma,
+                    record_metrics=False,
+                )
+                validation_eval_env.set_room_cache_limit(self.validation_size)
+                saved_stage = self._manifest_builder.snapshot().stage(stage.name)
+                train_seeds = saved_stage.seeds("train")
+                validation_seeds = saved_stage.seeds("validation")
+                trainer_attached = False
+                stage_announced = False
+
+                for pool_index, scheduled_pool_size in enumerate(stage_pool_sizes):
+                    if result_ordinal < len(self.results):
+                        saved_result = self.results[result_ordinal]
+                        expected_pool = (
+                            saved_result.scheduled_pool_size
+                            if saved_result.scheduled_pool_size is not None
+                            else saved_result.pool_size
+                        )
+                        if (
+                            saved_result.stage != stage.name
+                            or expected_pool != scheduled_pool_size
+                            or not saved_result.promoted
+                        ):
+                            raise ValueError(
+                                "recovery results do not follow the curriculum order"
+                            )
+                        result_ordinal += 1
+                        continue
+
+                    if not stage_announced:
+                        label = (
+                            f"resume:{stage.name}"
+                            if resume_graph_boundary
+                            else stage.name
+                        )
+                        resume_graph_boundary = False
+                        stage_marks.append((len(plot_returns), label))
+                        if plot is not None:
+                            plot.mark_stage(len(plot_returns), label)
+                        if stage.lesson:
+                            print(f"\n{stage.name}: {stage.lesson}", flush=True)
+                        if stage.objective:
+                            print(
+                                f"Promotion objective: {stage.objective}",
+                                flush=True,
+                            )
+                        stage_announced = True
+                    if not trainer_attached:
+                        resumed_here = resume_warmup_pending
+                        self.trainer.set_env(
+                            train_env,
+                            clear_replay=stage_index > 0 or resumed_here,
+                        )
+                        if stage_index > 0 or resumed_here:
+                            self.trainer.reheat_exploration()
+                        resume_warmup_pending = False
+                        trainer_attached = True
+
+                    active = None
+                    if resume_active is not None:
+                        if (
+                            int(resume_active["stage_index"]) != stage_index
+                            or int(resume_active["pool_index"]) != pool_index
+                            or int(resume_active["scheduled_pool_size"])
+                            != scheduled_pool_size
+                        ):
+                            raise ValueError(
+                                "recovery cursor does not match completed results"
+                            )
+                        active = resume_active
+                        resume_active = None
+                        print(
+                            f"Continuing {stage.name} pool="
+                            f"{active['active_pool_size']} after round "
+                            f"{active['total_rounds']}.",
+                            flush=True,
+                        )
+
+                    active_pool_size = (
+                        int(active["active_pool_size"])
+                        if active is not None
+                        else scheduled_pool_size
+                    )
+                    train_seeds, new_train_rooms = stage_rooms(
                         stage,
-                        "validation",
-                        self.validation_size,
-                        self.validation_size,
+                        "train",
+                        active_pool_size,
+                        largest_pool,
                     )
-                    validation_eval_env.cache_rooms(new_validation_rooms)
-                if plot is not None and plot.visible:
-                    plot.set_context(stage.name, pool_size)
-                pool = train_seeds[:pool_size]
-                rng = random.Random(
-                    derive_seed(self.run_seed, f"{stage.name}:pool:{pool_size}")
-                )
-                streak = 0
-                round_index = 0
-                training_eval: Evaluation | None = None
-                validation_eval: Evaluation | None = None
-                retention_eval: tuple[tuple[str, float], ...] = ()
+                    train_env.cache_rooms(new_train_rooms)
+                    training_eval_env.cache_rooms(new_train_rooms)
+                    if scheduled_pool_size == largest_pool:
+                        validation_seeds, new_validation_rooms = stage_rooms(
+                            stage,
+                            "validation",
+                            self.validation_size,
+                            self.validation_size,
+                        )
+                        validation_eval_env.cache_rooms(new_validation_rooms)
+                    if plot is not None and plot.visible:
+                        plot.set_context(stage.name, active_pool_size)
 
-                for round_index in range(1, self.max_rounds + 1):
-                    episodes = max(50, self.episodes_per_seed * pool_size)
-                    for _ in range(episodes):
-                        if rehearsal and rng.random() < 0.20:
-                            old_env, old_seeds = rng.choice(rehearsal)
-                            outcome = self.trainer.run_episode(
-                                seed=rng.choice(old_seeds),
-                                env=old_env,
-                            )
-                        else:
-                            outcome = self.trainer.run_episode(seed=rng.choice(pool))
-                        plot_returns.append(outcome.reward)
-                        plot_completed.append(float(outcome.completed))
-                        plot_deaths.append(
-                            float(outcome.metrics["wipeout_deaths"] > 0)
+                    rng = random.Random(
+                        derive_seed(
+                            self.run_seed,
+                            f"{stage.name}:pool:{scheduled_pool_size}",
                         )
-                        plot_hazards.append(
-                            float(outcome.metrics["hazards"] > 0)
-                        )
-                        plot_bridge_falls.append(
-                            float(outcome.metrics["bridge_falls"] > 0)
-                        )
-                        plot_crate_switches.append(
-                            float(outcome.metrics["crate_switches_solved"] > 0)
-                        )
-                        plot_resets.append(
-                            float(outcome.metrics["reset_zones"] > 0)
-                        )
-                        plot_steps.append(float(outcome.steps))
-                        plot_epsilons.append(self.trainer.epsilon())
-                        if plot is not None and plot.visible:
-                            plot.update(
-                                plot_returns,
-                                plot_completed,
-                                plot_deaths,
-                                plot_steps,
-                                plot_epsilons,
-                                hazards=plot_hazards,
-                                bridge_falls=plot_bridge_falls,
-                                crate_switches=plot_crate_switches,
-                                resets=plot_resets,
-                            )
+                    )
+                    if active is not None:
+                        rng.setstate(active["rng_state"])
+                    else:
+                        active = {
+                            "stage_index": stage_index,
+                            "pool_index": pool_index,
+                            "scheduled_pool_size": scheduled_pool_size,
+                            "active_pool_size": active_pool_size,
+                            "total_rounds": 0,
+                            "normal_rounds": 0,
+                            "recovery_rounds": 0,
+                            "phase": "normal",
+                            "phase_limit": None,
+                            "phase_rounds": 0,
+                            "streak": 0,
+                            "expansions": [],
+                            "rng_state": rng.getstate(),
+                            "best_rank": (),
+                            "best_round": 0,
+                            "best_training": None,
+                            "best_validation": None,
+                            "best_retention": (),
+                            "best_failures": (),
+                            "best_learner_state": None,
+                            "needs_replay_refill": self._force_replay_refill,
+                        }
+                        self._force_replay_refill = False
+                        self._save_progress("training", None)
 
-                    training_eval = evaluate(
-                        self.trainer.agents,
-                        training_eval_env,
-                        pool,
-                    )
-                    validation_eval = None
-                    passed = (
-                        training_eval.success_rate >= stage.train_threshold
-                        and training_eval.wipeout_death_rate
-                        <= stage.max_wipeout_death_rate
-                        and (
-                            stage.objective_check is None
-                            or stage.objective_check(training_eval)
+                    while True:
+                        pool = train_seeds[: int(active["active_pool_size"])]
+                        phase = str(active["phase"])
+                        episodes = max(
+                            50,
+                            self.episodes_per_seed
+                            * int(active["active_pool_size"]),
                         )
-                    )
-                    if pool_size == largest_pool:
-                        validation_eval = evaluate(
+                        rehearse_rate = 0.20
+                        if (
+                            phase == "recovery"
+                            and any(
+                                reason.startswith("retention ")
+                                for reason in active["best_failures"]
+                            )
+                        ):
+                            rehearse_rate = 0.35
+                        if active["needs_replay_refill"]:
+                            ready = max(
+                                self.trainer.cfg.batch_size,
+                                self.trainer.cfg.replay_warmup,
+                            )
+                            refill_episodes = 0
+                            print(
+                                f"  recovery: refilling replay to {ready} "
+                                "transitions before counting another round.",
+                                flush=True,
+                            )
+                            while len(self.trainer.learners[0].replay) < ready:
+                                if rehearsal and rng.random() < rehearse_rate:
+                                    old_env, old_seeds = rng.choice(rehearsal)
+                                    outcome = self.trainer.run_episode(
+                                        seed=rng.choice(old_seeds),
+                                        env=old_env,
+                                    )
+                                else:
+                                    outcome = self.trainer.run_episode(
+                                        seed=rng.choice(pool)
+                                    )
+                                record_outcome(outcome)
+                                refill_episodes += 1
+                            active["needs_replay_refill"] = False
+                            active["rng_state"] = rng.getstate()
+                            if active["best_training"] is not None:
+                                self._save_progress("training", active)
+                            print(
+                                f"  recovery: replay ready after "
+                                f"{refill_episodes} refill episodes.",
+                                flush=True,
+                            )
+                        for _ in range(episodes):
+                            if rehearsal and rng.random() < rehearse_rate:
+                                old_env, old_seeds = rng.choice(rehearsal)
+                                outcome = self.trainer.run_episode(
+                                    seed=rng.choice(old_seeds),
+                                    env=old_env,
+                                )
+                            else:
+                                outcome = self.trainer.run_episode(
+                                    seed=rng.choice(pool)
+                                )
+                            record_outcome(outcome)
+
+                        training_eval = evaluate(
                             self.trainer.agents,
-                            validation_eval_env,
-                            validation_seeds,
+                            training_eval_env,
+                            pool,
                         )
-                        passed = (
-                            passed
-                            and validation_eval.success_rate
-                            >= stage.validation_threshold
-                            and validation_eval.wipeout_death_rate
-                            <= stage.max_wipeout_death_rate
-                            and (
-                                stage.objective_check is None
-                                or stage.objective_check(validation_eval)
+                        validation_eval = None
+                        retention_eval: tuple[tuple[str, float], ...] = ()
+                        if scheduled_pool_size == largest_pool:
+                            validation_eval = evaluate(
+                                self.trainer.agents,
+                                validation_eval_env,
+                                validation_seeds,
                             )
-                        )
-                        retention_eval = self._evaluate_retention(retention_sets)
-                        passed = passed and all(
-                            rate
-                            >= max(
-                                0.50,
-                                self.stages[index].validation_threshold
-                                - self.retention_margin,
+                            retention_eval = self._evaluate_retention(
+                                retention_sets
                             )
-                            for index, (_, rate) in enumerate(retention_eval)
+                        failures, rank = self._assessment(
+                            stage,
+                            training_eval,
+                            validation_eval,
+                            retention_eval,
                         )
-                    evaluation_mark = (
-                        len(plot_returns),
-                        training_eval.success_rate,
-                        (
-                            validation_eval.success_rate
-                            if validation_eval is not None
-                            else None
-                        ),
-                        (
-                            min(rate for _, rate in retention_eval)
-                            if retention_eval
-                            else None
-                        ),
-                    )
-                    evaluation_marks.append(evaluation_mark)
-                    if plot is not None:
-                        plot.add_evaluation(
-                            *evaluation_mark,
+                        passed = not failures
+                        active["total_rounds"] += 1
+                        active["phase_rounds"] += 1
+                        if phase == "normal":
+                            active["normal_rounds"] += 1
+                        else:
+                            active["recovery_rounds"] += 1
+                        active["streak"] = (
+                            int(active["streak"]) + 1 if passed else 0
                         )
-                        if plot.visible:
-                            plot.update(
-                                plot_returns,
-                                plot_completed,
-                                plot_deaths,
-                                plot_steps,
-                                plot_epsilons,
-                                hazards=plot_hazards,
-                                bridge_falls=plot_bridge_falls,
-                                crate_switches=plot_crate_switches,
-                                resets=plot_resets,
-                                force=True,
+                        if (
+                            not active["best_rank"]
+                            or rank > tuple(active["best_rank"])
+                        ):
+                            active["best_rank"] = rank
+                            active["best_round"] = active["total_rounds"]
+                            active["best_training"] = training_eval
+                            active["best_validation"] = validation_eval
+                            active["best_retention"] = retention_eval
+                            active["best_failures"] = failures
+                            active["best_learner_state"] = (
+                                self.trainer.learner_state()
                             )
+                        active["rng_state"] = rng.getstate()
 
-                    streak = streak + 1 if passed else 0
-                    self._print_round(
-                        stage,
-                        pool_size,
-                        round_index,
-                        training_eval,
-                        validation_eval,
-                        retention_eval,
-                    )
-                    if streak >= self.promotion_passes:
-                        break
+                        evaluation_mark = (
+                            len(plot_returns),
+                            training_eval.success_rate,
+                            (
+                                validation_eval.success_rate
+                                if validation_eval is not None
+                                else None
+                            ),
+                            (
+                                min(rate for _, rate in retention_eval)
+                                if retention_eval
+                                else None
+                            ),
+                        )
+                        evaluation_marks.append(evaluation_mark)
+                        if plot is not None:
+                            plot.add_evaluation(*evaluation_mark)
+                            if plot.visible:
+                                plot.update(
+                                    plot_returns,
+                                    plot_completed,
+                                    plot_deaths,
+                                    plot_steps,
+                                    plot_epsilons,
+                                    hazards=plot_hazards,
+                                    bridge_falls=plot_bridge_falls,
+                                    crate_switches=plot_crate_switches,
+                                    resets=plot_resets,
+                                    force=True,
+                                )
+                        self._print_round(
+                            stage,
+                            int(active["active_pool_size"]),
+                            int(active["total_rounds"]),
+                            training_eval,
+                            validation_eval,
+                            retention_eval,
+                            failures,
+                            phase,
+                        )
+                        best_training = active["best_training"]
+                        if not isinstance(best_training, Evaluation):
+                            raise RuntimeError("best training evaluation was not saved")
+                        best_validation = active["best_validation"]
+                        best_retention = active["best_retention"]
 
-                assert training_eval is not None
-                promoted = streak >= self.promotion_passes
-                result = StageResult(
-                    stage=stage.name,
-                    pool_size=pool_size,
-                    rounds=round_index,
-                    training=training_eval,
-                    validation=validation_eval,
-                    promoted=promoted,
-                    retention=retention_eval,
+                        if int(active["streak"]) >= self.promotion_passes:
+                            self.trainer.load_learner_state(
+                                active["best_learner_state"]
+                            )
+                            if int(active["best_round"]) != int(
+                                active["total_rounds"]
+                            ):
+                                self.trainer.clear_replay()
+                                self.trainer.reheat_exploration()
+                                self._force_replay_refill = True
+                            result = StageResult(
+                                stage=stage.name,
+                                pool_size=int(active["active_pool_size"]),
+                                scheduled_pool_size=scheduled_pool_size,
+                                rounds=int(active["total_rounds"]),
+                                recovery_rounds=int(active["recovery_rounds"]),
+                                best_round=int(active["best_round"]),
+                                expansions=tuple(active["expansions"]),
+                                training=best_training,
+                                validation=best_validation,
+                                promoted=True,
+                                retention=best_retention,
+                            )
+                            self.results.append(result)
+                            result_ordinal += 1
+                            self._resume_active = None
+                            self._save_progress("training", None)
+                            break
+
+                        phase_limit = active.get("phase_limit")
+                        if phase_limit is None:
+                            phase_limit = (
+                                self.max_rounds
+                                if phase == "normal"
+                                else self.recovery_rounds
+                            )
+                        if int(active["phase_rounds"]) < phase_limit:
+                            self._save_progress("training", active)
+                            continue
+
+                        self.trainer.load_learner_state(
+                            active["best_learner_state"]
+                        )
+                        self.trainer.clear_replay()
+                        self.trainer.reheat_exploration()
+                        active["needs_replay_refill"] = True
+                        can_expand = (
+                            scheduled_pool_size == largest_pool
+                            and int(active["active_pool_size"])
+                            < self.recovery_pool_max
+                            and len(active["expansions"])
+                            < self.recovery_expansions
+                            and self._should_expand(
+                                stage,
+                                best_training,
+                                best_validation,
+                                best_retention,
+                            )
+                        )
+                        begin_recovery = (
+                            phase == "normal" and self.recovery_rounds > 0
+                        )
+                        if begin_recovery or (phase == "recovery" and can_expand):
+                            if can_expand:
+                                old_size = int(active["active_pool_size"])
+                                new_size = min(
+                                    self.recovery_pool_max,
+                                    max(old_size + 1, old_size * 2),
+                                )
+                                train_seeds, new_train_rooms = stage_rooms(
+                                    stage,
+                                    "train",
+                                    new_size,
+                                    largest_pool,
+                                )
+                                train_env.cache_rooms(new_train_rooms)
+                                training_eval_env.cache_rooms(new_train_rooms)
+                                active["active_pool_size"] = new_size
+                                active["expansions"].append(new_size)
+                                if plot is not None and plot.visible:
+                                    plot.set_context(stage.name, new_size)
+                                print(
+                                    "  recovery: validation generalization "
+                                    f"failed, expanding train rooms "
+                                    f"{old_size} -> {new_size}.",
+                                    flush=True,
+                                )
+                            else:
+                                print(
+                                    "  recovery: restoring the best round and "
+                                    f"adding {self.recovery_rounds} bounded "
+                                    "rounds on the same rooms.",
+                                    flush=True,
+                                )
+                            active["phase"] = "recovery"
+                            active["phase_limit"] = None
+                            active["phase_rounds"] = 0
+                            active["streak"] = 0
+                            active["rng_state"] = rng.getstate()
+                            self._save_progress("training", active)
+                            continue
+
+                        active["rng_state"] = rng.getstate()
+                        self._save_progress("stopped", active)
+                        result = StageResult(
+                            stage=stage.name,
+                            pool_size=int(active["active_pool_size"]),
+                            scheduled_pool_size=scheduled_pool_size,
+                            rounds=int(active["total_rounds"]),
+                            recovery_rounds=int(active["recovery_rounds"]),
+                            best_round=int(active["best_round"]),
+                            expansions=tuple(active["expansions"]),
+                            training=best_training,
+                            validation=best_validation,
+                            promoted=False,
+                            retention=best_retention,
+                            failure_reasons=tuple(active["best_failures"]),
+                        )
+                        self.results.append(result)
+                        self._resume_active = active
+                        print(
+                            "  recovery exhausted without lowering any "
+                            "promotion requirement.",
+                            flush=True,
+                        )
+                        finish_manifest(False)
+                        finish_plot()
+                        return list(self.results)
+
+                stage_results = [
+                    result
+                    for result in self.results
+                    if result.stage == stage.name
+                ]
+                effective_pool = max(
+                    result.pool_size for result in stage_results
                 )
-                self.results.append(result)
-                if not promoted:
-                    finish_manifest(False)
-                    finish_plot()
-                    return self.results
-            train_env.set_room_cache_limit(min(4, largest_pool))
-            rehearsal.append((train_env, train_seeds[:largest_pool]))
-            retention_seeds = validation_seeds[: self.retention_size]
-            for seed in retention_seeds:
-                validation_eval_env.reset(seed=seed)
-            validation_eval_env.set_room_cache_limit(len(retention_seeds))
-            retention_sets.append(
-                (stage.name, validation_eval_env, retention_seeds)
-            )
+                saved_stage = self._manifest_builder.snapshot().stage(stage.name)
+                train_seeds = saved_stage.seeds("train")[:effective_pool]
+                validation_seeds = saved_stage.seeds("validation")
+                train_env.set_room_cache_limit(min(4, effective_pool))
+                rehearsal.append((train_env, train_seeds))
+                retention_seeds = validation_seeds[: self.retention_size]
+                for seed in retention_seeds:
+                    validation_eval_env.reset(seed=seed)
+                validation_eval_env.set_room_cache_limit(len(retention_seeds))
+                retention_sets.append(
+                    (stage.name, validation_eval_env, retention_seeds)
+                )
+        except KeyboardInterrupt:
+            finish_manifest(False)
+            finish_plot()
+            if (
+                self.progress_path is not None
+                and self.progress_path.is_file()
+            ):
+                print(
+                    f"\nInterrupted safely. Resume from {self.progress_path}",
+                    flush=True,
+                )
+            else:
+                print(
+                    "\nInterrupted before the first recovery checkpoint; "
+                    "restart the run.",
+                    flush=True,
+                )
+            raise
 
         finish_manifest(self.require_full_coverage)
         finish_plot()
-        return self.results
+        self._save_progress("completed", None)
+        return list(self.results)
 
     def evaluate_final_test(self) -> list[StageTestResult]:
-        if self._test_started:
+        if self._resume_status == "tested":
+            print("Recovered final test is already complete.", flush=True)
+            return list(self.test_results)
+        if self._test_started and self._resume_status != "test_started":
             raise RuntimeError("the final test has already been started")
         if not self.completed:
             raise RuntimeError("the final test requires a completed curriculum")
 
-        self._test_started = True
-        print("\nFinal greedy test on untouched rooms", flush=True)
-        for stage in self.stages:
+        expected_prefix = tuple(
+            stage.name for stage in self.stages[: len(self.test_results)]
+        )
+        if tuple(result.stage for result in self.test_results) != expected_prefix:
+            raise ValueError("recovered final-test results are out of order")
+        if not self._test_started:
+            self._test_started = True
+            self._test_model_sha256 = self._model_sha256()
+            self._save_progress("test_started", None)
+        if self._test_model_sha256 != self._model_sha256():
+            raise RuntimeError("the frozen model changed after final testing began")
+        print(
+            "\nFinal greedy test on untouched rooms "
+            f"({len(self.test_results)}/{len(self.stages)} stages complete)",
+            flush=True,
+        )
+        for stage in self.stages[len(self.test_results) :]:
             records = self._manifest_builder.ensure(
                 stage.name,
                 "test",
@@ -1478,7 +2363,12 @@ class CurriculumRunner:
             result = StageTestResult(stage.name, evaluation, episodes)
             self.test_results.append(result)
             self._print_test(result)
+            self.room_manifest = self._manifest_builder.snapshot()
+            if self._test_model_sha256 != self._model_sha256():
+                raise RuntimeError("final testing changed the frozen model")
+            self._save_progress("test_started", None)
         self.room_manifest = self._manifest_builder.snapshot()
+        self._save_progress("tested", None)
         return list(self.test_results)
 
     def _evaluate_retention(
@@ -1505,10 +2395,12 @@ class CurriculumRunner:
         training: Evaluation,
         validation: Evaluation | None,
         retention: tuple[tuple[str, float], ...],
+        failures: Sequence[str],
+        phase: str,
     ) -> None:
         message = (
             f"{stage.name:22} pool={pool_size:>2} round={round_index:>2} "
-            f"train={training.success_rate:>6.1%}"
+            f"phase={phase:<8} train={training.success_rate:>6.1%}"
         )
         if validation is not None:
             message += f" validation={validation.success_rate:>6.1%}"
@@ -1526,6 +2418,13 @@ class CurriculumRunner:
                 + CurriculumRunner._metric_summary(validation),
                 flush=True,
             )
+        if failures:
+            print(
+                "  not promoted: " + "; ".join(failures),
+                flush=True,
+            )
+        else:
+            print("  promotion requirements passed.", flush=True)
 
     @staticmethod
     def _metric_summary(evaluation: Evaluation) -> str:

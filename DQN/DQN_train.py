@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import random
 from collections import deque
 from collections.abc import Callable, Sequence
@@ -23,6 +24,25 @@ from DQN.DQN_model import (
 )
 
 N_AGENTS = 2
+
+
+def _cpu_copy(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {key: _cpu_copy(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_cpu_copy(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_cpu_copy(item) for item in value)
+    return copy.deepcopy(value)
+
+
+def _optimizer_to(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(device)
 
 
 @dataclass(slots=True)
@@ -231,6 +251,38 @@ class Agent:
             },
             path,
         )
+
+    def learning_state(self) -> dict[str, Any]:
+        return {
+            "schema": OBSERVATION_SCHEMA,
+            "obs_dim": self.net.obs_dim,
+            "n_actions": self.net.n_actions,
+            "hidden": self.net.hidden,
+            "actions": ACTIONS,
+            "channels": CHANNEL_NAMES,
+            "globals": GLOBAL_NAMES,
+            "net": _cpu_copy(self.net.state_dict()),
+            "target": _cpu_copy(self.target.state_dict()),
+            "opt": _cpu_copy(self.opt.state_dict()),
+        }
+
+    def load_learning_state(self, checkpoint: dict[str, Any]) -> None:
+        if (
+            checkpoint.get("schema") != OBSERVATION_SCHEMA
+            or checkpoint.get("obs_dim") != self.net.obs_dim
+            or checkpoint.get("n_actions") != self.net.n_actions
+            or tuple(checkpoint.get("hidden", ())) != self.net.hidden
+            or tuple(checkpoint.get("actions", ())) != ACTIONS
+            or tuple(checkpoint.get("channels", ())) != CHANNEL_NAMES
+            or tuple(checkpoint.get("globals", ())) != GLOBAL_NAMES
+        ):
+            raise ValueError(
+                "checkpoint network, observation, or action contract does not match"
+            )
+        self.net.load_state_dict(checkpoint["net"])
+        self.target.load_state_dict(checkpoint["target"])
+        self.opt.load_state_dict(checkpoint["opt"])
+        _optimizer_to(self.opt, self.device)
 
     def load(self, path: str) -> None:
         checkpoint = torch.load(path, map_location=self.device)
@@ -505,6 +557,74 @@ class Trainer:
             learner.replay.clear()
         for pending in self._pending:
             pending.clear()
+
+    def learner_state(self) -> list[dict[str, Any]]:
+        return [learner.learning_state() for learner in self.learners]
+
+    def load_learner_state(self, states: Sequence[dict[str, Any]]) -> None:
+        if len(states) != len(self.learners):
+            raise ValueError("recovery learner count does not match")
+        for learner, state in zip(self.learners, states, strict=True):
+            learner.load_learning_state(state)
+
+    def recovery_state(self) -> dict[str, Any]:
+        if any(self._pending):
+            raise RuntimeError("recovery checkpoints require an episode boundary")
+        if self.device.type == "mps":
+            torch.mps.synchronize()
+        mps_rng = None
+        if self.device.type == "mps" and hasattr(torch.mps, "get_rng_state"):
+            mps_rng = torch.mps.get_rng_state().cpu()
+        return {
+            "schema_version": 1,
+            "learners": self.learner_state(),
+            "env_steps": self.env_steps,
+            "updates": self.updates,
+            "episodes": self.episodes,
+            "reheat_step": self._reheat_step,
+            "reheat_from": self._reheat_from,
+            "reheat_steps": self._reheat_steps,
+            "python_rng": random.getstate(),
+            "numpy_rng": np.random.get_state(),
+            "torch_rng": torch.get_rng_state().cpu(),
+            "mps_rng": mps_rng,
+            "replay_rngs": [
+                copy.deepcopy(learner.replay.rng.bit_generator.state)
+                for learner in self.learners
+            ],
+            "replay_included": False,
+        }
+
+    def load_recovery_state(self, state: dict[str, Any]) -> None:
+        if state.get("schema_version") != 1:
+            raise ValueError("recovery trainer schema does not match")
+        if state.get("replay_included") is not False:
+            raise ValueError("unsupported recovery replay format")
+        self.load_learner_state(state["learners"])
+        self.env_steps = int(state["env_steps"])
+        self.updates = int(state["updates"])
+        self.episodes = int(state["episodes"])
+        self._reheat_step = int(state["reheat_step"])
+        self._reheat_from = float(state["reheat_from"])
+        self._reheat_steps = int(state["reheat_steps"])
+        self.clear_replay()
+        replay_rngs = state["replay_rngs"]
+        if len(replay_rngs) != len(self.learners):
+            raise ValueError("recovery replay RNG count does not match")
+        for learner, rng_state in zip(
+            self.learners, replay_rngs, strict=True
+        ):
+            learner.replay.rng.bit_generator.state = copy.deepcopy(rng_state)
+        random.setstate(state["python_rng"])
+        np.random.set_state(state["numpy_rng"])
+        torch.set_rng_state(state["torch_rng"].cpu())
+        mps_rng = state.get("mps_rng")
+        if (
+            mps_rng is not None
+            and self.device.type == "mps"
+            and hasattr(torch.mps, "set_rng_state")
+        ):
+            torch.mps.set_rng_state(mps_rng.cpu())
 
     def reheat_exploration(self, start: float = 0.30, steps: int = 20_000) -> None:
         self._reheat_step = self.env_steps

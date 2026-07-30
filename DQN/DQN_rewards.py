@@ -5,6 +5,7 @@ from array import array
 from collections import deque
 from collections.abc import MutableSequence, Sequence
 from math import ceil
+from pathlib import Path
 
 
 def _pyplot(interactive: bool):
@@ -366,7 +367,12 @@ class CurriculumPlot:
             means.append(total / min(window, index + 1))
 
     def save(self, path: str) -> None:
-        self.fig.savefig(path, dpi=150)
+        target = Path(path)
+        temporary = target.with_name(
+            f".{target.stem}.tmp{target.suffix}"
+        )
+        self.fig.savefig(temporary, dpi=150)
+        temporary.replace(target)
 
     def close(self) -> None:
         if self.visible:

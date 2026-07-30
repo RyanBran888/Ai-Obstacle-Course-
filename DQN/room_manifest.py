@@ -159,6 +159,75 @@ class CurriculumRoomManifest:
         return _hash_json(self.as_dict())
 
 
+def manifest_from_dict(payload: Mapping[str, Any]) -> CurriculumRoomManifest:
+    """Rebuild a schema-4 manifest for deterministic training recovery."""
+    if int(payload.get("schema_version", -1)) != 4:
+        raise ValueError("room manifest schema does not match")
+    stages: list[StageRoomManifest] = []
+    for stage_data in payload.get("stages", ()):
+        split_data = stage_data.get("splits", {})
+
+        def records(split: str) -> tuple[RoomRecord, ...]:
+            result: list[RoomRecord] = []
+            for item in split_data.get(split, ()):
+                counts = item.get("counts", {})
+                result.append(
+                    RoomRecord(
+                        seed=int(item["seed"]),
+                        candidate_index=int(item["candidate_index"]),
+                        geometry_sha256=str(item["geometry_sha256"]),
+                        navigation_sha256=str(item["navigation_sha256"]),
+                        task_sha256=str(item["task_sha256"]),
+                        attempts=int(item["attempts"]),
+                        width=int(item["width"]),
+                        height=int(item["height"]),
+                        shape=str(item["shape"]),
+                        counts=tuple(
+                            (str(name), int(count))
+                            for name, count in counts.items()
+                        ),
+                        features=tuple(str(value) for value in item["features"]),
+                    )
+                )
+            return tuple(result)
+
+        config = stage_data["config"]
+        config_json = json.dumps(
+            config,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        cursors = stage_data.get("selection_cursors", {})
+        targets = stage_data.get("feature_targets", {})
+        stages.append(
+            StageRoomManifest(
+                stage=str(stage_data["stage"]),
+                config_json=config_json,
+                config_sha256=str(stage_data["config_sha256"]),
+                train=records("train"),
+                validation=records("validation"),
+                test=records("test"),
+                selection_cursors=tuple(
+                    (split, int(cursors.get(split, 0)))
+                    for split in ROOM_SPLITS
+                ),
+                feature_targets=tuple(
+                    (split, int(targets.get(split, 0)))
+                    for split in ROOM_SPLITS
+                ),
+            )
+        )
+    manifest = CurriculumRoomManifest(
+        data_seed=int(payload["data_seed"]),
+        stages=tuple(stages),
+        generator_version=str(payload["generator_version"]),
+        schema_version=int(payload["schema_version"]),
+        selection_algorithm=str(payload["selection_algorithm"]),
+    )
+    assert_disjoint(manifest)
+    return manifest
+
+
 def room_fingerprints(room: Room) -> tuple[str, str, str]:
     geometry = {
         "width": room.width,
@@ -279,8 +348,14 @@ class LazyRoomManifestBuilder:
         if count < 0:
             raise ValueError("room count must be nonnegative")
         quota_target = count if feature_target is None else feature_target
-        if quota_target < count:
-            raise ValueError("feature_target must be at least count")
+        if quota_target < 0:
+            raise ValueError("feature_target must be nonnegative")
+        required_features = set(stage.required_features)
+        if count and quota_target < len(required_features):
+            raise ValueError(
+                f"{stage_name} {split} feature_target cannot cover all "
+                "required features"
+            )
         saved_target = self._feature_targets[stage_name][split]
         if saved_target is None:
             self._feature_targets[stage_name][split] = quota_target
@@ -291,19 +366,19 @@ class LazyRoomManifestBuilder:
             )
 
         records = self._records[stage_name][split]
-        required_features = set(stage.required_features)
+        coverage_limit = min(count, quota_target)
         covered = {
             feature
-            for record in records[:count]
+            for record in records[:coverage_limit]
             for feature in record.features
         }
         missing_features = (
             required_features - covered
-            if quota_target >= len(required_features)
+            if coverage_limit >= len(required_features)
             else set()
         )
-        remaining_slots = count - len(records)
-        coverage_due = count >= len(required_features)
+        remaining_slots = max(0, coverage_limit - len(records))
+        coverage_due = coverage_limit >= len(required_features)
         if len(records) >= count:
             if coverage_due and missing_features:
                 raise ValueError(
@@ -559,9 +634,9 @@ def assert_disjoint(manifest: CurriculumRoomManifest) -> None:
                     f"{stage.stage} {split} selection cursor is stale"
                 )
             target = stage.feature_target(split)
-            if records and target < len(records):
+            if records and target < 1:
                 raise ValueError(
-                    f"{stage.stage} {split} feature target is too small"
+                    f"{stage.stage} {split} feature target is missing"
                 )
             navigations = [record.navigation_sha256 for record in records]
             tasks = [record.task_sha256 for record in records]
