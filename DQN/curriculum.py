@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from env_bridge import CoopEnvBridge, GenerationConfig
+from DQN.DQN_model import LEGACY_POLICY_CONTRACT, POLICY_CONTRACT
 from DQN.DQN_train import (
     Config,
     Evaluation,
@@ -1240,6 +1241,7 @@ class CurriculumRunner:
         extend_stopped_rounds: int = 0,
         retention_upgrade: bool = False,
         repair_upgrade: bool = False,
+        policy_upgrade: bool = False,
     ) -> None:
         if not pool_sizes or any(size < 1 for size in pool_sizes):
             raise ValueError("pool_sizes must contain positive values")
@@ -1296,10 +1298,18 @@ class CurriculumRunner:
         )
         self._external_progress_contract = dict(progress_contract or {})
         self.extend_stopped_rounds = extend_stopped_rounds
-        if retention_upgrade and repair_upgrade:
+        if sum(
+            bool(value)
+            for value in (
+                retention_upgrade,
+                repair_upgrade,
+                policy_upgrade,
+            )
+        ) > 1:
             raise ValueError("only one recovery upgrade may be selected")
         self._retention_upgrade = bool(retention_upgrade)
         self._repair_upgrade = bool(repair_upgrade)
+        self._policy_upgrade = bool(policy_upgrade)
         self.results: list[StageResult] = []
         self.test_results: list[StageTestResult] = []
         self._manifest_builder = LazyRoomManifestBuilder(
@@ -1579,7 +1589,11 @@ class CurriculumRunner:
             label = (
                 "training-repair-v4"
                 if self._repair_upgrade
-                else "retention-v2"
+                else (
+                    "policy-v2"
+                    if self._policy_upgrade
+                    else "retention-v2"
+                )
             )
             print(
                 f"Accepted the {label} source upgrade; the next recovery "
@@ -1619,6 +1633,8 @@ class CurriculumRunner:
             _test_result_from_payload(result)
             for result in payload.get("test_results", ())
         ]
+        if self._policy_upgrade and not exact_contract:
+            self._upgrade_policy_states(payload)
         self.trainer.load_recovery_state(payload["trainer"])
         self._test_model_sha256 = payload.get("test_model_sha256")
         if (
@@ -1677,6 +1693,31 @@ class CurriculumRunner:
             else:
                 self._force_replay_refill = True
             print("The replay buffer will warm up again.", flush=True)
+
+    @staticmethod
+    def _upgrade_policy_states(payload: Mapping[str, Any]) -> None:
+        def upgrade(states: Any, label: str) -> None:
+            if not isinstance(states, (list, tuple)) or not states:
+                raise ValueError(f"{label} learner state is missing")
+            for state in states:
+                if not isinstance(state, dict):
+                    raise ValueError(f"{label} learner state is invalid")
+                if state.get("policy") != LEGACY_POLICY_CONTRACT:
+                    raise ValueError(
+                        f"{label} does not use the exact policy-v1 contract"
+                    )
+                state["policy"] = dict(POLICY_CONTRACT)
+
+        trainer = payload.get("trainer")
+        if not isinstance(trainer, Mapping):
+            raise ValueError("policy upgrade trainer state is missing")
+        upgrade(trainer.get("learners"), "trainer")
+
+        active = payload.get("active")
+        if isinstance(active, Mapping):
+            best = active.get("best_learner_state")
+            if best is not None:
+                upgrade(best, "best checkpoint")
 
     def _validate_repair_cursor(self, payload: Mapping[str, Any]) -> None:
         if (
@@ -1784,7 +1825,11 @@ class CurriculumRunner:
         saved: Mapping[str, Any],
         current: Mapping[str, Any],
     ) -> bool:
-        if not (self._retention_upgrade or self._repair_upgrade):
+        if not (
+            self._retention_upgrade
+            or self._repair_upgrade
+            or self._policy_upgrade
+        ):
             return False
 
         saved_copy = dict(saved)
@@ -1803,7 +1848,7 @@ class CurriculumRunner:
                 "DQN/curriculum.py",
                 "DQN/run_curriculum.py",
             }
-        else:
+        elif self._repair_upgrade:
             if saved.get("retention_size") != current.get("retention_size"):
                 return False
             saved_stages = saved_copy.get("stages")
@@ -1826,6 +1871,20 @@ class CurriculumRunner:
                 return False
             current_copy["stages"] = saved_stages
             expected_kind = "training_repair_v4"
+            allowed_changes = {
+                "DQN/DQN_model.py",
+                "DQN/DQN_train.py",
+                "DQN/curriculum.py",
+                "DQN/env_bridge.py",
+                "DQN/load_model.py",
+                "DQN/run_curriculum.py",
+            }
+        else:
+            if saved.get("retention_size") != current.get("retention_size"):
+                return False
+            if saved.get("stages") != current.get("stages"):
+                return False
+            expected_kind = "policy_v2"
             allowed_changes = {
                 "DQN/DQN_model.py",
                 "DQN/DQN_train.py",

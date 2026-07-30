@@ -107,6 +107,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--resume-policy-upgrade",
+        action="store_true",
+        help=(
+            "upgrade an untested policy-v1 recovery state to the "
+            "hold-aware policy-v2 contract and write recovery to a new file"
+        ),
+    )
+    parser.add_argument(
         "--warm-start-progress",
         default=None,
         help=(
@@ -252,8 +260,15 @@ def _source_upgrade_metadata(
     kind: str,
 ) -> dict[str, Any]:
     status = str(payload.get("status"))
-    if status != "stopped":
-        raise ValueError("source upgrades require a stopped curriculum state")
+    allowed_statuses = (
+        {"training", "stopped"}
+        if kind == "policy_v2"
+        else {"stopped"}
+    )
+    if status not in allowed_statuses:
+        raise ValueError(
+            f"{kind} cannot upgrade a {status!r} curriculum state"
+        )
     if not isinstance(payload.get("active"), dict):
         raise ValueError("source-upgrade progress must contain an active pool")
     if payload.get("test_results"):
@@ -295,15 +310,29 @@ def main() -> None:
         if args.warm_start_progress
         else None
     )
-    if args.resume_retention_upgrade and args.resume_repair_upgrade:
+    upgrade_count = sum(
+        bool(value)
+        for value in (
+            args.resume_retention_upgrade,
+            args.resume_repair_upgrade,
+            args.resume_policy_upgrade,
+        )
+    )
+    if upgrade_count > 1:
         raise ValueError("choose only one resume upgrade")
     upgrade_requested = (
-        args.resume_retention_upgrade or args.resume_repair_upgrade
+        args.resume_retention_upgrade
+        or args.resume_repair_upgrade
+        or args.resume_policy_upgrade
     )
     upgrade_option = (
-        "--resume-repair-upgrade"
-        if args.resume_repair_upgrade
-        else "--resume-retention-upgrade"
+        "--resume-policy-upgrade"
+        if args.resume_policy_upgrade
+        else (
+            "--resume-repair-upgrade"
+            if args.resume_repair_upgrade
+            else "--resume-retention-upgrade"
+        )
     )
     if upgrade_requested and warm_start_path is not None:
         raise ValueError(
@@ -315,6 +344,7 @@ def main() -> None:
     if (
         upgrade_requested
         and args.extend_stopped_rounds <= 0
+        and not args.resume_policy_upgrade
     ):
         raise ValueError(
             f"{upgrade_option} requires "
@@ -433,6 +463,16 @@ def main() -> None:
         if resume_path is not None
         else None
     )
+    if (
+        args.resume_policy_upgrade
+        and resume_payload is not None
+        and resume_payload.get("status") == "stopped"
+        and args.extend_stopped_rounds <= 0
+    ):
+        raise ValueError(
+            "--resume-policy-upgrade needs --extend-stopped-rounds "
+            "greater than zero for an exhausted stopped state"
+        )
     resume_external: dict[str, Any] = {}
     if resume_payload is not None:
         resume_contract = resume_payload.get("contract")
@@ -465,9 +505,13 @@ def main() -> None:
             resume_path,
             resume_payload,
             (
-                "training_repair_v4"
-                if args.resume_repair_upgrade
-                else "retention_v2"
+                "policy_v2"
+                if args.resume_policy_upgrade
+                else (
+                    "training_repair_v4"
+                    if args.resume_repair_upgrade
+                    else "retention_v2"
+                )
             ),
         )
     elif resume_payload is not None:
@@ -533,6 +577,7 @@ def main() -> None:
         extend_stopped_rounds=args.extend_stopped_rounds,
         retention_upgrade=args.resume_retention_upgrade,
         repair_upgrade=args.resume_repair_upgrade,
+        policy_upgrade=args.resume_policy_upgrade,
     )
     if warm_start_payload is not None:
         if warm_start_info is None:

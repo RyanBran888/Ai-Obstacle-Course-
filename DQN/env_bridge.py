@@ -1090,6 +1090,14 @@ class CoopEnvBridge:
             self._navigation_checked = True
             return
 
+        dynamic_blocked = {
+            door.pos
+            for door in self._doors
+            if not self.state.is_door_open(door.id)
+        }
+        dynamic_blocked.update(self.state.block_positions.values())
+        navigation_tiles = self._static_navigation_tiles - dynamic_blocked
+
         distances: list[dict[Vec2, int]] = []
         owners: list[dict[Vec2, tuple[Any, str]]] = []
         for targets in targets_by_agent:
@@ -1108,7 +1116,7 @@ class CoopEnvBridge:
                 pos = pending.popleft()
                 for direction in DIRS:
                     neighbor = pos + direction
-                    if neighbor in distance or not self._navigation_walkable(neighbor):
+                    if neighbor in distance or neighbor not in navigation_tiles:
                         continue
                     distance[neighbor] = distance[pos] + 1
                     owner[neighbor] = owner[pos]
@@ -1126,7 +1134,7 @@ class CoopEnvBridge:
                     neighbor = pos + direction
                     if (
                         neighbor in exit_distance
-                        or not self._navigation_walkable(neighbor)
+                        or neighbor not in navigation_tiles
                     ):
                         continue
                     exit_distance[neighbor] = exit_distance[pos] + 1
@@ -1296,6 +1304,7 @@ class CoopEnvBridge:
     def _build_view_cache(self):
         """Cache fixed terrain and entity positions."""
         blocked, hazard = {}, {}
+        navigation_tiles = set()
         walkable = 0
         for pos in self.room.terrain.positions():
             tile = self.room.terrain_at(pos)
@@ -1305,6 +1314,7 @@ class CoopEnvBridge:
                 hazard[pos] = True
             else:
                 walkable += 1
+                navigation_tiles.add(pos)
         self._walkable_count = walkable
 
         self._tile_region = {}
@@ -1343,6 +1353,9 @@ class CoopEnvBridge:
         self._bridge_tiles = {
             tile for bridge in self.room.bridges for tile in bridge.footprint()
         }
+        self._static_navigation_tiles = (
+            navigation_tiles | self._bridge_tiles
+        ) - self._reset_tiles
         self._bridges_by_tile = {
             tile: bridge
             for bridge in self.room.bridges

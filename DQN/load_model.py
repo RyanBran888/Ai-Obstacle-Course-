@@ -40,6 +40,7 @@ for _path in (str(_HERE.parent), str(_HERE)):
 
 from DQN.DQN_model import (
     HIDDEN,
+    LEGACY_POLICY_CONTRACT,
     N_ACTIONS,
     OBS_DIM,
     POLICY_CONTRACT,
@@ -76,7 +77,8 @@ def _validate_policy(checkpoint: Any) -> None:
     if (
         isinstance(checkpoint, dict)
         and checkpoint.get("policy") is not None
-        and checkpoint.get("policy") != POLICY_CONTRACT
+        and checkpoint.get("policy")
+        not in (POLICY_CONTRACT, LEGACY_POLICY_CONTRACT)
     ):
         raise ValueError("checkpoint action policy does not match")
 

@@ -112,9 +112,23 @@ N_ACTIONS = len(ACTIONS)
 
 HIDDEN: tuple[int, ...] = (256, 128, 64)
 ROUTE_Q_BIAS = 0.5
-POLICY_CONTRACT = {
+HOLD_WAIT_Q_BIAS = 0.02
+LEGACY_POLICY_CONTRACT = {
     "version": 1,
     "route_q_bias": ROUTE_Q_BIAS,
+    "mask_invalid_interact": True,
+}
+POLICY_CONTRACT = {
+    "version": 2,
+    "route_q_bias": ROUTE_Q_BIAS,
+    "hold_wait_q_bias": HOLD_WAIT_Q_BIAS,
+    "hold_wait_predicate": (
+        "goal_reachable",
+        "goal_switch",
+        "switch_hold",
+        "on_goal",
+        "route_wait",
+    ),
     "mask_invalid_interact": True,
 }
 
@@ -122,8 +136,12 @@ _GLOBAL_BASE = OBS_DIM - len(GLOBAL_NAMES)
 _ROUTE_DX = _GLOBAL_BASE + GLOBAL_NAMES.index("route_dx")
 _ROUTE_DY = _GLOBAL_BASE + GLOBAL_NAMES.index("route_dy")
 _GOAL_REACHABLE = _GLOBAL_BASE + GLOBAL_NAMES.index("goal_reachable")
+_GOAL_SWITCH = _GLOBAL_BASE + GLOBAL_NAMES.index("goal_switch")
+_SWITCH_HOLD = _GLOBAL_BASE + GLOBAL_NAMES.index("switch_hold")
 _CAN_INTERACT = _GLOBAL_BASE + GLOBAL_NAMES.index("can_interact")
+_ON_GOAL = _GLOBAL_BASE + GLOBAL_NAMES.index("on_goal")
 _ROUTE_WAIT = _GLOBAL_BASE + GLOBAL_NAMES.index("route_wait")
+_WAIT_ACTION = ACTIONS.index("wait")
 
 
 def action_mask(observations: torch.Tensor) -> torch.Tensor:
@@ -162,6 +180,19 @@ def route_actions(observations: torch.Tensor) -> torch.Tensor:
     return actions.squeeze(0) if single else actions
 
 
+def hold_wait_states(observations: torch.Tensor) -> torch.Tensor:
+    single = observations.ndim == 1
+    batch = observations.unsqueeze(0) if single else observations
+    holds = (
+        (batch[:, _GOAL_REACHABLE] > 0.5)
+        & (batch[:, _GOAL_SWITCH] > 0.5)
+        & (batch[:, _SWITCH_HOLD] > 0.5)
+        & (batch[:, _ON_GOAL] > 0.5)
+        & (batch[:, _ROUTE_WAIT] > 0.5)
+    )
+    return holds.squeeze(0) if single else holds
+
+
 def policy_scores(
     q_values: torch.Tensor,
     observations: torch.Tensor,
@@ -173,6 +204,9 @@ def policy_scores(
     rows = (routes >= 0).nonzero().flatten()
     if len(rows):
         scores[rows, routes[rows]] += ROUTE_Q_BIAS
+    hold_rows = hold_wait_states(batch).nonzero().flatten()
+    if len(hold_rows):
+        scores[hold_rows, _WAIT_ACTION] += HOLD_WAIT_Q_BIAS
     scores = scores.masked_fill(~action_mask(batch), -torch.inf)
     return scores.squeeze(0) if single else scores
 

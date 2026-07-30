@@ -21,6 +21,7 @@ from DQN.DQN_model import (
     N_ACTIONS,
     OBS_DIM,
     OBSERVATION_SCHEMA,
+    LEGACY_POLICY_CONTRACT,
     POLICY_CONTRACT,
     QNetwork,
     action_mask,
@@ -892,7 +893,8 @@ class Agent:
             or tuple(checkpoint.get("globals", ())) != GLOBAL_NAMES
             or (
                 checkpoint.get("policy") is not None
-                and checkpoint.get("policy") != POLICY_CONTRACT
+                and checkpoint.get("policy")
+                not in (POLICY_CONTRACT, LEGACY_POLICY_CONTRACT)
             )
         ):
             raise ValueError(
