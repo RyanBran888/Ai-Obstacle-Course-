@@ -19,13 +19,17 @@ from helpers import (  # noqa: E402
 
 from coop_env import GenerationConfig, RoomGenerator  # noqa: E402
 from coop_env.entities import (  # noqa: E402
+    Key,
     PushableBlock,
     Switch,
     SwitchMode,
     TemporaryBridge,
+    WipeoutBall,
+    WipeoutBallSize,
 )
 from coop_env.requirements import SwitchRequirement, TriggerMode  # noqa: E402
 from coop_env.state import EpisodeState  # noqa: E402
+from coop_env.tiles import Tile  # noqa: E402
 from coop_env.utils.geometry import Vec2  # noqa: E402
 
 
@@ -63,7 +67,7 @@ class TestDoorLogic(unittest.TestCase):
         room = two_region_room(
             door_requirement=SwitchRequirement(("switch_0",)),
             extra_entities=(
-                Switch(id="switch_0", pos=LEFT_TILE, mode=SwitchMode.ONESHOT),
+                Switch(id="switch_0", pos=LEFT_TILE, mode=SwitchMode.TOGGLE),
             ),
         )
         doors = list(room.doors)
@@ -79,10 +83,17 @@ class TestDoorLogic(unittest.TestCase):
         state = EpisodeState.from_room(room)
         state.set_switch("switch_0", True)
         self.assertTrue(state.is_door_open("door_0"))
+        self.assertEqual(state.door_timer_remaining("door_0"), 5)
         state.advance(4)
         self.assertTrue(state.is_door_open("door_0"))
-        state.advance(2)
+        state.advance(1)
         self.assertFalse(state.is_door_open("door_0"), "timer should expire")
+        self.assertTrue(state.door_needs_rearm("door_0"))
+        state.set_switch("switch_0", False)
+        self.assertFalse(state.door_needs_rearm("door_0"))
+        state.set_switch("switch_0", True)
+        self.assertTrue(state.is_door_open("door_0"))
+        self.assertEqual(state.door_timer_remaining("door_0"), 5)
 
     def test_oneshot_switch_cannot_be_turned_off(self):
         room = two_region_room(
@@ -93,6 +104,18 @@ class TestDoorLogic(unittest.TestCase):
         state.set_switch("switch_0", True)
         state.set_switch("switch_0", False)
         self.assertTrue(state.is_switch_active("switch_0"))
+
+    def test_only_the_assigned_agent_collects_a_key(self):
+        room = two_region_room(
+            extra_entities=(
+                Key(id="owned_key", pos=LEFT_TILE, agent_index=0),
+            ),
+        )
+        state = EpisodeState.from_room(room)
+        self.assertFalse(state.collect_key("owned_key", agent_index=1))
+        self.assertFalse(state.is_key_collected("owned_key"))
+        self.assertTrue(state.collect_key("owned_key", agent_index=0))
+        self.assertTrue(state.is_key_collected("owned_key"))
 
 
 class TestCrateOnLever(unittest.TestCase):
@@ -122,6 +145,45 @@ class TestBridgeTiming(unittest.TestCase):
         bridge = TemporaryBridge(id="b", pos=Vec2(0, 0), tiles=(Vec2(0, 0),), period=4, on_ticks=2)
         self.assertEqual([bridge.is_solid_at(t) for t in range(6)],
                          [True, True, False, False, True, True])
+
+    def test_state_exposes_bridge_phase_and_hazard_transition(self):
+        bridge = TemporaryBridge(
+            id="bridge_0",
+            pos=LEFT_TILE,
+            tiles=(LEFT_TILE,),
+            period=4,
+            on_ticks=2,
+        )
+        room = two_region_room(extra_entities=(bridge,))
+        room.terrain[LEFT_TILE] = Tile.HAZARD_WATER
+        state = EpisodeState.from_room(room)
+        self.assertTrue(state.bridge_is_solid("bridge_0"))
+        self.assertEqual(state.bridge_ticks_until_change("bridge_0"), 2)
+        self.assertTrue(state.is_walkable(LEFT_TILE))
+        state.advance(2)
+        self.assertFalse(state.bridge_is_solid("bridge_0"))
+        self.assertTrue(state.is_hazardous(LEFT_TILE))
+
+
+class TestWipeoutTiming(unittest.TestCase):
+    def test_normal_ball_moves_left_to_right_and_back(self):
+        track = tuple(Vec2(x, 2) for x in range(1, 8))
+        ball = WipeoutBall(id="ball", pos=track[0], track=track)
+        self.assertEqual(
+            [ball.position_at(t).x for t in range(13)],
+            [1, 2, 3, 4, 5, 6, 7, 6, 5, 4, 3, 2, 1],
+        )
+
+    def test_big_ball_has_an_eleven_tile_track_and_large_hitbox(self):
+        track = tuple(Vec2(x, 3) for x in range(1, 12))
+        ball = WipeoutBall(
+            id="big",
+            pos=track[0],
+            track=track,
+            size=WipeoutBallSize.BIG,
+        )
+        self.assertEqual(ball.expected_track_length, 11)
+        self.assertEqual(len(ball.collision_tiles_at(0)), 9)
 
 
 class TestWalkability(unittest.TestCase):

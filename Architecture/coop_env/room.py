@@ -29,6 +29,7 @@ from .entities import (
     ResetZone,
     Switch,
     TemporaryBridge,
+    WipeoutBall,
 )
 from .tiles import Tile, is_walkable
 from .utils.geometry import Rect, Vec2
@@ -211,6 +212,10 @@ class Room:
     @property
     def bridges(self) -> tuple[TemporaryBridge, ...]:
         return self.of_type(TemporaryBridge)
+
+    @property
+    def wipeout_balls(self) -> tuple[WipeoutBall, ...]:
+        return self.of_type(WipeoutBall)
 
     # -- reporting ---------------------------------------------------------
 

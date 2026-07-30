@@ -18,10 +18,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ..entities import LockedDoor, PushableBlock, TemporaryBridge
+from ..entities import (
+    Key,
+    LockedDoor,
+    PushableBlock,
+    Switch,
+    SwitchMode,
+    TemporaryBridge,
+    WipeoutBall,
+)
 from ..requirements import Requirement, combine
 from ..room import Room
-from ..tiles import is_walkable
+from ..tiles import Tile, is_walkable
 from ..utils.geometry import Vec2
 from ..utils.grid import connected_components
 
@@ -51,6 +59,8 @@ class ConnectivityModel:
     free_links: set[tuple[int, int]] = field(default_factory=set)
     clusters: dict[str, DoorCluster] = field(default_factory=dict)
     entity_region: dict[str, int] = field(default_factory=dict)
+    key_owners: dict[str, int] = field(default_factory=dict)
+    crate_held_switches: frozenset[str] = frozenset()
     unreachable_entities: tuple[str, ...] = ()
 
     def region_of_tile(self, pos: Vec2) -> int | None:
@@ -79,9 +89,8 @@ def build_connectivity(room: Room) -> ConnectivityModel:
     for door in room.doors:
         door_tiles[door.pos] = door
 
-    # Crates are treated as solid. A crate can in principle be pushed aside,
-    # but assuming so would let an unsolvable room slip through, so the
-    # pessimistic reading is the safe one here.
+    # Crates are solid until moved. Balls are temporary hazards, so their tracks
+    # stay part of the route graph.
     blocked = {b.pos for b in room.of_type(PushableBlock)}
 
     base = {
@@ -116,7 +125,7 @@ def build_connectivity(room: Room) -> ConnectivityModel:
                     break
         if rid is None:
             # bridges sit on hazard tiles by design
-            if isinstance(entity, TemporaryBridge):
+            if isinstance(entity, (TemporaryBridge, WipeoutBall)):
                 continue
             unreachable.append(entity.id)
             continue
@@ -128,7 +137,35 @@ def build_connectivity(room: Room) -> ConnectivityModel:
         free_links=free_links,
         clusters=clusters,
         entity_region=entity_region,
+        key_owners={
+            key.id: key.agent_index
+            for key in room.keys
+            if key.agent_index is not None
+        },
+        crate_held_switches=frozenset(
+            block.target_switch_id
+            for block in room.blocks
+            if _valid_crate_hold(room, block)
+            and block.target_switch_id is not None
+        ),
         unreachable_entities=tuple(sorted(unreachable)),
+    )
+
+
+def _valid_crate_hold(room: Room, block: PushableBlock) -> bool:
+    target = room.find(block.target_switch_id or "")
+    if (
+        not isinstance(target, Switch)
+        or target.mode is not SwitchMode.HOLD
+        or block.push_from is None
+        or block.pos.manhattan(target.pos) != 1
+    ):
+        return False
+    direction = target.pos - block.pos
+    return (
+        block.push_from == block.pos - direction
+        and room.terrain_at(block.push_from) is Tile.FLOOR
+        and room.terrain_at(target.pos) is Tile.FLOOR
     )
 
 

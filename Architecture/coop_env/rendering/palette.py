@@ -63,6 +63,7 @@ DARK = Theme(
         EntityKind.CHECKPOINT: "#dfe4ee",
         EntityKind.RESET_ZONE: "#6b5ce0",
         EntityKind.TEMPORARY_BRIDGE: "#77c6a8",
+        EntityKind.WIPEOUT_BALL: "#ff5d73",
     },
     accents={
         "lock_key": "#ffcc4d",
@@ -71,6 +72,10 @@ DARK = Theme(
         "lock_hold": "#ff9a3c",
         "lock_timed": "#ff7a7a",
         "open": "#3d8a63",
+        "agent_0": "#4c9dff",
+        "agent_1": "#ff5c7c",
+        "wipeout_normal": "#ff9f43",
+        "wipeout_big": "#ff3b4f",
     },
 )
 
@@ -116,12 +121,14 @@ ENTITY_GLYPHS: dict[EntityKind, str] = {
     EntityKind.CHECKPOINT: "C",
     EntityKind.RESET_ZONE: ",",
     EntityKind.TEMPORARY_BRIDGE: "-",
+    EntityKind.WIPEOUT_BALL: "o",
 }
 
 #: Draw order -- later kinds win the tile when several share one.
 ENTITY_DRAW_ORDER: tuple[EntityKind, ...] = (
     EntityKind.RESET_ZONE,
     EntityKind.TEMPORARY_BRIDGE,
+    EntityKind.WIPEOUT_BALL,
     EntityKind.CHECKPOINT,
     EntityKind.KEY,
     EntityKind.SWITCH,

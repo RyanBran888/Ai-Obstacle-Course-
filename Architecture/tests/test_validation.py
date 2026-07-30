@@ -57,6 +57,23 @@ class TestAcceptsGoodRooms(unittest.TestCase):
         for seed in range(15):
             self.assertTrue(validate_room(generator.generate(seed)).ok)
 
+    def test_generic_crate_and_hold_switch_remain_valid(self):
+        room = two_region_room(
+            door_requirement=SwitchRequirement(("switch_0",)),
+            latching=False,
+            extra_entities=(
+                Switch(
+                    id="switch_0",
+                    pos=LEFT_TILE,
+                    mode=SwitchMode.HOLD,
+                    controls=("door_0",),
+                ),
+                PushableBlock(id="block_0", pos=LEFT_TILE_B),
+            ),
+        )
+        report = validate_room(room)
+        self.assertTrue(report.ok, report.report_lines())
+
 
 class TestRejectsUnsolvable(unittest.TestCase):
     def test_key_sealed_behind_its_own_door(self):
@@ -113,6 +130,26 @@ class TestRejectsBadPlacement(unittest.TestCase):
         report = validate_room(room)
         self.assertFalse(report.ok)
         self.assertIn("stacked", codes(report))
+
+    def test_bad_crate_switch_push_direction_is_caught(self):
+        room = two_region_room(
+            extra_entities=(
+                Switch(
+                    id="switch_0",
+                    pos=Vec2(5, 5),
+                    mode=SwitchMode.HOLD,
+                ),
+                PushableBlock(
+                    id="block_0",
+                    pos=Vec2(4, 5),
+                    target_switch_id="switch_0",
+                    push_from=Vec2(4, 4),
+                ),
+            )
+        )
+        report = validate_room(room)
+        self.assertFalse(report.ok)
+        self.assertIn("crate_switch_direction", codes(report))
 
     def test_object_sealed_in_solid_rock(self):
         room = two_region_room(extra_entities=(Key(id="key_0", pos=Vec2(0, 5)),))

@@ -14,10 +14,8 @@ cooperative layouts verifiable:
 
 * **Latching** doors stay open once triggered, so satisfying them once opens
   the passage for both agent slots permanently.
-* **Non-latching** (hold-lever) doors are only open while a trigger is held
-  down. Slot `i` may pass such a door only if the *other* slot can reach the
-  lever -- and the passage is one-way, because whoever holds the lever cannot
-  also walk through.
+* **Non-latching** doors are one-way unless an aligned crate can keep their
+  HOLD switch pressed.
 
 Deliberately conservative choices: hazards are never crossable without a
 bridge, crates never move, and a trigger counts only if some slot can reach
@@ -127,7 +125,9 @@ def analyse(room: Room, model: ConnectivityModel) -> SolvabilityReport:
         for cluster_id, cluster in sorted(model.clusters.items()):
             if cluster_id in open_clusters:
                 continue
-            if cluster.latching:
+            if cluster.latching or _crate_sustains(
+                cluster.requirement, model
+            ):
                 if _satisfiable(cluster.requirement, range(AGENT_SLOTS), reach, model):
                     open_clusters.add(cluster_id)
                     unlock_round[cluster_id] = round_index
@@ -248,12 +248,30 @@ def _satisfiable(
     return False
 
 
+def _crate_sustains(
+    requirement: Requirement,
+    model: ConnectivityModel,
+) -> bool:
+    if not isinstance(requirement, SwitchRequirement):
+        return False
+    checks = [
+        switch_id in model.crate_held_switches
+        for switch_id in requirement.switch_ids
+    ]
+    if requirement.mode is TriggerMode.ANY:
+        return any(checks)
+    return bool(checks) and all(checks)
+
+
 def _any_slot_reaches(
     entity_id: str, slots, reach: list[set[int]], model: ConnectivityModel
 ) -> bool:
     region = model.region_of_entity(entity_id)
     if region is None:
         return False
+    owner = model.key_owners.get(entity_id)
+    if owner is not None:
+        return owner in slots and region in reach[owner]
     return any(region in reach[s] for s in slots)
 
 

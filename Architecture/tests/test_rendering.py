@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from helpers import solvable_key_room  # noqa: E402
 
-from coop_env import GenerationConfig, RoomGenerator  # noqa: E402
+from coop_env import GenerationConfig, RoomGenerator, RoomShape  # noqa: E402
 from coop_env.rendering import (  # noqa: E402
     AsciiOptions,
     GalleryEntry,
@@ -107,6 +107,53 @@ class TestSvg(unittest.TestCase):
         room = solvable_key_room()
         self.assertIn("key_0", render_svg(room, options=SvgOptions(labels=True)))
         self.assertNotIn("key_0", render_svg(room, options=SvgOptions(labels=False)))
+
+    def test_owned_key_legend_uses_agent_colors_without_generic_key_door(self):
+        config = GenerationConfig.preset(
+            "tutorial",
+            num_keys=(2, 2),
+            num_locked_doors=(2, 2),
+            region_count=(3, 3),
+            puzzle_chain_length=2,
+            agent_specific_keys=True,
+            allow_shared_keys=False,
+            require_key_for_each_agent=True,
+            num_normal_wipeout_balls=(0, 0),
+            num_big_wipeout_balls=(0, 0),
+        )
+        svg = render_svg(RoomGenerator(config).generate(3))
+        self.assertIn("agent 1 key/door", svg)
+        self.assertIn("agent 2 key/door", svg)
+        self.assertNotIn(">key door<", svg)
+
+    def test_big_wipeout_ball_shows_its_three_by_three_hitbox(self):
+        config = GenerationConfig(
+            width=(24, 24),
+            height=(14, 14),
+            shape_weights={RoomShape.RECTANGLE: 1.0},
+            region_count=(1, 1),
+            obstacle_density=0.0,
+            hazard_density=0.0,
+            num_keys=(0, 0),
+            num_locked_doors=(0, 0),
+            num_switches=(0, 0),
+            puzzle_chain_length=0,
+            exit_objective_count=0,
+            required_cooperative_actions=0,
+            num_big_wipeout_balls=(1, 1),
+        )
+        room = RoomGenerator(config).generate(4)
+        root = ElementTree.fromstring(
+            render_svg(room, options=SvgOptions(cell=10))
+        )
+        hitboxes = [
+            element
+            for element in root.iter()
+            if element.get("data-wipeout-hitbox") == "3x3"
+        ]
+        self.assertEqual(len(hitboxes), 1)
+        self.assertEqual(float(hitboxes[0].get("width", "0")), 30.0)
+        self.assertEqual(float(hitboxes[0].get("height", "0")), 30.0)
 
 
 class TestGallery(unittest.TestCase):

@@ -1,18 +1,4 @@
-"""Mutable per-episode state.
-
-`EpisodeState` holds every value that can change while a room is being played:
-which keys are gone, which switches are thrown, where the crates ended up, and
-what the clock says. It is rebuilt from the immutable `Room` on every reset,
-which is why reset is exact by construction -- there is no accumulated drift to
-undo.
-
-Scope note: this module implements *mechanism* behaviour only -- how a door
-reacts to its own requirement, whether a bridge is solid at tick N
-under a crate reads as pressed. It contains no agents, no movement, no
-decision-making, and nothing that chooses to press anything. The mutator
-methods (`collect_key`, `set_switch`, ...) are the seams a future control layer
-would call; this project never calls them on its own behalf.
-"""
+"""Mutable values for one room episode."""
 
 from __future__ import annotations
 
@@ -20,10 +6,12 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 from .entities import (
+    Key,
     LockedDoor,
     PushableBlock,
     Switch,
     SwitchMode,
+    TemporaryBridge,
 )
 from .room import Room
 from .tiles import Tile, is_hazard, is_walkable
@@ -95,11 +83,17 @@ class EpisodeState:
     # Seams for a future control layer. Nothing in this project calls them
     # except tests and the mechanism self-check tool.
 
-    def collect_key(self, key_id: str) -> None:
-        if self.room.find(key_id) is None:
+    def collect_key(self, key_id: str, agent_index: int | None = None) -> bool:
+        key = self.room.find(key_id)
+        if not isinstance(key, Key):
             raise KeyError(f"no key {key_id!r} in this room")
+        if key_id in self.keys_collected:
+            return False
+        if key.agent_index is not None and key.agent_index != agent_index:
+            return False
         self.keys_collected.add(key_id)
         self.refresh()
+        return True
 
     def set_switch(self, switch_id: str, active: bool) -> None:
         switch = self.room.find(switch_id)
@@ -135,11 +129,7 @@ class EpisodeState:
     # -- time --------------------------------------------------------------
 
     def advance(self, ticks: int = 1) -> "EpisodeState":
-        """Step the environment clock.
-
-        Only time-driven mechanics respond: temporary bridges
-        and timed-door countdowns. Nothing moves through the room as a result.
-        """
+        """Advance doors, bridges, and wipeout-ball timing."""
         if ticks < 0:
             raise ValueError("cannot advance time backwards")
         for _ in range(ticks):
@@ -158,6 +148,40 @@ class EpisodeState:
         return self
 
     # -- derived state -----------------------------------------------------
+
+    def door_timer_remaining(self, door_id: str) -> int:
+        door = self.room.find(door_id)
+        if not isinstance(door, LockedDoor):
+            raise KeyError(f"no door {door_id!r} in this room")
+        return self._door_timers.get(door_id, 0)
+
+    def door_needs_rearm(self, door_id: str) -> bool:
+        door = self.room.find(door_id)
+        if not isinstance(door, LockedDoor):
+            raise KeyError(f"no door {door_id!r} in this room")
+        return door_id in self._door_spent
+
+    def bridge_is_solid(self, bridge_id: str, tick: int | None = None) -> bool:
+        bridge = self.room.find(bridge_id)
+        if not isinstance(bridge, TemporaryBridge):
+            raise KeyError(f"no bridge {bridge_id!r} in this room")
+        return bridge.is_solid_at(self.tick if tick is None else tick)
+
+    def bridge_ticks_until_change(
+        self,
+        bridge_id: str,
+        tick: int | None = None,
+    ) -> int:
+        bridge = self.room.find(bridge_id)
+        if not isinstance(bridge, TemporaryBridge):
+            raise KeyError(f"no bridge {bridge_id!r} in this room")
+        at = self.tick if tick is None else tick
+        current = bridge.is_solid_at(at)
+        period = max(1, bridge.period)
+        for offset in range(1, period + 1):
+            if bridge.is_solid_at(at + offset) != current:
+                return offset
+        return period
 
     def refresh(self) -> None:
         """Recompute everything that follows from the primary state."""
@@ -203,6 +227,18 @@ class EpisodeState:
             if bridge.is_solid_at(self.tick):
                 tiles.update(bridge.tiles)
         return tiles
+
+    def wipeout_positions(self, tick: int | None = None) -> dict[str, Vec2]:
+        at = self.tick if tick is None else tick
+        return {ball.id: ball.position_at(at) for ball in self.room.wipeout_balls}
+
+    def lethal_wipeout_tiles(self, tick: int | None = None) -> set[Vec2]:
+        at = self.tick if tick is None else tick
+        return {
+            tile
+            for ball in self.room.wipeout_balls
+            for tile in ball.collision_tiles_at(at)
+        }
 
     def supported_hazard_tiles(self) -> set[Vec2]:
         """Hazard tiles currently made crossable by a temporary bridge."""

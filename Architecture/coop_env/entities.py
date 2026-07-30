@@ -1,15 +1,4 @@
-"""Interactive object definitions.
-
-Everything here is an immutable *blueprint*: the shape of the mechanism, where
-it sits, and what it needs. Mutable per-episode values (is the door open, has
-the key been taken) live in `EpisodeState`, which is rebuilt from these
-definitions on every reset. That split is what makes reset trivially correct --
-there is no in-place mutation to undo.
-
-Adding a new mechanic means adding a dataclass here, a placement rule in
-`generation/mechanisms.py`, and a glyph in the renderers. Nothing else needs to
-know about it.
-"""
+"""Immutable room objects."""
 
 from __future__ import annotations
 
@@ -21,7 +10,7 @@ from .utils.geometry import Rect, Vec2
 
 
 class EntityKind(IntEnum):
-    """Stable integer ids, suitable for a future observation encoder."""
+    """Stable entity type IDs."""
 
     AGENT_SPAWN = 1
     EXIT_DOOR = 2
@@ -34,12 +23,18 @@ class EntityKind(IntEnum):
     CHECKPOINT = 9
     RESET_ZONE = 10
     TEMPORARY_BRIDGE = 11
+    WIPEOUT_BALL = 12
 
 
 class SwitchMode(str, Enum):
     TOGGLE = "toggle"  # flips and stays flipped
     HOLD = "hold"      # active only while something rests on it
     ONESHOT = "oneshot"  # can be turned on once, never off
+
+
+class WipeoutBallSize(str, Enum):
+    NORMAL = "normal"
+    BIG = "big"
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,11 +58,7 @@ class Entity:
 
 @dataclass(frozen=True, slots=True)
 class AgentSpawn(Entity):
-    """A start tile reserved for one of the two future agents.
-
-    This marks a location only. No agent object, controller, or observation is
-    created here or anywhere else in the project.
-    """
+    """A start tile for one agent."""
 
     index: int = 0
 
@@ -82,6 +73,7 @@ class Key(Entity):
 
     color: str = "gold"
     opens: tuple[str, ...] = ()  # ids of doors this key is intended for
+    agent_index: int | None = None
 
     @property
     def kind(self) -> EntityKind:
@@ -159,10 +151,21 @@ class PushableBlock(Entity):
     """
 
     heavy: bool = False
+    target_switch_id: str | None = None
+    push_from: Vec2 | None = None
 
     @property
     def kind(self) -> EntityKind:
         return EntityKind.PUSHABLE_BLOCK
+
+    def describe(self) -> str:
+        if self.target_switch_id is None:
+            return Entity.describe(self)
+        return (
+            f"crate {self.id} at {tuple(self.pos)} pushes from "
+            f"{tuple(self.push_from) if self.push_from is not None else '?'} "
+            f"onto {self.target_switch_id}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,6 +216,53 @@ class TemporaryBridge(Entity):
 
     def is_solid_at(self, tick: int) -> bool:
         return ((tick + self.phase) % max(1, self.period)) < self.on_ticks
+
+
+@dataclass(frozen=True, slots=True)
+class WipeoutBall(Entity):
+    """A lethal ball that advances one tile per environment tick."""
+
+    track: tuple[Vec2, ...] = ()
+    size: WipeoutBallSize = WipeoutBallSize.NORMAL
+
+    @property
+    def kind(self) -> EntityKind:
+        return EntityKind.WIPEOUT_BALL
+
+    @property
+    def expected_track_length(self) -> int:
+        return 7 if self.size is WipeoutBallSize.NORMAL else 11
+
+    @property
+    def collision_radius(self) -> int:
+        return 0 if self.size is WipeoutBallSize.NORMAL else 1
+
+    def position_at(self, tick: int) -> Vec2:
+        path = self.track or (self.pos,)
+        if len(path) == 1:
+            return path[0]
+        cycle = 2 * (len(path) - 1)
+        offset = tick % cycle
+        index = offset if offset < len(path) else cycle - offset
+        return path[index]
+
+    def collision_tiles_at(self, tick: int) -> tuple[Vec2, ...]:
+        center = self.position_at(tick)
+        radius = self.collision_radius
+        return tuple(
+            Vec2(center.x + dx, center.y + dy)
+            for dy in range(-radius, radius + 1)
+            for dx in range(-radius, radius + 1)
+        )
+
+    def footprint(self) -> tuple[Vec2, ...]:
+        path = self.track or (self.pos,)
+        tiles = {
+            tile
+            for tick in range(len(path))
+            for tile in self.collision_tiles_at(tick)
+        }
+        return tuple(sorted(tiles, key=lambda tile: (tile.y, tile.x)))
 
 
 #: Entity types that block movement while in their default state. Used by the

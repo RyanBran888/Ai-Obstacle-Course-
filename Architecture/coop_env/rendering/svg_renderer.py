@@ -23,6 +23,8 @@ from ..entities import (
     Switch,
     SwitchMode,
     TemporaryBridge,
+    WipeoutBall,
+    WipeoutBallSize,
 )
 from ..requirements import (
     CheckpointRequirement,
@@ -63,7 +65,7 @@ def render_svg(
     map_w = room.width * cell
     map_h = room.height * cell
     header_h = 52 if opts.header else 0
-    legend_rows = _legend_entries(room)
+    legend_rows = _legend_entries(room, theme)
     legend_h = _legend_height(legend_rows, map_w) if opts.legend else 0
 
     total_w = map_w + pad * 2
@@ -181,6 +183,7 @@ def _entity_layer(
     order = {
         EntityKind.RESET_ZONE: 0,
         EntityKind.TEMPORARY_BRIDGE: 1,
+        EntityKind.WIPEOUT_BALL: 2,
         EntityKind.CHECKPOINT: 3,
         EntityKind.KEY: 5,
         EntityKind.SWITCH: 6,
@@ -200,6 +203,9 @@ def _draw_entity(
     entity: Entity, room: Room, state: EpisodeState | None, theme: Theme, cell: int
 ) -> list[str]:
     color = theme.entity_color(entity.kind)
+
+    if isinstance(entity, Key) and entity.agent_index is not None:
+        color = theme.accents[f"agent_{entity.agent_index}"]
 
     if isinstance(entity, ResetZone):
         r = entity.rect
@@ -221,6 +227,41 @@ def _draw_entity(
                 f'stroke-width="1" stroke-dasharray="3 2"/>'
             )
         return out
+
+    if isinstance(entity, WipeoutBall):
+        start, end = entity.track[0], entity.track[-1]
+        sx = start.x * cell + cell / 2
+        ex = end.x * cell + cell / 2
+        cy = start.y * cell + cell / 2
+        tick = state.tick if state is not None else 0
+        current = entity.position_at(tick)
+        cx = current.x * cell + cell / 2
+        cy_now = current.y * cell + cell / 2
+        ball_color = theme.accents[
+            "wipeout_big"
+            if entity.size is WipeoutBallSize.BIG
+            else "wipeout_normal"
+        ]
+        big = entity.size is WipeoutBallSize.BIG
+        radius = cell * (1.35 if big else 0.34)
+        marks = [
+            f'<line x1="{sx}" y1="{cy}" x2="{ex}" y2="{cy}" '
+            f'stroke="{ball_color}" stroke-width="3" stroke-opacity="0.35" '
+            f'stroke-dasharray="4 3"/>',
+        ]
+        if big:
+            hitbox = cell * 3
+            marks.append(
+                f'<rect data-wipeout-hitbox="3x3" x="{cx - hitbox / 2}" '
+                f'y="{cy_now - hitbox / 2}" width="{hitbox}" height="{hitbox}" '
+                f'rx="{cell * 0.35}" fill="{ball_color}" fill-opacity="0.12" '
+                f'stroke="{ball_color}" stroke-width="1" stroke-opacity="0.55"/>'
+            )
+        marks.append(
+            f'<circle cx="{cx}" cy="{cy_now}" r="{radius:.1f}" fill="{ball_color}" '
+            f'fill-opacity="0.9" stroke="{_shade(ball_color, 0.65)}" stroke-width="2"/>'
+        )
+        return marks
 
     px, py = entity.pos[0] * cell, entity.pos[1] * cell
     mid_x, mid_y = px + cell / 2, py + cell / 2
@@ -257,7 +298,7 @@ def _draw_entity(
         ]
 
     if isinstance(entity, LockedDoor):
-        lock_color = _lock_color(entity, theme)
+        lock_color = _lock_color(entity, room, theme)
         open_now = state.is_door_open(entity.id) if state else False
         if entity.horizontal:
             bar = f'x="{px + 1}" y="{py + cell * 0.28:.1f}" width="{cell - 2}" height="{cell * 0.44:.1f}"'
@@ -334,7 +375,7 @@ def _label(entity: Entity, theme: Theme, cell: int) -> str:
     )
 
 
-def _lock_color(door: LockedDoor, theme: Theme) -> str:
+def _lock_color(door: LockedDoor, room: Room, theme: Theme) -> str:
     if door.timer:
         return theme.accents["lock_timed"]
     if not door.latching:
@@ -343,6 +384,14 @@ def _lock_color(door: LockedDoor, theme: Theme) -> str:
     if requirement.needs_simultaneity():
         return theme.accents["lock_paired"]
     if isinstance(requirement, KeyRequirement):
+        owners = {
+            key.agent_index
+            for key_id in requirement.key_ids
+            if isinstance((key := room.find(key_id)), Key)
+            and key.agent_index is not None
+        }
+        if len(owners) == 1:
+            return theme.accents[f"agent_{owners.pop()}"]
         return theme.accents["lock_key"]
     if isinstance(requirement, SwitchRequirement):
         return theme.accents["lock_switch"]
@@ -383,9 +432,8 @@ def _header(
     )
 
 
-def _legend_entries(room: Room) -> list[tuple[str, str]]:
+def _legend_entries(room: Room, theme: Theme) -> list[tuple[str, str]]:
     """(colour, label) pairs for whatever this room actually contains."""
-    theme = get_theme("dark")
     entries: list[tuple[str, str]] = [
         (theme.tile_color(Tile.FLOOR), "floor"),
         (theme.tile_color(Tile.WALL), "wall"),
@@ -404,9 +452,18 @@ def _legend_entries(room: Room) -> list[tuple[str, str]]:
     entries.append((theme.entity_color(EntityKind.AGENT_SPAWN), "spawn"))
     entries.append((theme.entity_color(EntityKind.EXIT_DOOR), "exit"))
     if EntityKind.KEY in kinds:
-        entries.append((theme.entity_color(EntityKind.KEY), "key"))
+        if any(key.agent_index == 0 for key in room.keys):
+            entries.append((theme.accents["agent_0"], "agent 1 key/door"))
+        if any(key.agent_index == 1 for key in room.keys):
+            entries.append((theme.accents["agent_1"], "agent 2 key/door"))
+        if any(key.agent_index is None for key in room.keys):
+            entries.append((theme.entity_color(EntityKind.KEY), "shared key"))
     if EntityKind.LOCKED_DOOR in kinds:
-        if any(isinstance(d.requirement, KeyRequirement) for d in room.doors):
+        if any(
+            isinstance(door.requirement, KeyRequirement)
+            and _lock_color(door, room, theme) == theme.accents["lock_key"]
+            for door in room.doors
+        ):
             entries.append((theme.accents["lock_key"], "key door"))
         if any(
             isinstance(d.requirement, SwitchRequirement)
@@ -431,6 +488,11 @@ def _legend_entries(room: Room) -> list[tuple[str, str]]:
         entries.append((theme.entity_color(EntityKind.RESET_ZONE), "reset zone"))
     if EntityKind.TEMPORARY_BRIDGE in kinds:
         entries.append((theme.entity_color(EntityKind.TEMPORARY_BRIDGE), "temp bridge"))
+    if EntityKind.WIPEOUT_BALL in kinds:
+        if any(ball.size is WipeoutBallSize.NORMAL for ball in room.wipeout_balls):
+            entries.append((theme.accents["wipeout_normal"], "7x1 wipeout ball"))
+        if any(ball.size is WipeoutBallSize.BIG for ball in room.wipeout_balls):
+            entries.append((theme.accents["wipeout_big"], "11x1 big ball"))
     return entries
 
 

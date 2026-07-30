@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from typing import Any
 
-from .tiles import Tile
+from .tiles import HAZARD_TILES, Tile
 
 IntRange = tuple[int, int]
 
@@ -110,6 +110,16 @@ class GenerationConfig:
     num_checkpoints: IntRange = (0, 2)
     num_reset_zones: IntRange = (0, 1)
     num_temporary_bridges: IntRange = (0, 1)
+    num_normal_wipeout_balls: IntRange = (0, 0)
+    num_big_wipeout_balls: IntRange = (0, 0)
+    require_wipeout_crossing: bool = False
+    """Require one ball track to lie on every spawn-to-exit route."""
+    require_bridge_crossing: bool = False
+    """Require one phasing bridge to lie on every spawn-to-exit route."""
+    require_reset_detour: bool = False
+    """Put one reset tile on a shorter route while keeping a safe detour."""
+    require_combined_course: bool = False
+    """Build the serial, fully contracted cooperative course."""
 
     # -- puzzle structure --------------------------------------------------
     puzzle_chain_length: int = 2
@@ -123,6 +133,12 @@ class GenerationConfig:
     """Chance the two spawn points are placed in different regions."""
     exit_requires_both_agents: bool = False
     """When true, the validator demands both agents can stand at the exit."""
+    agent_specific_keys: bool = False
+    """Assign every generated key to one of the two agent slots."""
+    allow_shared_keys: bool = True
+    """Allow one key to unlock more than one logical doorway."""
+    require_key_for_each_agent: bool = False
+    """Require at least one generated key for both agent slots."""
 
     # -- generation control ------------------------------------------------
     max_attempts: int = 24
@@ -148,6 +164,8 @@ class GenerationConfig:
             "num_checkpoints",
             "num_reset_zones",
             "num_temporary_bridges",
+            "num_normal_wipeout_balls",
+            "num_big_wipeout_balls",
         ):
             setattr(self, name, _ordered(getattr(self, name)))
 
@@ -180,6 +198,87 @@ class GenerationConfig:
             problems.append("exit_objective_count must be >= 0")
         if self.max_attempts < 1:
             problems.append("max_attempts must be at least 1")
+        for name in (
+            "num_keys",
+            "num_locked_doors",
+            "num_switches",
+            "num_pushable_blocks",
+            "num_checkpoints",
+            "num_reset_zones",
+            "num_temporary_bridges",
+            "num_normal_wipeout_balls",
+            "num_big_wipeout_balls",
+        ):
+            if getattr(self, name)[0] < 0:
+                problems.append(f"{name} must be nonnegative")
+        if self.require_key_for_each_agent and not self.agent_specific_keys:
+            problems.append("require_key_for_each_agent needs agent_specific_keys")
+        if self.require_key_for_each_agent and self.num_keys[0] < 2:
+            problems.append("require_key_for_each_agent needs at least 2 keys")
+        if self.require_key_for_each_agent and self.num_locked_doors[0] < 2:
+            problems.append("require_key_for_each_agent needs at least 2 locked doors")
+        if self.require_key_for_each_agent and self.region_count[0] < 3:
+            problems.append("require_key_for_each_agent needs at least 3 regions")
+        if (
+            self.require_wipeout_crossing
+            and self.num_normal_wipeout_balls[0] + self.num_big_wipeout_balls[0] < 1
+        ):
+            problems.append("require_wipeout_crossing needs at least 1 wipeout ball")
+        if self.require_bridge_crossing and self.num_temporary_bridges[0] < 1:
+            problems.append("require_bridge_crossing needs at least 1 temporary bridge")
+        if self.require_bridge_crossing and self.num_temporary_bridges[1] != 1:
+            problems.append("require_bridge_crossing needs exactly 1 temporary bridge")
+        if self.require_bridge_crossing and not any(
+            weight > 0 and tile in HAZARD_TILES
+            for tile, weight in self.hazard_weights.items()
+        ):
+            problems.append("require_bridge_crossing needs a positive hazard weight")
+        if self.require_reset_detour and self.num_reset_zones != (1, 1):
+            problems.append("require_reset_detour needs exactly 1 reset zone")
+        if self.require_combined_course:
+            if (
+                self.width[1] < 37
+                or self.width[0] > 38
+                or self.height[1] < 25
+                or self.height[0] > 32
+            ):
+                problems.append(
+                    "require_combined_course needs dimensions overlapping 37..38 x 25..32"
+                )
+            if not self.agent_specific_keys or not self.require_key_for_each_agent:
+                problems.append("require_combined_course needs owned keys for both agents")
+            if self.allow_shared_keys:
+                problems.append("require_combined_course does not allow shared keys")
+            for name, wanted in (
+                ("num_keys", 2),
+                ("num_locked_doors", 3),
+                ("num_switches", 1),
+                ("num_pushable_blocks", 1),
+                ("num_reset_zones", 1),
+                ("num_temporary_bridges", 1),
+                ("num_normal_wipeout_balls", 1),
+                ("num_big_wipeout_balls", 1),
+            ):
+                low, high = getattr(self, name)
+                if not low <= wanted <= high:
+                    problems.append(
+                        f"require_combined_course needs {name} to include {wanted}"
+                    )
+            if self.exit_objective_count != 1:
+                problems.append("require_combined_course needs one exit objective")
+            if self.num_checkpoints != (0, 0):
+                problems.append(
+                    "require_combined_course creates its checkpoint from the exit objective"
+                )
+            if self.required_cooperative_actions != 1:
+                problems.append("require_combined_course needs one cooperative action")
+            if not self.exit_requires_both_agents:
+                problems.append("require_combined_course needs both agents at the exit")
+            if not any(
+                weight > 0 and tile in HAZARD_TILES
+                for tile, weight in self.hazard_weights.items()
+            ):
+                problems.append("require_combined_course needs a positive hazard weight")
         if not any(w > 0 for w in self.shape_weights.values()):
             problems.append("at least one room shape needs a positive weight")
         if self.hazard_density > 0 and not any(w > 0 for w in self.hazard_weights.values()):
@@ -253,11 +352,16 @@ class GenerationConfig:
             num_checkpoints=_lerp_range((0, 0), (2, 3), t),
             num_reset_zones=_lerp_range((0, 0), (1, 2), t),
             num_temporary_bridges=_lerp_range((0, 0), (1, 2), t),
+            num_normal_wipeout_balls=(0, 0),
+            num_big_wipeout_balls=(0, 0),
             puzzle_chain_length=_lerp_int(1, 5, t),
             exit_objective_count=_lerp_int(1, 3, t),
             required_cooperative_actions=_lerp_int(0, 3, t),
             timed_door_probability=_lerp(0.05, 0.35, t),
             separate_spawns_probability=_lerp(0.10, 0.60, t),
+            agent_specific_keys=t >= 0.20,
+            allow_shared_keys=t < 0.20,
+            require_key_for_each_agent=t >= 0.60,
             complexity=t,
         )
         return replace(derived, **overrides) if overrides else derived

@@ -11,9 +11,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from coop_env import GenerationConfig, RoomGenerator  # noqa: E402
 from coop_env.config import PRESET_COMPLEXITY, RoomShape  # noqa: E402
-from coop_env.entities import AgentSpawn, ExitDoor  # noqa: E402
+from coop_env.entities import (  # noqa: E402
+    AgentSpawn,
+    ExitDoor,
+    LockedDoor,
+    Switch,
+    SwitchMode,
+)
 from coop_env.generation.generator import GenerationError  # noqa: E402
+from coop_env.state import EpisodeState  # noqa: E402
 from coop_env.tiles import Tile, is_walkable  # noqa: E402
+from coop_env.utils.geometry import DIRECTIONS4  # noqa: E402
 from coop_env.validation import validate_room  # noqa: E402
 
 SAMPLE = 40
@@ -132,6 +140,61 @@ class TestConfigIsRespected(unittest.TestCase):
                 with_coop += 1
         self.assertGreaterEqual(with_coop, 20, "co-op budget should almost always land")
 
+    def test_requested_crate_starts_one_push_from_a_hold_switch(self):
+        for paired in (False, True):
+            with self.subTest(paired=paired):
+                switches = 2 if paired else 1
+                config = GenerationConfig(
+                    width=(18, 22),
+                    height=(14, 18),
+                    shape_weights={RoomShape.RECTANGLE: 1.0},
+                    region_count=(2, 3),
+                    obstacle_density=0.0,
+                    hazard_density=0.0,
+                    num_keys=(0, 0),
+                    num_locked_doors=(1, 1),
+                    num_switches=(switches, switches),
+                    num_pushable_blocks=(1, 1),
+                    num_checkpoints=(0, 0),
+                    num_reset_zones=(0, 0),
+                    num_temporary_bridges=(0, 0),
+                    puzzle_chain_length=1,
+                    exit_objective_count=0,
+                    required_cooperative_actions=1,
+                    timed_door_probability=0.0,
+                    exit_requires_both_agents=paired,
+                    raise_on_failure=True,
+                )
+                generator = RoomGenerator(config)
+                for seed in range(8):
+                    outcome = generator.generate_with_report(seed)
+                    room = outcome.room
+                    self.assertFalse(outcome.fallback)
+                    self.assertTrue(outcome.report.ok, outcome.report.report_lines())
+                    self.assertEqual(len(room.blocks), 1)
+
+                    block = room.blocks[0]
+                    target = room.find(block.target_switch_id or "")
+                    self.assertIsInstance(target, Switch)
+                    assert isinstance(target, Switch)
+                    self.assertIs(target.mode, SwitchMode.HOLD)
+
+                    direction = target.pos - block.pos
+                    self.assertIn(direction, DIRECTIONS4)
+                    self.assertEqual(block.push_from, block.pos - direction)
+                    assert block.push_from is not None
+                    self.assertEqual(room.terrain_at(block.push_from), Tile.FLOOR)
+                    self.assertFalse(room.entities_at(block.push_from))
+
+                    state = EpisodeState.from_room(room)
+                    self.assertFalse(state.is_switch_active(target.id))
+                    state.place_block(block.id, target.pos)
+                    self.assertTrue(state.is_switch_active(target.id))
+                    self.assertEqual(
+                        room.metadata["crate_switch_pairs"][0]["block"],
+                        block.id,
+                    )
+
     def test_harder_presets_build_longer_lock_chains(self):
         """`chain_length` is measured by the validator, not claimed by the generator."""
 
@@ -154,14 +217,223 @@ class TestConfigIsRespected(unittest.TestCase):
         )
         self.assertGreater(deep, 10, "a door behind a door should be common at 'hard'")
 
-    def test_shared_keys_open_more_than_one_door(self):
+    def test_preset_keys_do_not_open_multiple_logical_doors(self):
         generator = RoomGenerator(GenerationConfig.preset("brutal"))
-        shared = 0
         for seed in range(30):
             room = generator.generate(seed)
-            if any(len(key.opens) > 1 for key in room.keys):
-                shared += 1
-        self.assertGreater(shared, 0, "no room reused a key across doors")
+            for key in room.keys:
+                targets = set()
+                for target_id in key.opens:
+                    target = room.find(target_id)
+                    if target_id == "exit":
+                        targets.add(("exit",))
+                    elif isinstance(target, LockedDoor):
+                        targets.add(
+                            (
+                                min(target.region_a, target.region_b),
+                                max(target.region_a, target.region_b),
+                            )
+                        )
+                self.assertLessEqual(len(targets), 1)
+
+    def test_owned_key_levels_have_multiple_distinct_doors(self):
+        config = GenerationConfig(
+            width=(16, 20),
+            height=(11, 15),
+            shape_weights={RoomShape.RECTANGLE: 1.0},
+            region_count=(3, 4),
+            obstacle_density=0.0,
+            hazard_density=0.0,
+            num_keys=(2, 2),
+            num_locked_doors=(2, 3),
+            num_switches=(0, 0),
+            puzzle_chain_length=2,
+            required_cooperative_actions=0,
+            exit_objective_count=0,
+            agent_specific_keys=True,
+            allow_shared_keys=False,
+            require_key_for_each_agent=True,
+        )
+        generator = RoomGenerator(config)
+        for seed in range(10):
+            room = generator.generate(seed)
+            self.assertEqual({key.agent_index for key in room.keys}, {0, 1})
+            self.assertGreaterEqual(len(room.doors), 2)
+            self.assertTrue(all(len(key.opens) >= 1 for key in room.keys))
+
+    def test_wipeout_levels_have_exact_tracks(self):
+        config = GenerationConfig(
+            width=(24, 28),
+            height=(14, 18),
+            shape_weights={RoomShape.RECTANGLE: 1.0},
+            region_count=(1, 1),
+            obstacle_density=0.0,
+            hazard_density=0.0,
+            num_keys=(0, 0),
+            num_locked_doors=(0, 0),
+            num_switches=(0, 0),
+            puzzle_chain_length=0,
+            required_cooperative_actions=0,
+            exit_objective_count=0,
+            num_normal_wipeout_balls=(1, 1),
+            num_big_wipeout_balls=(1, 1),
+        )
+        room = RoomGenerator(config).generate(4)
+        lengths = sorted(len(ball.track) for ball in room.wipeout_balls)
+        self.assertEqual(lengths, [7, 11])
+
+    def test_required_wipeout_crossings_are_forced_and_time_solvable(self):
+        cases = ((9, 16, 1, 0), (15, 18, 0, 1))
+        for width, height, normal, big in cases:
+            config = GenerationConfig(
+                width=(width, width),
+                height=(height, height),
+                shape_weights={RoomShape.RECTANGLE: 1.0},
+                region_count=(1, 1),
+                obstacle_density=0.0,
+                hazard_density=0.0,
+                num_keys=(0, 0),
+                num_locked_doors=(0, 0),
+                num_switches=(0, 0),
+                num_pushable_blocks=(0, 0),
+                num_checkpoints=(0, 0),
+                num_reset_zones=(0, 0),
+                num_temporary_bridges=(0, 0),
+                puzzle_chain_length=0,
+                required_cooperative_actions=0,
+                exit_objective_count=0,
+                num_normal_wipeout_balls=(normal, normal),
+                num_big_wipeout_balls=(big, big),
+                require_wipeout_crossing=True,
+                raise_on_failure=True,
+            )
+            generator = RoomGenerator(config)
+            for seed in range(8):
+                report = generator.generate_with_report(seed).report
+                self.assertTrue(report.ok, report.report_lines())
+                wipeout = report.wipeout
+                self.assertIsNotNone(wipeout)
+                assert wipeout is not None
+                self.assertTrue(wipeout.structural_crossing)
+                self.assertTrue(wipeout.time_solvable)
+                self.assertEqual(wipeout.reachable_by, (0, 1))
+
+    def test_timed_probability_one_always_builds_rearmable_timed_gates(self):
+        config = GenerationConfig(
+            width=(24, 24),
+            height=(18, 18),
+            shape_weights={RoomShape.RECTANGLE: 1.0},
+            region_count=(3, 3),
+            obstacle_density=0.0,
+            hazard_density=0.0,
+            num_keys=(0, 0),
+            num_locked_doors=(1, 1),
+            num_switches=(1, 1),
+            num_pushable_blocks=(0, 0),
+            num_checkpoints=(0, 0),
+            num_reset_zones=(0, 0),
+            num_temporary_bridges=(0, 0),
+            puzzle_chain_length=1,
+            required_cooperative_actions=0,
+            exit_objective_count=0,
+            timed_door_probability=1.0,
+            raise_on_failure=True,
+        )
+        for seed in range(12):
+            room = RoomGenerator(config).generate(seed)
+            self.assertEqual(
+                [gate["kind"] for gate in room.metadata["gates"]],
+                ["timed_switch"],
+            )
+            self.assertTrue(all(door.timer is not None for door in room.doors))
+            self.assertTrue(all(switch.mode.value == "toggle" for switch in room.switches))
+
+    def test_required_bridge_course_forces_a_timed_crossing(self):
+        config = GenerationConfig(
+            width=(8, 8),
+            height=(16, 18),
+            shape_weights={RoomShape.RECTANGLE: 1.0},
+            region_count=(1, 1),
+            obstacle_density=0.0,
+            hazard_density=0.0,
+            hazard_weights={Tile.HAZARD_WATER: 1.0},
+            num_keys=(0, 0),
+            num_locked_doors=(0, 0),
+            num_switches=(0, 0),
+            num_pushable_blocks=(0, 0),
+            num_checkpoints=(0, 0),
+            num_reset_zones=(0, 0),
+            num_temporary_bridges=(1, 1),
+            num_normal_wipeout_balls=(0, 0),
+            num_big_wipeout_balls=(0, 0),
+            puzzle_chain_length=0,
+            required_cooperative_actions=0,
+            exit_objective_count=0,
+            require_bridge_crossing=True,
+            raise_on_failure=True,
+        )
+        generator = RoomGenerator(config)
+        for seed in range(12):
+            outcome = generator.generate_with_report(seed)
+            room = outcome.room
+            bridge = outcome.report.bridge
+            self.assertFalse(outcome.fallback)
+            self.assertEqual(len(room.bridges), 1)
+            self.assertEqual(room.metadata["required_bridge_id"], room.bridges[0].id)
+            self.assertIsNotNone(bridge)
+            assert bridge is not None
+            self.assertTrue(bridge.structural_crossing)
+            self.assertTrue(bridge.time_solvable)
+            self.assertEqual(bridge.reachable_by, (0, 1))
+
+    def test_required_reset_zone_has_a_longer_safe_detour(self):
+        config = GenerationConfig(
+            width=(10, 10),
+            height=(16, 18),
+            shape_weights={RoomShape.RECTANGLE: 1.0},
+            region_count=(1, 1),
+            obstacle_density=0.0,
+            hazard_density=0.0,
+            num_keys=(0, 0),
+            num_locked_doors=(0, 0),
+            num_switches=(0, 0),
+            num_pushable_blocks=(0, 0),
+            num_checkpoints=(0, 0),
+            num_reset_zones=(1, 1),
+            num_temporary_bridges=(0, 0),
+            num_normal_wipeout_balls=(0, 0),
+            num_big_wipeout_balls=(0, 0),
+            puzzle_chain_length=0,
+            required_cooperative_actions=0,
+            exit_objective_count=0,
+            require_reset_detour=True,
+            raise_on_failure=True,
+        )
+        generator = RoomGenerator(config)
+        for seed in range(12):
+            outcome = generator.generate_with_report(seed)
+            room = outcome.room
+            detour = outcome.report.reset_detour
+            self.assertFalse(outcome.fallback)
+            self.assertEqual(len(room.reset_zones), 1)
+            self.assertEqual(
+                room.metadata["required_reset_zone_id"],
+                room.reset_zones[0].id,
+            )
+            self.assertIsNotNone(detour)
+            assert detour is not None
+            self.assertTrue(detour.shortcut_valid)
+            self.assertTrue(detour.safe_detour)
+            self.assertTrue(
+                all(
+                    safe > short
+                    for short, safe in zip(
+                        detour.shortest_steps_by_agent,
+                        detour.safe_steps_by_agent,
+                    )
+                    if short is not None and safe is not None
+                )
+            )
 
     def test_zero_cooperative_budget_still_valid(self):
         config = GenerationConfig.preset("hard", required_cooperative_actions=0)
@@ -219,6 +491,67 @@ class TestFallbackPath(unittest.TestCase):
         room = _fallback_room(1, GenerationConfig())
         report = validate_room(room)
         self.assertTrue(report.ok, report.summary())
+
+    def test_required_bridge_fallback_keeps_the_crossing_contract(self):
+        config = GenerationConfig(
+            width=(24, 24),
+            height=(18, 18),
+            shape_weights={RoomShape.RECTANGLE: 1.0},
+            region_count=(1, 1),
+            obstacle_density=0.0,
+            hazard_density=0.0,
+            hazard_weights={Tile.HAZARD_WATER: 1.0},
+            num_keys=(0, 0),
+            num_locked_doors=(0, 0),
+            num_switches=(0, 0),
+            num_pushable_blocks=(0, 0),
+            num_checkpoints=(0, 0),
+            num_reset_zones=(0, 0),
+            num_temporary_bridges=(1, 1),
+            puzzle_chain_length=0,
+            required_cooperative_actions=0,
+            exit_objective_count=0,
+            require_bridge_crossing=True,
+            max_attempts=1,
+        )
+        outcome = RoomGenerator(config).generate_with_report(0)
+        self.assertTrue(outcome.fallback)
+        self.assertTrue(outcome.report.ok, outcome.report.report_lines())
+        bridge = outcome.report.bridge
+        self.assertIsNotNone(bridge)
+        assert bridge is not None
+        self.assertTrue(bridge.structural_crossing)
+        self.assertTrue(bridge.time_solvable)
+
+    def test_required_reset_fallback_keeps_the_detour_contract(self):
+        config = GenerationConfig(
+            width=(8, 8),
+            height=(8, 8),
+            shape_weights={RoomShape.RECTANGLE: 1.0},
+            region_count=(1, 1),
+            obstacle_density=0.6,
+            hazard_density=0.6,
+            num_keys=(0, 0),
+            num_locked_doors=(0, 0),
+            num_switches=(0, 0),
+            num_pushable_blocks=(0, 0),
+            num_checkpoints=(0, 0),
+            num_reset_zones=(1, 1),
+            num_temporary_bridges=(0, 0),
+            puzzle_chain_length=0,
+            required_cooperative_actions=0,
+            exit_objective_count=0,
+            require_reset_detour=True,
+            max_attempts=1,
+        )
+        outcome = RoomGenerator(config).generate_with_report(0)
+        self.assertTrue(outcome.fallback)
+        self.assertTrue(outcome.report.ok, outcome.report.report_lines())
+        detour = outcome.report.reset_detour
+        self.assertIsNotNone(detour)
+        assert detour is not None
+        self.assertTrue(detour.shortcut_valid)
+        self.assertTrue(detour.safe_detour)
 
     def test_raise_on_failure_surfaces_the_error(self):
         # a single attempt with an impossible mechanism budget will not always

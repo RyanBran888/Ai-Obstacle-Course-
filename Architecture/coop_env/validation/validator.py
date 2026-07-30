@@ -25,12 +25,26 @@ from ..entities import (
     PushableBlock,
     ResetZone,
     Switch,
+    SwitchMode,
     TemporaryBridge,
+    WipeoutBall,
+    WipeoutBallSize,
 )
 from ..room import Room
+from ..requirements import (
+    CheckpointRequirement,
+    CompositeRequirement,
+    KeyRequirement,
+    SwitchRequirement,
+)
 from ..tiles import Tile, is_hazard, is_walkable
+from ..utils.geometry import Vec2
+from .bridge import BridgeReport, analyse_bridge
+from .combined import CombinedCourseReport, analyse_combined_course
 from .connectivity import ConnectivityModel, build_connectivity
+from .reset_detour import ResetDetourReport, analyse_reset_detour
 from .solvability import SolvabilityReport, analyse
+from .wipeout import WipeoutReport, analyse_wipeout
 
 
 class Severity(str, Enum):
@@ -53,6 +67,10 @@ class ValidationReport:
     ok: bool = False
     issues: list[Issue] = field(default_factory=list)
     solvability: SolvabilityReport | None = None
+    wipeout: WipeoutReport | None = None
+    bridge: BridgeReport | None = None
+    reset_detour: ResetDetourReport | None = None
+    combined: CombinedCourseReport | None = None
     stats: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -187,15 +205,388 @@ def rule_requirement_references(room: Room, model: ConnectivityModel) -> list[Is
     for exit_door in room.of_type(ExitDoor):
         holders.append((exit_door.id, exit_door.requirement))
     for holder_id, requirement in holders:
-        for entity_id in sorted(requirement.referenced_ids()):
-            if room.find(entity_id) is None:
+        for entity_id, expected, label in _typed_references(requirement):
+            entity = room.find(entity_id)
+            if entity is None:
                 issues.append(
                     _error(
                         "dangling_requirement",
                         f"{holder_id} requires {entity_id!r}, which is not in the room",
                     )
                 )
+            elif expected is not None and not isinstance(entity, expected):
+                issues.append(
+                    _error(
+                        "wrong_requirement_type",
+                        f"{holder_id} expects {entity_id!r} to be a {label}",
+                    )
+                )
     return issues
+
+
+def _typed_references(requirement):
+    if isinstance(requirement, CompositeRequirement):
+        for part in requirement.parts:
+            yield from _typed_references(part)
+        return
+    if isinstance(requirement, KeyRequirement):
+        for entity_id in sorted(requirement.key_ids):
+            yield entity_id, Key, "key"
+        return
+    if isinstance(requirement, SwitchRequirement):
+        for entity_id in sorted(requirement.switch_ids):
+            yield entity_id, Switch, "switch"
+        return
+    if isinstance(requirement, CheckpointRequirement):
+        for entity_id in sorted(requirement.checkpoint_ids):
+            yield entity_id, Checkpoint, "checkpoint"
+        return
+    for entity_id in sorted(requirement.referenced_ids()):
+        yield entity_id, None, "entity"
+
+
+def rule_agent_keys(room: Room, model: ConnectivityModel) -> list[Issue]:
+    issues: list[Issue] = []
+    required_by: dict[str, set[str]] = {key.id: set() for key in room.keys}
+    holders = [*room.doors, room.exit]
+    for holder in holders:
+        for key_id in holder.requirement.referenced_ids():
+            if key_id in required_by:
+                required_by[key_id].add(holder.id)
+
+    owners: set[int] = set()
+    for key in room.keys:
+        if key.agent_index not in (None, 0, 1):
+            issues.append(
+                _error(
+                    "key_owner",
+                    f"key {key.id} has invalid agent index {key.agent_index}",
+                )
+            )
+        if key.agent_index is not None:
+            owners.add(key.agent_index)
+        if room.config.agent_specific_keys and key.agent_index is None:
+            issues.append(
+                _error("key_owner", f"key {key.id} is not assigned to an agent")
+            )
+        strict_links = room.config.agent_specific_keys or not room.config.allow_shared_keys
+        if strict_links and set(key.opens) != required_by[key.id]:
+            issues.append(
+                _error(
+                    "key_door_mismatch",
+                    f"key {key.id} opens {sorted(key.opens)}, but requirements use "
+                    f"{sorted(required_by[key.id])}",
+                )
+            )
+        if not room.config.allow_shared_keys:
+            logical_targets = set()
+            for target_id in key.opens:
+                target = room.find(target_id)
+                if isinstance(target, LockedDoor):
+                    logical_targets.add(
+                        ("door", min(target.region_a, target.region_b), max(target.region_a, target.region_b))
+                    )
+                else:
+                    logical_targets.add(("exit", target_id))
+            if len(logical_targets) > 1:
+                issues.append(
+                    _error(
+                        "shared_key",
+                        f"key {key.id} is connected to multiple logical doors",
+                    )
+                )
+
+    if room.config.require_key_for_each_agent and owners != {0, 1}:
+        issues.append(
+            _error("missing_agent_key", "the room needs at least one key for each agent")
+        )
+    return issues
+
+
+def rule_crate_switch_pairs(room: Room, model: ConnectivityModel) -> list[Issue]:
+    issues: list[Issue] = []
+    paired: list[PushableBlock] = []
+
+    for block in room.blocks:
+        if block.target_switch_id is None and block.push_from is None:
+            continue
+        if block.target_switch_id is None or block.push_from is None:
+            issues.append(
+                _error(
+                    "crate_switch_pair",
+                    f"crate {block.id} has an incomplete switch plan",
+                )
+            )
+            continue
+
+        target = room.find(block.target_switch_id)
+        if not isinstance(target, Switch) or target.mode is not SwitchMode.HOLD:
+            issues.append(
+                _error(
+                    "crate_switch_target",
+                    f"crate {block.id} targets a missing or non-HOLD switch",
+                )
+            )
+            continue
+        paired.append(block)
+
+        if block.pos.manhattan(target.pos) != 1:
+            issues.append(
+                _error(
+                    "crate_switch_distance",
+                    f"crate {block.id} is not one push from {target.id}",
+                )
+            )
+            continue
+
+        direction = target.pos - block.pos
+        expected_standing = block.pos - direction
+        if block.push_from != expected_standing:
+            issues.append(
+                _error(
+                    "crate_switch_direction",
+                    f"crate {block.id} needs standing tile {tuple(expected_standing)}",
+                )
+            )
+            continue
+
+        if room.terrain_at(block.push_from) != Tile.FLOOR:
+            issues.append(
+                _error(
+                    "crate_switch_standing",
+                    f"crate {block.id} standing tile is not clear floor",
+                )
+            )
+        elif room.entities_at(block.push_from):
+            issues.append(
+                _error(
+                    "crate_switch_standing",
+                    f"crate {block.id} standing tile is occupied",
+                )
+            )
+        elif model.region_of_tile(block.push_from) is None:
+            issues.append(
+                _error(
+                    "crate_switch_standing",
+                    f"crate {block.id} standing tile is unreachable",
+                )
+            )
+
+        target_occupants = [
+            entity.id
+            for entity in room.entities_at(target.pos)
+            if entity.id != target.id
+        ]
+        if room.terrain_at(target.pos) != Tile.FLOOR or target_occupants:
+            issues.append(
+                _error(
+                    "crate_switch_destination",
+                    f"crate {block.id} cannot be pushed onto {target.id}",
+                )
+            )
+
+    requested = room.metadata.get("requested_pushable_blocks")
+    if requested is not None and len(room.blocks) != requested:
+        issues.append(
+            _error(
+                "crate_count",
+                f"expected {requested} pushable blocks, found {len(room.blocks)}",
+            )
+        )
+
+    hold_switches = [
+        switch for switch in room.switches if switch.mode is SwitchMode.HOLD
+    ]
+    if requested and hold_switches and not paired:
+        issues.append(
+            _error(
+                "crate_switch_missing",
+                "a requested crate was not paired with a HOLD switch",
+            )
+        )
+
+    saved_pairs = room.metadata.get("crate_switch_pairs")
+    if saved_pairs is not None:
+        actual_pairs = tuple(
+            {
+                "block": block.id,
+                "switch": block.target_switch_id,
+                "push_from": (
+                    list(block.push_from) if block.push_from is not None else None
+                ),
+            }
+            for block in room.blocks
+            if block.target_switch_id is not None
+        )
+        if tuple(saved_pairs) != actual_pairs:
+            issues.append(
+                _error(
+                    "crate_switch_metadata",
+                    "crate-switch metadata does not match the room blueprint",
+                )
+            )
+    return issues
+
+
+def rule_wipeout_balls(room: Room, model: ConnectivityModel) -> list[Issue]:
+    issues: list[Issue] = []
+    swept: set[Any] = set()
+    static_tiles = {
+        tile
+        for entity in room.entities
+        if not isinstance(entity, WipeoutBall)
+        for tile in entity.footprint()
+    }
+
+    for ball in room.wipeout_balls:
+        expected = 7 if ball.size is WipeoutBallSize.NORMAL else 11
+        if len(ball.track) != expected:
+            issues.append(
+                _error(
+                    "wipeout_length",
+                    f"{ball.id} needs a {expected}x1 track, found {len(ball.track)} tiles",
+                )
+            )
+        if not ball.track or ball.pos != ball.track[0]:
+            issues.append(
+                _error("wipeout_origin", f"{ball.id} must start at the left track endpoint")
+            )
+        if len(set(ball.track)) != len(ball.track):
+            issues.append(_error("wipeout_track", f"{ball.id} repeats a track tile"))
+        for previous, current in zip(ball.track, ball.track[1:]):
+            if current != Vec2(previous.x + 1, previous.y):
+                issues.append(
+                    _error(
+                        "wipeout_track",
+                        f"{ball.id} track must be a contiguous horizontal run",
+                    )
+                )
+                break
+
+        footprint = set(ball.footprint())
+        for tile in footprint:
+            if not room.terrain.in_bounds(tile):
+                issues.append(
+                    _error(
+                        "wipeout_bounds",
+                        f"{ball.id} collision area leaves the room at {tuple(tile)}",
+                    )
+                )
+            elif room.terrain_at(tile) != Tile.FLOOR:
+                issues.append(
+                    _error(
+                        "wipeout_terrain",
+                        f"{ball.id} collision area crosses {room.terrain_at(tile).name}",
+                    )
+                )
+        overlap = footprint & static_tiles
+        if overlap:
+            issues.append(
+                _error(
+                    "wipeout_overlap",
+                    f"{ball.id} overlaps a static entity at {tuple(sorted(overlap)[0])}",
+                )
+            )
+        ball_overlap = footprint & swept
+        if ball_overlap:
+            issues.append(
+                _error(
+                    "wipeout_overlap",
+                    f"{ball.id} overlaps another wipeout track",
+                )
+            )
+        swept.update(footprint)
+
+    for size in ("normal", "big"):
+        requested = room.metadata.get(f"requested_{size}_wipeout_balls")
+        if requested is None:
+            continue
+        actual = sum(ball.size.value == size for ball in room.wipeout_balls)
+        if actual != requested:
+            issues.append(
+                _error(
+                    "wipeout_count",
+                    f"expected {requested} {size} wipeout balls, found {actual}",
+                )
+            )
+    return issues
+
+
+def rule_temporary_bridges(room: Room, model: ConnectivityModel) -> list[Issue]:
+    issues: list[Issue] = []
+    occupied: set[Vec2] = set()
+    for bridge in room.bridges:
+        tiles = bridge.footprint()
+        if not tiles or bridge.pos != tiles[0]:
+            issues.append(
+                _error(
+                    "bridge_origin",
+                    f"{bridge.id} must start at its first bridge tile",
+                )
+            )
+            continue
+        if len(tiles) < 2:
+            issues.append(
+                _error("bridge_length", f"{bridge.id} needs at least 2 tiles")
+            )
+        if len(set(tiles)) != len(tiles):
+            issues.append(_error("bridge_path", f"{bridge.id} repeats a bridge tile"))
+        xs = {tile.x for tile in tiles}
+        ys = {tile.y for tile in tiles}
+        if len(xs) > 1 and len(ys) > 1:
+            issues.append(_error("bridge_path", f"{bridge.id} must be a straight run"))
+        ordered = sorted(tiles, key=lambda tile: (tile.y, tile.x))
+        if any(a.manhattan(b) != 1 for a, b in zip(ordered, ordered[1:])):
+            issues.append(_error("bridge_path", f"{bridge.id} has a gap in its run"))
+        for tile in tiles:
+            if not room.terrain.in_bounds(tile):
+                issues.append(
+                    _error(
+                        "bridge_bounds",
+                        f"{bridge.id} leaves the room at {tuple(tile)}",
+                    )
+                )
+            elif not is_hazard(room.terrain_at(tile)):
+                issues.append(
+                    _error(
+                        "bridge_terrain",
+                        f"{bridge.id} must cover hazard terrain at {tuple(tile)}",
+                    )
+                )
+        if set(tiles) & occupied:
+            issues.append(_error("bridge_overlap", f"{bridge.id} overlaps another bridge"))
+        occupied.update(tiles)
+
+    if room.config.require_bridge_crossing or room.config.require_combined_course:
+        requested = room.metadata.get("requested_temporary_bridges")
+        placed = room.metadata.get("placed_temporary_bridges")
+        actual = len(room.bridges)
+        if requested != 1 or placed != 1 or actual != 1:
+            issues.append(
+                _error(
+                    "bridge_count",
+                    f"required bridge course expected 1 bridge, found {actual}",
+                )
+            )
+    return issues
+
+
+def rule_reset_detours(room: Room, model: ConnectivityModel) -> list[Issue]:
+    if not (
+        room.config.require_reset_detour
+        or room.config.require_combined_course
+    ):
+        return []
+    requested = room.metadata.get("requested_reset_zones")
+    placed = room.metadata.get("placed_reset_zones")
+    if requested == 1 and placed == 1 and len(room.reset_zones) == 1:
+        return []
+    return [
+        _error(
+            "reset_count",
+            f"required reset detour expected 1 reset zone, found {len(room.reset_zones)}",
+        )
+    ]
 
 
 def rule_reachable_mechanisms(room: Room, model: ConnectivityModel) -> list[Issue]:
@@ -238,6 +629,11 @@ STRUCTURAL_RULES: list[Rule] = [
     rule_entity_placement,
     rule_no_stacking,
     rule_requirement_references,
+    rule_agent_keys,
+    rule_crate_switch_pairs,
+    rule_wipeout_balls,
+    rule_temporary_bridges,
+    rule_reset_detours,
     rule_reachable_mechanisms,
     rule_hazard_sanity,
 ]
@@ -260,6 +656,84 @@ def validate_room(room: Room, rules: list[Rule] | None = None) -> ValidationRepo
         report.ok = False
         report.stats["stage"] = "structural"
         return report
+
+    if room.wipeout_balls or room.config.require_wipeout_crossing:
+        wipeout = analyse_wipeout(room)
+        report.wipeout = wipeout
+        report.stats.update(
+            {
+                "wipeout_period": wipeout.period,
+                "wipeout_reachable_by": wipeout.reachable_by,
+                "wipeout_min_steps": wipeout.min_steps_by_agent,
+                "required_wipeout_crossing": wipeout.structural_crossing,
+            }
+        )
+        for reason in wipeout.reasons:
+            report.issues.append(_error("wipeout_unsolvable", reason))
+        if report.errors:
+            report.ok = False
+            report.stats["stage"] = "wipeout"
+            return report
+
+    if room.config.require_bridge_crossing or room.config.require_combined_course:
+        bridge = analyse_bridge(room)
+        report.bridge = bridge
+        report.stats.update(
+            {
+                "bridge_period": bridge.period,
+                "bridge_reachable_by": bridge.reachable_by,
+                "bridge_min_steps": bridge.min_steps_by_agent,
+                "required_bridge_crossing": bridge.structural_crossing,
+            }
+        )
+        for reason in bridge.reasons:
+            report.issues.append(_error("bridge_unsolvable", reason))
+        if report.errors:
+            report.ok = False
+            report.stats["stage"] = "bridge"
+            return report
+
+    if room.config.require_reset_detour or room.config.require_combined_course:
+        reset_detour = analyse_reset_detour(room)
+        report.reset_detour = reset_detour
+        report.stats.update(
+            {
+                "reset_shortest_steps": reset_detour.shortest_steps_by_agent,
+                "reset_safe_steps": reset_detour.safe_steps_by_agent,
+                "required_reset_shortcut": reset_detour.shortcut_valid,
+                "required_reset_detour": reset_detour.safe_detour,
+            }
+        )
+        for reason in reset_detour.reasons:
+            report.issues.append(_error("reset_detour_invalid", reason))
+        if report.errors:
+            report.ok = False
+            report.stats["stage"] = "reset_detour"
+            return report
+
+    if room.config.require_combined_course:
+        combined = analyse_combined_course(
+            room,
+            report.wipeout,
+            report.bridge,
+            report.reset_detour,
+        )
+        report.combined = combined
+        report.stats.update(
+            {
+                "combined_sections": combined.section_ids,
+                "combined_gate_cuts": combined.gate_cut_ids,
+                "combined_ball_cuts": combined.ball_cut_ids,
+                "combined_timed_steps": combined.timed_max_steps,
+                "combined_route_budget": combined.route_budget,
+            }
+        )
+        for reason in combined.reasons:
+            report.issues.append(_error("combined_course_invalid", reason))
+        if report.errors:
+            report.ok = False
+            report.stats["stage"] = "combined_course"
+            return report
 
     solvability = analyse(room, model)
     report.solvability = solvability

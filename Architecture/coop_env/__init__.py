@@ -37,6 +37,8 @@ from .entities import (
     Switch,
     SwitchMode,
     TemporaryBridge,
+    WipeoutBall,
+    WipeoutBallSize,
 )
 from .episode import EnvironmentSession, EpisodeRecord
 from .generation.generator import GenerationError, GenerationOutcome, RoomGenerator
@@ -63,7 +65,7 @@ from .tiles import Tile, is_hazard, is_walkable
 from .utils.geometry import Rect, Vec2
 from .validation.validator import ValidationReport, validate_room
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = [
     # configuration
@@ -98,6 +100,8 @@ __all__ = [
     "Checkpoint",
     "ResetZone",
     "TemporaryBridge",
+    "WipeoutBall",
+    "WipeoutBallSize",
     # requirements
     "Requirement",
     "AlwaysOpen",

@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from ..config import GenerationConfig
 from ..entities import (
@@ -41,6 +41,8 @@ from ..entities import (
     Switch,
     SwitchMode,
     TemporaryBridge,
+    WipeoutBall,
+    WipeoutBallSize,
 )
 from ..requirements import (
     AlwaysOpen,
@@ -53,8 +55,8 @@ from ..requirements import (
 )
 from ..rng import SeededRandom
 from ..room import PortalKey
-from ..tiles import Tile, is_hazard
-from ..utils.geometry import Rect, Vec2
+from ..tiles import HAZARD_TILES, Tile, is_hazard
+from ..utils.geometry import DIRECTIONS4, Rect, Vec2
 from ..utils.grid import Grid, distance_field
 from .layout import Layout
 from .terrain import Decoration
@@ -201,7 +203,11 @@ def populate_mechanisms(
         keys=rng.derive("budget").in_range(config.num_keys),
         switches=rng.derive("budget").in_range(config.num_switches),
         cooperative=config.required_cooperative_actions,
+        blocks=rng.derive("block_budget").in_range(config.num_pushable_blocks),
     )
+    result.stats["requested_pushable_blocks"] = budgets.blocks
+    if config.require_key_for_each_agent:
+        budgets.keys = max(2, budgets.keys)
     if budgets.cooperative > 0 and config.exit_requires_both_agents:
         # Single hold-levers are unavailable in this mode, so paired levers are
         # the only cooperative gate left. Guarantee enough levers to build one
@@ -224,16 +230,24 @@ def populate_mechanisms(
             for entity in entities
             if isinstance(entity, Key)
             and topology.tile_region.get(entity.pos) in available
-        ]
-        kind = _pick_gate_kind(
-            budgets,
-            config,
-            edge,
-            depths,
-            hold_gated_regions,
-            bool(reusable_keys),
-            rng.derive("gate_kind"),
-        )
+        ] if config.allow_shared_keys else []
+        owned = {
+            entity.agent_index
+            for entity in entities
+            if isinstance(entity, Key) and entity.agent_index is not None
+        }
+        if config.require_key_for_each_agent and len(owned) < 2 and budgets.keys > 0:
+            kind = GateKind.KEY
+        else:
+            kind = _pick_gate_kind(
+                budgets,
+                config,
+                edge,
+                depths,
+                hold_gated_regions,
+                bool(reusable_keys),
+                rng.derive("gate_kind"),
+            )
         if kind is None:
             continue
         record = _install_gate(
@@ -286,7 +300,16 @@ def populate_mechanisms(
     )
 
     _place_extras(
-        layout, topology, config, placer, counter, rng.derive("extras"), entities, result
+        layout,
+        topology,
+        decoration,
+        config,
+        budgets,
+        placer,
+        counter,
+        rng.derive("extras"),
+        entities,
+        result,
     )
 
     result.entities = entities
@@ -402,6 +425,7 @@ class _Budgets:
     keys: int
     switches: int
     cooperative: int
+    blocks: int
 
 
 class _IdCounter:
@@ -449,16 +473,70 @@ def _pick_gate_kind(
     if budgets.keys >= 1:
         plain.append(GateKind.KEY)
     if budgets.switches >= 1:
-        plain.append(GateKind.SWITCH)
-        if rng.chance(config.timed_door_probability):
-            plain.append(GateKind.TIMED_SWITCH)
-    if reusable_keys:
+        plain.append(
+            GateKind.TIMED_SWITCH
+            if rng.chance(config.timed_door_probability)
+            else GateKind.SWITCH
+        )
+    if reusable_keys and config.allow_shared_keys:
         # Costs no budget, which is also what makes it the fallback when the
         # mechanism budget is spent but there are still links worth locking.
         plain.append(GateKind.SHARED_KEY)
     if not plain:
         return None
     return rng.choice(plain)
+
+
+def _crate_switch_lines(
+    placer: _Placer,
+    region_ids: Iterable[int],
+) -> list[tuple[Vec2, Vec2, Vec2]]:
+    free = set(placer.free_tiles(region_ids))
+    lines: list[tuple[Vec2, Vec2, Vec2]] = []
+    for switch_tile in sorted(free, key=lambda tile: (tile.y, tile.x)):
+        for direction in DIRECTIONS4:
+            block_tile = switch_tile - direction
+            standing_tile = block_tile - direction
+            if block_tile in free and standing_tile in free:
+                lines.append((switch_tile, block_tile, standing_tile))
+    return lines
+
+
+def _take_crate_switch_line(
+    placer: _Placer,
+    region_ids: Iterable[int],
+    rng: SeededRandom,
+) -> tuple[Vec2, Vec2, Vec2] | None:
+    lines = _crate_switch_lines(placer, region_ids)
+    if not lines:
+        return None
+    line = rng.choice(lines)
+    placer.reserved.update(line)
+    return line
+
+
+def _take_paired_switch_plan(
+    placer: _Placer,
+    region_ids: Sequence[int],
+    topology: Topology,
+    rng: SeededRandom,
+) -> tuple[tuple[Vec2, Vec2], tuple[Vec2, Vec2, Vec2]] | None:
+    free = set(placer.free_tiles(region_ids))
+    for line in rng.shuffled(_crate_switch_lines(placer, region_ids)):
+        remaining = free - set(line)
+        if not remaining:
+            continue
+        first_region = topology.tile_region.get(line[0])
+        spread = [
+            tile
+            for tile in remaining
+            if topology.tile_region.get(tile) != first_region
+        ]
+        options = spread or list(remaining)
+        second = rng.choice(sorted(options, key=lambda tile: (tile.y, tile.x)))
+        placer.reserved.update((*line, second))
+        return (line[0], second), line
+    return None
 
 
 def _install_gate(
@@ -492,8 +570,17 @@ def _install_gate(
         if tile is None:
             return None
         key_id = counter.next("key")
-        color = KEY_COLORS[len(trigger_ids) % len(KEY_COLORS)]
-        entities.append(Key(id=key_id, pos=tile, color=color, opens=tuple(door_ids)))
+        owner = _next_key_owner(config, entities, rng)
+        color = _key_color(owner, entities)
+        entities.append(
+            Key(
+                id=key_id,
+                pos=tile,
+                color=color,
+                opens=tuple(door_ids),
+                agent_index=owner,
+            )
+        )
         trigger_ids.append(key_id)
         requirement = KeyRequirement((key_id,))
         budgets.keys -= 1
@@ -514,9 +601,13 @@ def _install_gate(
         if tile is None:
             return None
         switch_id = counter.next("switch")
-        mode = SwitchMode.ONESHOT if kind is GateKind.TIMED_SWITCH else SwitchMode.TOGGLE
         entities.append(
-            Switch(id=switch_id, pos=tile, mode=mode, controls=tuple(door_ids))
+            Switch(
+                id=switch_id,
+                pos=tile,
+                mode=SwitchMode.TOGGLE,
+                controls=tuple(door_ids),
+            )
         )
         trigger_ids.append(switch_id)
         requirement = SwitchRequirement((switch_id,))
@@ -525,9 +616,18 @@ def _install_gate(
             timer = rng.randint(18, 44)
 
     elif kind is GateKind.HOLD_SWITCH:
-        tile = placer.take(available)
-        if tile is None:
-            return None
+        crate_line = None
+        if budgets.blocks > 0:
+            crate_line = _take_crate_switch_line(
+                placer, available, rng.derive("crate_line")
+            )
+            if crate_line is None:
+                return None
+            tile = crate_line[0]
+        else:
+            tile = placer.take(available)
+            if tile is None:
+                return None
         switch_id = counter.next("switch")
         entities.append(
             Switch(
@@ -538,6 +638,16 @@ def _install_gate(
                 controls=tuple(door_ids),
             )
         )
+        if crate_line is not None:
+            entities.append(
+                PushableBlock(
+                    id=counter.next("block"),
+                    pos=crate_line[1],
+                    target_switch_id=switch_id,
+                    push_from=crate_line[2],
+                )
+            )
+            budgets.blocks -= 1
         trigger_ids.append(switch_id)
         requirement = SwitchRequirement((switch_id,))
         latching = False  # closes the moment the lever is released
@@ -545,12 +655,21 @@ def _install_gate(
         budgets.cooperative -= 1
 
     elif kind is GateKind.PAIRED_LEVERS:
-        # Two hold-levers in different regions, wired to a latching door: both
-        # must be weighed down at the same instant, and once that happens the
-        # door stays open so neither agent is stranded behind it.
-        tiles = placer.take_spread(available, 2)
-        if len(tiles) < 2:
-            return None
+        crate_line = None
+        if budgets.blocks > 0:
+            plan = _take_paired_switch_plan(
+                placer,
+                available,
+                topology,
+                rng.derive("crate_line"),
+            )
+            if plan is None:
+                return None
+            tiles, crate_line = plan
+        else:
+            tiles = tuple(placer.take_spread(available, 2))
+            if len(tiles) < 2:
+                return None
         lever_ids = [counter.next("switch") for _ in tiles]
         group = f"pair_{edge[0]}_{edge[1]}"
         for lever_id, tile in zip(lever_ids, tiles):
@@ -563,6 +682,16 @@ def _install_gate(
                     controls=tuple(door_ids),
                 )
             )
+        if crate_line is not None:
+            entities.append(
+                PushableBlock(
+                    id=counter.next("block"),
+                    pos=crate_line[1],
+                    target_switch_id=lever_ids[0],
+                    push_from=crate_line[2],
+                )
+            )
+            budgets.blocks -= 1
         trigger_ids.extend(lever_ids)
         requirement = SwitchRequirement(tuple(lever_ids), TriggerMode.SIMULTANEOUS)
         budgets.switches -= 2
@@ -669,8 +798,17 @@ def _place_exit(
             break
         if style == "key":
             key_id = counter.next("key")
-            color = KEY_COLORS[len(objective_ids) % len(KEY_COLORS)]
-            entities.append(Key(id=key_id, pos=target, color=color, opens=("exit",)))
+            owner = _next_key_owner(config, entities, rng)
+            color = _key_color(owner, entities)
+            entities.append(
+                Key(
+                    id=key_id,
+                    pos=target,
+                    color=color,
+                    opens=("exit",),
+                    agent_index=owner,
+                )
+            )
             parts.append(KeyRequirement((key_id,)))
             objective_ids.append(key_id)
             budgets.keys -= 1
@@ -711,28 +849,67 @@ def _pick_objective_style(budgets: _Budgets, rng: SeededRandom) -> str:
 def _place_extras(
     layout: Layout,
     topology: Topology,
+    decoration: Decoration,
     config: GenerationConfig,
+    budgets: _Budgets,
     placer: _Placer,
     counter: _IdCounter,
     rng: SeededRandom,
     entities: list[Entity],
     result: MechanismResult,
 ) -> None:
-    """Optional objects: crates, checkpoints, reset zones, temporary bridges.
-
-    None of these gate progress, so they can be scattered freely once the
-    solvable skeleton exists.
-    """
+    """Place extra mechanics after the gate skeleton."""
     regions = sorted(topology.regions)
 
-    # Crates count as solid to the validator, so one dropped in a one-tile
-    # corridor could wall off a region. Keeping them in open ground avoids that
-    # and puts them somewhere they can actually be pushed around.
-    for _ in range(rng.in_range(config.num_pushable_blocks)):
+    _place_wipeout_balls(
+        layout.terrain,
+        config,
+        placer,
+        counter,
+        rng.derive("wipeout"),
+        entities,
+        result,
+    )
+    if config.require_bridge_crossing:
+        _place_bridges(
+            layout.terrain,
+            decoration,
+            config,
+            placer,
+            counter,
+            rng.derive("bridges"),
+            entities,
+            result,
+        )
+    if config.require_reset_detour:
+        _place_required_reset_detour(
+            layout.terrain,
+            decoration,
+            placer,
+            counter,
+            rng.derive("reset_detour"),
+            entities,
+            result,
+        )
+
+    for _ in range(budgets.blocks):
         tile = _take_open_tile(layout.terrain, placer, regions, rng)
         if tile is None:
             break
         entities.append(PushableBlock(id=counter.next("block"), pos=tile))
+    budgets.blocks = 0
+
+    blocks = [entity for entity in entities if isinstance(entity, PushableBlock)]
+    result.stats["placed_pushable_blocks"] = len(blocks)
+    result.stats["crate_switch_pairs"] = tuple(
+        {
+            "block": block.id,
+            "switch": block.target_switch_id,
+            "push_from": list(block.push_from) if block.push_from is not None else None,
+        }
+        for block in blocks
+        if block.target_switch_id is not None
+    )
 
     for index in range(rng.in_range(config.num_checkpoints)):
         tile = placer.take(regions)
@@ -742,31 +919,544 @@ def _place_extras(
             Checkpoint(id=counter.next("checkpoint"), pos=tile, order=index, group="route")
         )
 
-    for _ in range(rng.in_range(config.num_reset_zones)):
-        zone = _find_reset_zone(layout.terrain, placer, rng)
-        if zone is None:
-            break
-        entities.append(
-            ResetZone(id=counter.next("reset"), pos=Vec2(zone.x, zone.y), rect=zone)
-        )
+    if not config.require_reset_detour:
+        wanted_resets = rng.in_range(config.num_reset_zones)
+        placed_resets = 0
+        for _ in range(wanted_resets):
+            zone = _find_reset_zone(layout.terrain, placer, rng)
+            if zone is None:
+                break
+            entities.append(
+                ResetZone(id=counter.next("reset"), pos=Vec2(zone.x, zone.y), rect=zone)
+            )
+            placed_resets += 1
+        result.stats["requested_reset_zones"] = wanted_resets
+        result.stats["placed_reset_zones"] = placed_resets
+        result.stats["required_reset_zone_id"] = None
 
-    used_bridge_tiles: set[Vec2] = set()
-    for _ in range(rng.in_range(config.num_temporary_bridges)):
-        run = _find_bridge_run(layout.terrain, used_bridge_tiles, rng)
+    if not config.require_bridge_crossing:
+        wanted = rng.in_range(config.num_temporary_bridges)
+        placed = 0
+        used_bridge_tiles: set[Vec2] = set()
+        for _ in range(wanted):
+            run = _find_bridge_run(layout.terrain, used_bridge_tiles, rng)
+            if not run:
+                break
+            used_bridge_tiles.update(run)
+            period = rng.randint(10, 20)
+            entities.append(
+                TemporaryBridge(
+                    id=counter.next("bridge"),
+                    pos=run[0],
+                    tiles=tuple(run),
+                    period=period,
+                    on_ticks=max(3, period // 2),
+                    phase=rng.randint(0, period - 1),
+                )
+            )
+            placed += 1
+        result.stats["requested_temporary_bridges"] = wanted
+        result.stats["placed_temporary_bridges"] = placed
+        result.stats["required_bridge_id"] = None
+
+
+def _place_bridges(
+    terrain: Grid,
+    decoration: Decoration,
+    config: GenerationConfig,
+    placer: _Placer,
+    counter: _IdCounter,
+    rng: SeededRandom,
+    entities: list[Entity],
+    result: MechanismResult,
+) -> None:
+    wanted = rng.derive("count").in_range(config.num_temporary_bridges)
+    placed = 0
+    used: set[Vec2] = set()
+    result.stats["required_bridge_id"] = None
+
+    if config.require_bridge_crossing:
+        run = _find_required_bridge_run(
+            terrain,
+            placer,
+            entities,
+            rng.derive("required"),
+        )
+        if run:
+            choices = {
+                tile: weight
+                for tile, weight in config.hazard_weights.items()
+                if tile in HAZARD_TILES and weight > 0
+            }
+            hazard = rng.derive("required_hazard").weighted_choice(choices)
+            for tile in run:
+                terrain[tile] = hazard
+            decoration.hazard_tiles.update(run)
+            bridge = _add_bridge(
+                run,
+                placer,
+                counter,
+                rng.derive("required_timing"),
+                entities,
+            )
+            result.stats["required_bridge_id"] = bridge.id
+            used.update(run)
+            placed += 1
+
+    for index in range(placed, wanted):
+        run = _find_bridge_run(terrain, used, rng.derive(f"extra_{index}"))
         if not run:
             break
-        used_bridge_tiles.update(run)
-        period = rng.randint(10, 20)
-        entities.append(
-            TemporaryBridge(
-                id=counter.next("bridge"),
-                pos=run[0],
-                tiles=tuple(run),
-                period=period,
-                on_ticks=max(3, period // 2),
-                phase=rng.randint(0, period - 1),
-            )
+        _add_bridge(
+            run,
+            placer,
+            counter,
+            rng.derive(f"timing_{index}"),
+            entities,
         )
+        used.update(run)
+        placed += 1
+
+    result.stats["requested_temporary_bridges"] = wanted
+    result.stats["placed_temporary_bridges"] = placed
+
+
+def _add_bridge(
+    run: list[Vec2],
+    placer: _Placer,
+    counter: _IdCounter,
+    rng: SeededRandom,
+    entities: list[Entity],
+) -> TemporaryBridge:
+    period = rng.randint(10, 20)
+    bridge = TemporaryBridge(
+        id=counter.next("bridge"),
+        pos=run[0],
+        tiles=tuple(run),
+        period=period,
+        on_ticks=max(3, period // 2),
+        phase=rng.randint(0, period - 1),
+    )
+    placer.reserved.update(run)
+    entities.append(bridge)
+    return bridge
+
+
+def _find_required_bridge_run(
+    terrain: Grid,
+    placer: _Placer,
+    entities: Sequence[Entity],
+    rng: SeededRandom,
+) -> list[Vec2]:
+    separates = _required_crossing_predicate(terrain, entities)
+    candidates: list[list[Vec2]] = []
+    for run in _bridge_course_candidates(terrain):
+        tiles = set(run)
+        if tiles & placer.reserved:
+            continue
+        if separates(run, tiles):
+            candidates.append(run)
+    return rng.choice(candidates) if candidates else []
+
+
+def _bridge_course_candidates(terrain: Grid) -> list[list[Vec2]]:
+    runs: list[list[Vec2]] = []
+    for y in range(terrain.height):
+        row = [Vec2(x, y) for x in range(terrain.width)]
+        runs.extend(_bounded_floor_runs(terrain, row, Vec2(0, 1)))
+    for x in range(terrain.width):
+        column = [Vec2(x, y) for y in range(terrain.height)]
+        runs.extend(_bounded_floor_runs(terrain, column, Vec2(1, 0)))
+    return runs
+
+
+def _bounded_floor_runs(
+    terrain: Grid,
+    line: list[Vec2],
+    side: Vec2,
+) -> list[list[Vec2]]:
+    found: list[list[Vec2]] = []
+    current: list[Vec2] = []
+    for tile in (*line, None):
+        if tile is not None and terrain.get(tile, Tile.VOID) == Tile.FLOOR:
+            current.append(tile)
+            continue
+        if 2 <= len(current) <= 7:
+            found.append(current)
+        elif len(current) > 7 and all(
+            terrain.get(point + side, Tile.VOID) != Tile.FLOOR
+            and terrain.get(point - side, Tile.VOID) != Tile.FLOOR
+            for point in current
+        ):
+            found.extend(current[index : index + 2] for index in range(len(current) - 1))
+        current = []
+    return found
+
+
+@dataclass(frozen=True, slots=True)
+class _ResetDetourPlan:
+    barrier: tuple[Vec2, ...]
+    reset_tile: Vec2
+    safe_tile: Vec2
+    shortest_steps: tuple[int, ...]
+    safe_steps: tuple[int, ...]
+
+
+def _place_required_reset_detour(
+    terrain: Grid,
+    decoration: Decoration,
+    placer: _Placer,
+    counter: _IdCounter,
+    rng: SeededRandom,
+    entities: list[Entity],
+    result: MechanismResult,
+) -> None:
+    result.stats["requested_reset_zones"] = 1
+    result.stats["placed_reset_zones"] = 0
+    result.stats["required_reset_zone_id"] = None
+    plan = _find_reset_detour_plan(terrain, placer, entities, rng)
+    if plan is None:
+        return
+
+    blocked = set(plan.barrier) - {plan.reset_tile, plan.safe_tile}
+    for tile in blocked:
+        terrain[tile] = Tile.OBSTACLE
+    decoration.obstacle_tiles.update(blocked)
+    placer.reserved.update((plan.reset_tile, plan.safe_tile))
+    reset_id = counter.next("reset")
+    entities.append(
+        ResetZone(
+            id=reset_id,
+            pos=plan.reset_tile,
+            rect=Rect(plan.reset_tile.x, plan.reset_tile.y, 1, 1),
+        )
+    )
+    result.stats["placed_reset_zones"] = 1
+    result.stats["required_reset_zone_id"] = reset_id
+    result.stats["reset_shortest_steps"] = plan.shortest_steps
+    result.stats["reset_safe_steps"] = plan.safe_steps
+
+
+def _find_reset_detour_plan(
+    terrain: Grid,
+    placer: _Placer,
+    entities: Sequence[Entity],
+    rng: SeededRandom,
+) -> _ResetDetourPlan | None:
+    spawns = [entity.pos for entity in entities if isinstance(entity, AgentSpawn)]
+    exits = [entity.pos for entity in entities if isinstance(entity, ExitDoor)]
+    if len(spawns) != 2 or len(exits) != 1:
+        return None
+    exit_pos = exits[0]
+    floor = {pos for pos in terrain.positions() if terrain[pos] == Tile.FLOOR}
+    plans: list[_ResetDetourPlan] = []
+
+    for barrier in _reset_barrier_candidates(terrain):
+        if set(barrier) & placer.reserved:
+            continue
+        horizontal = len({tile.y for tile in barrier}) == 1
+        boundary = barrier[0].y if horizontal else barrier[0].x
+        spawn_sides = [
+            (spawn.y - boundary) if horizontal else (spawn.x - boundary)
+            for spawn in spawns
+        ]
+        exit_side = (
+            exit_pos.y - boundary if horizontal else exit_pos.x - boundary
+        )
+        if exit_side == 0 or any(side == 0 or side * exit_side >= 0 for side in spawn_sides):
+            continue
+
+        shortcut_options = sorted(
+            barrier,
+            key=lambda tile: (
+                sum(spawn.manhattan(tile) for spawn in spawns)
+                + tile.manhattan(exit_pos),
+                tile.y,
+                tile.x,
+            ),
+        )[:4]
+        safe_options = sorted(
+            barrier,
+            key=lambda tile: (
+                -sum(spawn.manhattan(tile) for spawn in spawns)
+                - tile.manhattan(exit_pos),
+                tile.y,
+                tile.x,
+            ),
+        )[:4]
+        for reset_tile in shortcut_options:
+            for safe_tile in safe_options:
+                if reset_tile == safe_tile:
+                    continue
+                blocked = set(barrier) - {reset_tile, safe_tile}
+                course = floor - blocked
+                shortest: list[int] = []
+                detours: list[int] = []
+                valid = True
+                for spawn in spawns:
+                    direct = _distance_between(terrain, course, spawn, exit_pos)
+                    to_reset = _distance_between(
+                        terrain, course, spawn, reset_tile
+                    )
+                    from_reset = _distance_between(
+                        terrain, course, reset_tile, exit_pos
+                    )
+                    safe = _distance_between(
+                        terrain, course - {reset_tile}, spawn, exit_pos
+                    )
+                    if (
+                        direct is None
+                        or to_reset is None
+                        or from_reset is None
+                        or safe is None
+                        or to_reset + from_reset != direct
+                        or safe <= direct
+                    ):
+                        valid = False
+                        break
+                    shortest.append(direct)
+                    detours.append(safe)
+                if valid:
+                    plans.append(
+                        _ResetDetourPlan(
+                            barrier=tuple(barrier),
+                            reset_tile=reset_tile,
+                            safe_tile=safe_tile,
+                            shortest_steps=tuple(shortest),
+                            safe_steps=tuple(detours),
+                        )
+                    )
+    return rng.choice(plans) if plans else None
+
+
+def _reset_barrier_candidates(terrain: Grid) -> list[list[Vec2]]:
+    barriers: list[list[Vec2]] = []
+    for y in range(terrain.height):
+        barriers.extend(
+            run
+            for run in _maximal_floor_runs(
+                terrain,
+                [Vec2(x, y) for x in range(terrain.width)],
+            )
+            if len(run) >= 6
+        )
+    for x in range(terrain.width):
+        barriers.extend(
+            run
+            for run in _maximal_floor_runs(
+                terrain,
+                [Vec2(x, y) for y in range(terrain.height)],
+            )
+            if len(run) >= 6
+        )
+    return barriers
+
+
+def _maximal_floor_runs(terrain: Grid, line: list[Vec2]) -> list[list[Vec2]]:
+    found: list[list[Vec2]] = []
+    current: list[Vec2] = []
+    for tile in (*line, None):
+        if tile is not None and terrain.get(tile, Tile.VOID) == Tile.FLOOR:
+            current.append(tile)
+            continue
+        if current:
+            found.append(current)
+        current = []
+    return found
+
+
+def _distance_between(
+    terrain: Grid,
+    allowed: set[Vec2],
+    start: Vec2,
+    goal: Vec2,
+) -> int | None:
+    if start not in allowed or goal not in allowed:
+        return None
+    return distance_field(
+        (start,),
+        lambda tile: tile in allowed,
+        terrain.bounds,
+    ).get(goal)
+
+
+def _next_key_owner(
+    config: GenerationConfig,
+    entities: Sequence[Entity],
+    rng: SeededRandom,
+) -> int | None:
+    if not config.agent_specific_keys:
+        return None
+    counts = [
+        sum(
+            isinstance(entity, Key) and entity.agent_index == index
+            for entity in entities
+        )
+        for index in range(2)
+    ]
+    if counts[0] == counts[1]:
+        return rng.choice([0, 1])
+    return 0 if counts[0] < counts[1] else 1
+
+
+def _key_color(owner: int | None, entities: Sequence[Entity]) -> str:
+    if owner == 0:
+        return "azure"
+    if owner == 1:
+        return "crimson"
+    count = sum(isinstance(entity, Key) for entity in entities)
+    return KEY_COLORS[count % len(KEY_COLORS)]
+
+
+def _place_wipeout_balls(
+    terrain: Grid,
+    config: GenerationConfig,
+    placer: _Placer,
+    counter: _IdCounter,
+    rng: SeededRandom,
+    entities: list[Entity],
+    result: MechanismResult,
+) -> None:
+    wanted = {
+        WipeoutBallSize.NORMAL: rng.derive("normal_count").in_range(
+            config.num_normal_wipeout_balls
+        ),
+        WipeoutBallSize.BIG: rng.derive("big_count").in_range(
+            config.num_big_wipeout_balls
+        ),
+    }
+    placed = {size: 0 for size in wanted}
+    result.stats["required_wipeout_ball_id"] = None
+
+    if config.require_wipeout_crossing:
+        crossing_predicate = _required_crossing_predicate(terrain, entities)
+        for size in (WipeoutBallSize.BIG, WipeoutBallSize.NORMAL):
+            if wanted[size] < 1:
+                continue
+            track = _find_wipeout_track(
+                terrain,
+                placer,
+                7 if size is WipeoutBallSize.NORMAL else 11,
+                0 if size is WipeoutBallSize.NORMAL else 1,
+                rng.derive(f"required_{size.value}"),
+                predicate=crossing_predicate,
+            )
+            if not track:
+                continue
+            ball = _add_wipeout_ball(size, track, placer, counter, entities)
+            placed[size] += 1
+            result.stats["required_wipeout_ball_id"] = ball.id
+            break
+
+    for size in (WipeoutBallSize.BIG, WipeoutBallSize.NORMAL):
+        for index in range(placed[size], wanted[size]):
+            track = _find_wipeout_track(
+                terrain,
+                placer,
+                7 if size is WipeoutBallSize.NORMAL else 11,
+                0 if size is WipeoutBallSize.NORMAL else 1,
+                rng.derive(f"{size.value}_{index}"),
+            )
+            if not track:
+                break
+            _add_wipeout_ball(size, track, placer, counter, entities)
+            placed[size] += 1
+
+    for size in (WipeoutBallSize.NORMAL, WipeoutBallSize.BIG):
+        result.stats[f"requested_{size.value}_wipeout_balls"] = wanted[size]
+        result.stats[f"placed_{size.value}_wipeout_balls"] = placed[size]
+
+
+def _add_wipeout_ball(
+    size: WipeoutBallSize,
+    track: list[Vec2],
+    placer: _Placer,
+    counter: _IdCounter,
+    entities: list[Entity],
+) -> WipeoutBall:
+    ball = WipeoutBall(
+        id=counter.next(f"wipeout_{size.value}"),
+        pos=track[0],
+        track=tuple(track),
+        size=size,
+    )
+    placer.reserved.update(ball.footprint())
+    entities.append(ball)
+    return ball
+
+
+def _find_wipeout_track(
+    terrain: Grid,
+    placer: _Placer,
+    length: int,
+    radius: int,
+    rng: SeededRandom,
+    predicate: Callable[[list[Vec2], set[Vec2]], bool] | None = None,
+) -> list[Vec2]:
+    candidates: list[list[Vec2]] = []
+    for y in range(terrain.height):
+        for x in range(terrain.width - length + 1):
+            track = [Vec2(x + offset, y) for offset in range(length)]
+            swept = {
+                Vec2(center.x + dx, center.y + dy)
+                for center in track
+                for dy in range(-radius, radius + 1)
+                for dx in range(-radius, radius + 1)
+            }
+            if swept & placer.reserved:
+                continue
+            if not all(terrain.get(tile, Tile.VOID) == Tile.FLOOR for tile in swept):
+                continue
+            if predicate is not None and not predicate(track, swept):
+                continue
+            candidates.append(track)
+    return rng.choice(candidates) if candidates else []
+
+
+def _required_crossing_predicate(
+    terrain: Grid,
+    entities: Sequence[Entity],
+) -> Callable[[list[Vec2], set[Vec2]], bool]:
+    spawns = [entity.pos for entity in entities if isinstance(entity, AgentSpawn)]
+    exits = [entity.pos for entity in entities if isinstance(entity, ExitDoor)]
+    floor = {pos for pos in terrain.positions() if terrain[pos] == Tile.FLOOR}
+    if len(spawns) != 2 or len(exits) != 1:
+        return lambda _track, _swept: False
+
+    exit_pos = exits[0]
+    if any(not _tiles_connect(spawn, exit_pos, floor) for spawn in spawns):
+        return lambda _track, _swept: False
+
+    def separates(_track: list[Vec2], swept: set[Vec2]) -> bool:
+        return all(not _tiles_connect(spawn, exit_pos, floor, swept) for spawn in spawns)
+
+    return separates
+
+
+def _tiles_connect(
+    start: Vec2,
+    goal: Vec2,
+    floor: set[Vec2],
+    blocked: set[Vec2] | None = None,
+) -> bool:
+    blocked = blocked or set()
+    if start not in floor or goal not in floor or start in blocked or goal in blocked:
+        return False
+    seen = {start}
+    stack = [start]
+    while stack:
+        current = stack.pop()
+        if current == goal:
+            return True
+        for neighbour in current.neighbors4():
+            if (
+                neighbour in floor
+                and neighbour not in blocked
+                and neighbour not in seen
+            ):
+                seen.add(neighbour)
+                stack.append(neighbour)
+    return False
 
 
 def _take_open_tile(

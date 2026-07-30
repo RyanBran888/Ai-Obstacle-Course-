@@ -8,7 +8,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..entities import AgentSpawn, EntityKind, LockedDoor, Switch, SwitchMode
+from ..entities import (
+    AgentSpawn,
+    EntityKind,
+    Key,
+    LockedDoor,
+    Switch,
+    SwitchMode,
+    WipeoutBall,
+    WipeoutBallSize,
+)
+from ..requirements import KeyRequirement
 from ..room import Room
 from ..state import EpisodeState
 from ..tiles import Tile, glyph
@@ -41,7 +51,7 @@ def render_ascii(
         for entity in room.entities:
             if entity.kind is not kind:
                 continue
-            mark = _glyph_for(entity, state if opts.live_state else None)
+            mark = _glyph_for(entity, room, state if opts.live_state else None)
             if mark is None:
                 continue
             for tile in _draw_tiles(entity, state if opts.live_state else None):
@@ -65,7 +75,7 @@ def render_ascii(
     return "\n".join(out)
 
 
-def _glyph_for(entity, state: EpisodeState | None) -> str | None:
+def _glyph_for(entity, room: Room, state: EpisodeState | None) -> str | None:
     if isinstance(entity, AgentSpawn):
         return str(entity.index + 1)
     if isinstance(entity, LockedDoor):
@@ -74,6 +84,16 @@ def _glyph_for(entity, state: EpisodeState | None) -> str | None:
         if entity.timer:
             return "T"
         # lowercase for hold-doors, so a door is never confused with its lever
+        if isinstance(entity.requirement, KeyRequirement):
+            owners = {
+                key.agent_index
+                for key_id in entity.requirement.key_ids
+                if isinstance((key := room.find(key_id)), Key)
+            }
+            if owners == {0}:
+                return "A"
+            if owners == {1}:
+                return "B"
         return "D" if entity.latching else "d"
     if isinstance(entity, Switch):
         if entity.mode is not SwitchMode.HOLD:
@@ -81,13 +101,23 @@ def _glyph_for(entity, state: EpisodeState | None) -> str | None:
         # paired levers get their own mark: they only work if held together.
         # '&' echoes how a SIMULTANEOUS requirement prints itself.
         return "&" if entity.group.startswith("pair") else "H"
-    if entity.kind is EntityKind.KEY and state is not None:
-        if state.is_key_collected(entity.id):
+    if isinstance(entity, Key):
+        if state is not None and state.is_key_collected(entity.id):
             return None
+        if entity.agent_index == 0:
+            return "a"
+        if entity.agent_index == 1:
+            return "b"
+        return "k"
+    if isinstance(entity, WipeoutBall):
+        return "O" if entity.size is WipeoutBallSize.BIG else "o"
     return ENTITY_GLYPHS.get(entity.kind)
 
 
 def _draw_tiles(entity, state: EpisodeState | None) -> tuple[Vec2, ...]:
+    if isinstance(entity, WipeoutBall):
+        tick = state.tick if state is not None else 0
+        return entity.collision_tiles_at(tick)
     return entity.footprint()
 
 
@@ -129,7 +159,12 @@ def _legend(room: Room) -> str:
     kinds = {e.kind for e in room.entities}
     labels: list[tuple[str, str]] = [("1/2", "agent spawn"), ("E", "exit")]
     if EntityKind.KEY in kinds:
-        labels.append(("k", "key"))
+        if any(key.agent_index == 0 for key in room.keys):
+            labels.append(("a", "agent 1 key"))
+        if any(key.agent_index == 1 for key in room.keys):
+            labels.append(("b", "agent 2 key"))
+        if any(key.agent_index is None for key in room.keys):
+            labels.append(("k", "shared key"))
     if any(d.latching and not d.timer for d in room.doors):
         labels.append(("D", "locked door"))
     if any(not d.latching for d in room.doors):
@@ -153,6 +188,11 @@ def _legend(room: Room) -> str:
         labels.append((",", "reset zone"))
     if EntityKind.TEMPORARY_BRIDGE in kinds:
         labels.append(("-", "temporary bridge"))
+    if EntityKind.WIPEOUT_BALL in kinds:
+        if any(ball.size is WipeoutBallSize.NORMAL for ball in room.wipeout_balls):
+            labels.append(("o", "7x1 wipeout ball"))
+        if any(ball.size is WipeoutBallSize.BIG for ball in room.wipeout_balls):
+            labels.append(("O", "11x1 big wipeout ball"))
 
     entries.extend(f"{mark} {label}" for mark, label in labels)
     return "  ".join(entries)
@@ -168,7 +208,13 @@ def render_mechanism_report(room: Room) -> str:
         for door in sorted(room.doors, key=lambda d: d.id):
             lines.append(f"  {door.describe()}")
     triggers = [
-        *((f"  key {k.id} @ {tuple(k.pos)} ({k.color})") for k in room.keys),
+        *(
+            (
+                f"  key {k.id} @ {tuple(k.pos)} ({k.color}, "
+                f"{'shared' if k.agent_index is None else f'agent {k.agent_index + 1}'})"
+            )
+            for k in room.keys
+        ),
         *(
             f"  switch {s.id} @ {tuple(s.pos)} [{s.mode.value}]"
             for s in room.switches
@@ -177,4 +223,17 @@ def render_mechanism_report(room: Room) -> str:
     if triggers:
         lines.append("triggers:")
         lines.extend(triggers)
+    planned_blocks = [
+        block for block in room.blocks if block.target_switch_id is not None
+    ]
+    if planned_blocks:
+        lines.append("crate plans:")
+        lines.extend(f"  {block.describe()}" for block in planned_blocks)
+    if room.wipeout_balls:
+        lines.append("wipeout balls:")
+        for ball in room.wipeout_balls:
+            lines.append(
+                f"  {ball.id} [{ball.size.value}] {len(ball.track)}x1 "
+                f"{tuple(ball.track[0])} -> {tuple(ball.track[-1])}"
+            )
     return "\n".join(lines)
