@@ -2,7 +2,7 @@
 
 Runs in a few seconds:
 
-    python3 QN/mvp_2x2.py
+    python3 DQN/mvp_2x2.py
 """
 
 from __future__ import annotations

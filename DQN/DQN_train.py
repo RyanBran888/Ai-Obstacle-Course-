@@ -11,7 +11,16 @@ import torch
 import torch.nn as nn
 
 from env_bridge import CoopEnvBridge, GenerationConfig
-from DQN.DQN_model import HIDDEN, N_ACTIONS, OBS_DIM, QNetwork
+from DQN.DQN_model import (
+    ACTIONS,
+    CHANNEL_NAMES,
+    GLOBAL_NAMES,
+    HIDDEN,
+    N_ACTIONS,
+    OBS_DIM,
+    OBSERVATION_SCHEMA,
+    QNetwork,
+)
 
 N_AGENTS = 2
 
@@ -203,6 +212,13 @@ class Agent:
     def save(self, path: str) -> None:
         torch.save(
             {
+                "schema": OBSERVATION_SCHEMA,
+                "obs_dim": self.net.obs_dim,
+                "n_actions": self.net.n_actions,
+                "hidden": self.net.hidden,
+                "actions": ACTIONS,
+                "channels": CHANNEL_NAMES,
+                "globals": GLOBAL_NAMES,
                 "net": self.net.state_dict(),
                 "target": self.target.state_dict(),
                 "opt": self.opt.state_dict(),
@@ -212,12 +228,25 @@ class Agent:
 
     def load(self, path: str) -> None:
         checkpoint = torch.load(path, map_location=self.device)
+        if (
+            checkpoint.get("schema") != OBSERVATION_SCHEMA
+            or checkpoint.get("obs_dim") != self.net.obs_dim
+            or checkpoint.get("n_actions") != self.net.n_actions
+            or tuple(checkpoint.get("hidden", ())) != self.net.hidden
+            or tuple(checkpoint.get("actions", ())) != ACTIONS
+            or tuple(checkpoint.get("channels", ())) != CHANNEL_NAMES
+            or tuple(checkpoint.get("globals", ())) != GLOBAL_NAMES
+        ):
+            raise ValueError(
+                "checkpoint network, observation, or action contract does not match"
+            )
         self.net.load_state_dict(checkpoint["net"])
         if "target" in checkpoint:
             self.target.load_state_dict(checkpoint["target"])
         else:
             self.sync()
-        self.opt.load_state_dict(checkpoint["opt"])
+        if "opt" in checkpoint:
+            self.opt.load_state_dict(checkpoint["opt"])
 
     def _tensor(self, obs) -> torch.Tensor:
         if isinstance(obs, torch.Tensor):
@@ -252,6 +281,25 @@ class Evaluation:
     mean_checkpoints: float
     exit_open_rate: float
     exit_open_not_reached: int
+    mean_wipeout_deaths: float
+    wipeout_death_rate: float
+    mean_hazard_entries: float
+    hazard_entry_rate: float
+    normal_ball_death_rate: float
+    big_ball_death_rate: float
+    mean_bridge_falls: float
+    bridge_fall_rate: float
+    mean_timed_doors_opened: float
+    mean_timed_doors_expired: float
+    mean_timed_doors_rearmed: float
+    timed_door_open_rate: float
+    timed_door_expiry_rate: float
+    timed_door_rearm_rate: float
+    mean_crate_switches: float
+    crate_switch_rate: float
+    mean_reset_entries: float
+    reset_entry_rate: float
+    mean_wrong_key_interactions: float
 
     @property
     def success_rate(self) -> float:
@@ -270,6 +318,25 @@ class Evaluation:
             "exit_open_rate": self.exit_open_rate,
             "timeouts": self.timeouts,
             "exit_open_not_reached": self.exit_open_not_reached,
+            "mean_wipeout_deaths": self.mean_wipeout_deaths,
+            "wipeout_death_rate": self.wipeout_death_rate,
+            "mean_hazard_entries": self.mean_hazard_entries,
+            "hazard_entry_rate": self.hazard_entry_rate,
+            "normal_ball_death_rate": self.normal_ball_death_rate,
+            "big_ball_death_rate": self.big_ball_death_rate,
+            "mean_bridge_falls": self.mean_bridge_falls,
+            "bridge_fall_rate": self.bridge_fall_rate,
+            "mean_timed_doors_opened": self.mean_timed_doors_opened,
+            "mean_timed_doors_expired": self.mean_timed_doors_expired,
+            "mean_timed_doors_rearmed": self.mean_timed_doors_rearmed,
+            "timed_door_open_rate": self.timed_door_open_rate,
+            "timed_door_expiry_rate": self.timed_door_expiry_rate,
+            "timed_door_rearm_rate": self.timed_door_rearm_rate,
+            "mean_crate_switches": self.mean_crate_switches,
+            "crate_switch_rate": self.crate_switch_rate,
+            "mean_reset_entries": self.mean_reset_entries,
+            "reset_entry_rate": self.reset_entry_rate,
+            "mean_wrong_key_interactions": self.mean_wrong_key_interactions,
         }
 
 
@@ -285,6 +352,17 @@ class EvaluationEpisode:
     switches: int
     checkpoints: int
     exit_open: bool
+    wipeout_deaths: int
+    hazard_entries: int
+    normal_ball_deaths: int
+    big_ball_deaths: int
+    bridge_falls: int
+    timed_doors_opened: int
+    timed_doors_expired: int
+    timed_doors_rearmed: int
+    crate_switches: int
+    reset_entries: int
+    wrong_key_interactions: int
 
     def as_dict(self) -> dict[str, float | int | bool]:
         return {
@@ -298,6 +376,17 @@ class EvaluationEpisode:
             "switches": self.switches,
             "checkpoints": self.checkpoints,
             "exit_open": self.exit_open,
+            "wipeout_deaths": self.wipeout_deaths,
+            "hazard_entries": self.hazard_entries,
+            "normal_ball_deaths": self.normal_ball_deaths,
+            "big_ball_deaths": self.big_ball_deaths,
+            "bridge_falls": self.bridge_falls,
+            "timed_doors_opened": self.timed_doors_opened,
+            "timed_doors_expired": self.timed_doors_expired,
+            "timed_doors_rearmed": self.timed_doors_rearmed,
+            "crate_switches": self.crate_switches,
+            "reset_entries": self.reset_entries,
+            "wrong_key_interactions": self.wrong_key_interactions,
         }
 
 
@@ -476,7 +565,16 @@ class Trainer:
             terminal = done or cut
 
             if learn:
-                important = bool(info["progress_events"]) or done
+                important = (
+                    bool(info["progress_events"])
+                    or terminal
+                    or any(
+                        "wipeout_" in event
+                        or "bridge_fall" in event
+                        or event.startswith("timed_door_")
+                        for event in info["events"]
+                    )
+                )
                 self._remember(
                     obs, actions, rewards, next_obs, terminal, important
                 )
@@ -494,7 +592,7 @@ class Trainer:
                             learner.sync()
 
             obs = next_obs
-            total += rewards[0]
+            total += sum(float(reward) for reward in rewards) / len(rewards)
             final_info = info
             if terminal:
                 break
@@ -557,14 +655,16 @@ def evaluate_detailed(
                 for index, agent in enumerate(agents)
             ]
             obs, rewards, done, cut, info = env.step(actions)
-            episode_return += float(rewards[0])
+            episode_return += (
+                sum(float(reward) for reward in rewards) / len(rewards)
+            )
             if done or cut:
                 metrics = info["episode"]
                 episodes.append(
                     EvaluationEpisode(
                         seed=int(seed),
-                        completed=bool(done),
-                        timed_out=bool(cut),
+                        completed=bool(metrics["completed"]),
+                        timed_out=bool(metrics["timed_out"]),
                         reward=episode_return,
                         steps=int(metrics["steps"]),
                         keys=int(metrics["keys_collected"]),
@@ -572,6 +672,31 @@ def evaluate_detailed(
                         switches=int(metrics["switches_activated"]),
                         checkpoints=int(metrics["checkpoints_reached"]),
                         exit_open=bool(metrics["exit_opened"]),
+                        wipeout_deaths=int(metrics["wipeout_deaths"]),
+                        hazard_entries=int(metrics.get("hazards", 0)),
+                        normal_ball_deaths=int(
+                            metrics.get("normal_ball_deaths", 0)
+                        ),
+                        big_ball_deaths=int(
+                            metrics.get("big_ball_deaths", 0)
+                        ),
+                        bridge_falls=int(metrics.get("bridge_falls", 0)),
+                        timed_doors_opened=int(
+                            metrics.get("timed_doors_opened", 0)
+                        ),
+                        timed_doors_expired=int(
+                            metrics.get("timed_doors_expired", 0)
+                        ),
+                        timed_doors_rearmed=int(
+                            metrics.get("timed_doors_rearmed", 0)
+                        ),
+                        crate_switches=int(
+                            metrics.get("crate_switches_solved", 0)
+                        ),
+                        reset_entries=int(metrics.get("reset_zones", 0)),
+                        wrong_key_interactions=int(
+                            metrics["wrong_key_interactions"]
+                        ),
                     )
                 )
                 break
@@ -615,6 +740,101 @@ def evaluate_detailed(
         ),
         exit_open_not_reached=sum(
             episode.exit_open and not episode.completed for episode in episodes
+        ),
+        mean_wipeout_deaths=(
+            sum(episode.wipeout_deaths for episode in episodes) / count
+            if count
+            else 0.0
+        ),
+        wipeout_death_rate=(
+            sum(episode.wipeout_deaths > 0 for episode in episodes) / count
+            if count
+            else 0.0
+        ),
+        mean_hazard_entries=(
+            sum(episode.hazard_entries for episode in episodes) / count
+            if count
+            else 0.0
+        ),
+        hazard_entry_rate=(
+            sum(episode.hazard_entries > 0 for episode in episodes) / count
+            if count
+            else 0.0
+        ),
+        normal_ball_death_rate=(
+            sum(episode.normal_ball_deaths > 0 for episode in episodes) / count
+            if count
+            else 0.0
+        ),
+        big_ball_death_rate=(
+            sum(episode.big_ball_deaths > 0 for episode in episodes) / count
+            if count
+            else 0.0
+        ),
+        mean_bridge_falls=(
+            sum(episode.bridge_falls for episode in episodes) / count
+            if count
+            else 0.0
+        ),
+        bridge_fall_rate=(
+            sum(episode.bridge_falls > 0 for episode in episodes) / count
+            if count
+            else 0.0
+        ),
+        mean_timed_doors_opened=(
+            sum(episode.timed_doors_opened for episode in episodes) / count
+            if count
+            else 0.0
+        ),
+        mean_timed_doors_expired=(
+            sum(episode.timed_doors_expired for episode in episodes) / count
+            if count
+            else 0.0
+        ),
+        mean_timed_doors_rearmed=(
+            sum(episode.timed_doors_rearmed for episode in episodes) / count
+            if count
+            else 0.0
+        ),
+        timed_door_open_rate=(
+            sum(episode.timed_doors_opened > 0 for episode in episodes) / count
+            if count
+            else 0.0
+        ),
+        timed_door_expiry_rate=(
+            sum(episode.timed_doors_expired > 0 for episode in episodes) / count
+            if count
+            else 0.0
+        ),
+        timed_door_rearm_rate=(
+            sum(episode.timed_doors_rearmed > 0 for episode in episodes) / count
+            if count
+            else 0.0
+        ),
+        mean_crate_switches=(
+            sum(episode.crate_switches for episode in episodes) / count
+            if count
+            else 0.0
+        ),
+        crate_switch_rate=(
+            sum(episode.crate_switches > 0 for episode in episodes) / count
+            if count
+            else 0.0
+        ),
+        mean_reset_entries=(
+            sum(episode.reset_entries for episode in episodes) / count
+            if count
+            else 0.0
+        ),
+        reset_entry_rate=(
+            sum(episode.reset_entries > 0 for episode in episodes) / count
+            if count
+            else 0.0
+        ),
+        mean_wrong_key_interactions=(
+            sum(episode.wrong_key_interactions for episode in episodes) / count
+            if count
+            else 0.0
         ),
     )
     return evaluation, tuple(episodes)
