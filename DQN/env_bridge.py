@@ -310,6 +310,43 @@ class CoopEnvBridge:
     def legacy_assistance_enabled(self) -> bool:
         return self.policy_mode == ASSISTED_POLICY_MODE
 
+    def route_action_labels(self) -> tuple[int, ...]:
+        """The planner's next step per agent, as an action index, or -1.
+
+        This is a *training* signal, deliberately available in both policy
+        modes. Learned mode zeroes route_dx/route_dy in the observation so the
+        acting network never reads the planner's answer; supervising against
+        this label teaches the network to work the step out from the view and
+        goal deltas it can still see. The label is never consumed at action
+        time, so a checkpoint trained with it still runs unaided.
+
+        Returns -1 for an agent whose next step is undefined -- goal not
+        reachable, standing on an interactable, told to wait, or already there
+        -- which is the same eligibility ``route_actions`` applies to the
+        assisted observation.
+        """
+        if not self._ready:
+            raise RuntimeError("call reset() before requesting route labels")
+        labels: list[int] = []
+        for i in range(N_AGENTS):
+            target, _, _, route, _, reachable, route_wait = self._goal_info(i)
+            if not reachable or route_wait or self._can_interact(i, target):
+                labels.append(-1)
+                continue
+            dx, dy = int(route[0]), int(route[1])
+            # Match the action layout: north, east, south, west.
+            if dy < 0:
+                labels.append(0)
+            elif dx > 0:
+                labels.append(1)
+            elif dy > 0:
+                labels.append(2)
+            elif dx < 0:
+                labels.append(3)
+            else:
+                labels.append(-1)
+        return tuple(labels)
+
 
     def reset(self, seed=None):
         if self.micro is not None:

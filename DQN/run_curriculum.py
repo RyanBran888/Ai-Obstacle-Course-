@@ -19,7 +19,7 @@ from curriculum import (
     make_runner,
 )
 from DQN.DQN_model import ACTIONS, CHANNEL_NAMES, GLOBAL_NAMES, OBS_DIM, OBSERVATION_SCHEMA
-from DQN.DQN_train import Config, pin_auto_device
+from DQN.DQN_train import DEFAULT_ROUTE_AUX_WEIGHT, Config, pin_auto_device
 from preview_maps import export_manifest_site, load_manifest
 from room_manifest import save_manifest
 
@@ -76,6 +76,17 @@ def parse_args() -> argparse.Namespace:
             "learned hides exact route-action and future-safety answers "
             "(default); assisted preserves the legacy planner-guided policy "
             "for compatibility/diagnostics"
+        ),
+    )
+    parser.add_argument(
+        "--route-aux-weight",
+        type=float,
+        default=DEFAULT_ROUTE_AUX_WEIGHT,
+        help=(
+            "weight on the route ranking loss that teaches the network to "
+            "read route_dx/route_dy rather than memorize training rooms "
+            f"(default {DEFAULT_ROUTE_AUX_WEIGHT}); 0 trains on TD error "
+            "alone, which stalls near 70%% on held-out rooms"
         ),
     )
     parser.add_argument("--validation-seeds", type=int, default=64)
@@ -768,6 +779,7 @@ def main() -> None:
         device=args.device,
         seed=args.seed,
         policy_mode=args.policy_mode,
+        route_aux_weight=args.route_aux_weight,
     )
     runner = make_runner(
         cfg,

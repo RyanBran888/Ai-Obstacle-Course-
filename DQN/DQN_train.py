@@ -6,7 +6,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -23,6 +23,7 @@ from DQN.DQN_model import (
     HIDDEN,
     LEARNED_POLICY_CONTRACT,
     LEARNED_POLICY_MODE,
+    LEGACY_LEARNED_POLICY_CONTRACT,
     N_ACTIONS,
     OBS_DIM,
     OBSERVATION_SCHEMA,
@@ -39,6 +40,9 @@ _AUTO_DEVICE: torch.device | None = None
 _AUTO_CPU_THREADS: int | None = None
 _ROUTE_AUX_WEIGHT = 0.05
 _ROUTE_AUX_MARGIN = 1.0
+#: Public alias so callers can show the default without reaching for a private
+#: name. See Config.route_aux_weight for what it buys.
+DEFAULT_ROUTE_AUX_WEIGHT = _ROUTE_AUX_WEIGHT
 _WAIT_ACTION = ACTIONS.index("wait")
 
 
@@ -93,6 +97,25 @@ def _environment_action_masks(env, observations) -> np.ndarray:
         observations,
         [ASSISTED_POLICY_MODE] * len(observations),
     )
+
+
+def _environment_route_labels(env) -> tuple[int, ...]:
+    """The planner's next step per agent, or all -1 when unavailable.
+
+    Environments without the accessor (stubs, older bridges) simply train on
+    TD error alone rather than failing, so an absent teacher degrades to the
+    previous behavior instead of crashing the run.
+    """
+    accessor = getattr(env, "route_action_labels", None)
+    if not callable(accessor):
+        return (-1,) * N_AGENTS
+    reported = cast(Sequence[int], accessor())
+    labels = tuple(int(value) for value in reported)
+    if len(labels) != N_AGENTS:
+        raise ValueError(
+            f"expected {N_AGENTS} route labels, got {len(labels)}"
+        )
+    return labels
 
 
 def _environment_action_masks_for_modes(
@@ -157,10 +180,15 @@ def _valid_actions(observation, safety_mask=None) -> list[int]:
 
 def _route_auxiliary_loss(
     q_values: torch.Tensor,
-    observations: torch.Tensor,
+    labels: torch.Tensor,
     valid_mask: torch.Tensor,
 ) -> torch.Tensor:
-    labels = route_actions(observations)
+    """Rank the planner's step above every other legal action by a margin.
+
+    ``labels`` comes from the environment, not from the observation: learned
+    mode zeroes the route features an observation-derived label would need, so
+    deriving them here would silently produce no labels and no gradient.
+    """
     valid = labels >= 0
     if not bool(valid.any()):
         return q_values.new_zeros(())
@@ -213,23 +241,29 @@ def _policy_contract(mode: str) -> dict[str, Any]:
 
 
 def _checkpoint_policy_mode(checkpoint: Mapping[str, Any]) -> str:
-    """Resolve explicit new checkpoints and implicit historical checkpoints."""
+    """Resolve explicit new checkpoints and implicit historical checkpoints.
+
+    The learned-v3 contract is accepted alongside learned-v4. The two differ
+    only in whether the route auxiliary loss ran during training, which changes
+    the weights that come out but not how an action is chosen from them, so a
+    v3 checkpoint loads and acts correctly under v4 code.
+    """
     explicit = checkpoint.get("policy_mode")
     contract = checkpoint.get("policy")
     if explicit is not None:
         mode = _normalize_policy_mode(str(explicit))
-        expected = (
-            LEARNED_POLICY_CONTRACT
+        accepted = (
+            (LEARNED_POLICY_CONTRACT, LEGACY_LEARNED_POLICY_CONTRACT)
             if mode == LEARNED_POLICY_MODE
-            else ASSISTED_POLICY_CONTRACT
+            else (ASSISTED_POLICY_CONTRACT,)
         )
-        if contract != expected:
+        if contract not in accepted:
             raise ValueError(
                 "checkpoint policy mode and policy contract do not match"
             )
         return mode
 
-    if contract == LEARNED_POLICY_CONTRACT:
+    if contract in (LEARNED_POLICY_CONTRACT, LEGACY_LEARNED_POLICY_CONTRACT):
         return LEARNED_POLICY_MODE
     if contract in (
         None,
@@ -285,6 +319,11 @@ class Config:
     shared_net: bool = True
     seed: int = 0
     policy_mode: str = LEARNED_POLICY_MODE
+    #: Weight on the route ranking loss. This is what teaches the network to
+    #: read route_dx/route_dy instead of memorizing individual rooms, so it is
+    #: the difference between a policy that transfers to unseen rooms and one
+    #: that does not. Set to 0.0 to train on TD error alone.
+    route_aux_weight: float = _ROUTE_AUX_WEIGHT
 
 
 def eps_at(step: int, cfg: Config) -> float:
@@ -584,6 +623,10 @@ class ReplayBuffer:
             dtype=np.bool_,
         )
         self.important = np.empty(capacity, dtype=np.bool_)
+        #: The planner's step for this observation, or -1 where it has none.
+        #: Supplied by the environment rather than read back out of the
+        #: observation, because learned mode zeroes the route features there.
+        self.route_labels = np.full(capacity, -1, dtype=np.int64)
         self.replay_groups = np.empty(capacity, dtype=np.int64)
         self._important_indices = np.empty(capacity, dtype=np.int64)
         self._important_positions = np.full(capacity, -1, dtype=np.int64)
@@ -656,6 +699,7 @@ class ReplayBuffer:
         replay_group: int = 0,
         current_mask=None,
         next_mask=None,
+        route_label: int = -1,
     ) -> None:
         group = _replay_group(replay_group)
         slot = self.index
@@ -687,6 +731,7 @@ class ReplayBuffer:
             next_mask,
         )
         self.important[slot] = important
+        self.route_labels[slot] = route_label
         self.replay_groups[slot] = group
         self.index = (self.index + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
@@ -892,6 +937,7 @@ class ReplayBuffer:
             self.discount[indices],
             self.action_masks[indices],
             self.next_action_masks[indices],
+            self.route_labels[indices],
         )
 
 
@@ -909,12 +955,16 @@ class Agent:
         replay_seed: int = 0,
         important_fraction: float = 0.25,
         policy_mode: str = LEARNED_POLICY_MODE,
+        route_aux_weight: float = _ROUTE_AUX_WEIGHT,
     ) -> None:
         self.device = torch.device(device)
         self.gamma = gamma
         self.clip = clip
         self.important_fraction = important_fraction
         self.policy_mode = _normalize_policy_mode(policy_mode)
+        if route_aux_weight < 0.0:
+            raise ValueError("route_aux_weight cannot be negative")
+        self.route_aux_weight = float(route_aux_weight)
         self.require_action_mask = False
         self.latest_learning_metrics: dict[str, float] = {}
         self.replay_group_weights: dict[int, float] | None = None
@@ -975,6 +1025,7 @@ class Agent:
         replay_group: int = 0,
         current_mask=None,
         next_mask=None,
+        route_label: int = -1,
     ) -> None:
         self.replay.add(
             obs,
@@ -987,6 +1038,7 @@ class Agent:
             replay_group,
             current_mask,
             next_mask,
+            route_label,
         )
 
     def learn_batch(self, batch_size: int) -> dict[str, float]:
@@ -1004,8 +1056,14 @@ class Agent:
             discount,
             current_masks,
             next_masks,
+            route_labels,
         ) = batch
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+        route_labels_t = torch.as_tensor(
+            route_labels,
+            dtype=torch.int64,
+            device=self.device,
+        )
         actions_t = torch.as_tensor(actions, dtype=torch.int64, device=self.device)
         rewards_t = torch.as_tensor(rewards, dtype=torch.float32, device=self.device)
         next_obs_t = torch.as_tensor(next_obs, dtype=torch.float32, device=self.device)
@@ -1036,16 +1094,23 @@ class Agent:
             target = rewards_t + discount_t * next_q * (1.0 - terminal_t)
 
         td_loss = self.loss_fn(q, target)
+        # Applies in both policy modes. Assisted mode also biases scores toward
+        # the route action at selection time; learned mode does not, so this
+        # ranking loss is the network's only route signal there -- without it
+        # the cheapest way to cut TD error is to memorize the training pool.
+        # The hinge stops producing gradient once the route action leads by the
+        # margin, so a network that already routes correctly trains on TD error
+        # alone.
         route_loss = (
             _route_auxiliary_loss(
                 q_values,
-                obs_t,
+                route_labels_t,
                 current_masks_t,
             )
-            if self.policy_mode == ASSISTED_POLICY_MODE
+            if self.route_aux_weight > 0.0
             else q_values.new_zeros(())
         )
-        loss = td_loss + _ROUTE_AUX_WEIGHT * route_loss
+        loss = td_loss + self.route_aux_weight * route_loss
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
         grad_norm = nn.utils.clip_grad_norm_(
@@ -1386,6 +1451,7 @@ class Trainer:
                 replay_seed=replay_seed,
                 important_fraction=self.cfg.important_fraction,
                 policy_mode=self.policy_mode,
+                route_aux_weight=self.cfg.route_aux_weight,
             )
 
         if self.cfg.shared_net:
@@ -1615,6 +1681,7 @@ class Trainer:
                 step_group,
                 _,
                 next_mask,
+                _,
             ) = transition
             if step_group != replay_group:
                 raise RuntimeError("n-step transition crossed replay groups")
@@ -1627,6 +1694,9 @@ class Trainer:
                 break
 
         first_obs, first_action = pending[0][0], pending[0][1]
+        # The auxiliary loss scores the head of the n-step window, so it takes
+        # that step's label rather than the one the window ends on.
+        first_route_label = pending[0][9]
         self.agents[agent_index].remember(
             first_obs,
             first_action,
@@ -1638,6 +1708,7 @@ class Trainer:
             replay_group,
             first_mask,
             last_next_mask,
+            first_route_label,
         )
         pending.popleft()
 
@@ -1652,8 +1723,10 @@ class Trainer:
         terminal: bool,
         important: bool,
         replay_group: int = 0,
+        route_labels: Sequence[int] | None = None,
     ) -> None:
         group = _replay_group(replay_group)
+        labels = route_labels or (-1,) * N_AGENTS
         for index in range(N_AGENTS):
             self._pending[index].append(
                 (
@@ -1666,6 +1739,7 @@ class Trainer:
                     group,
                     current_masks[index],
                     next_masks[index],
+                    int(labels[index]),
                 )
             )
             if len(self._pending[index]) >= self.cfg.n_step:
@@ -1704,6 +1778,9 @@ class Trainer:
                 eps,
                 current_masks,
             )
+            # Read before stepping: the label describes the state the agents
+            # are acting from, which is the observation the loss scores.
+            route_labels = _environment_route_labels(active_env)
             next_obs, rewards, done, cut, info = active_env.step(actions)
             terminal = done or cut
             next_masks = (
@@ -1738,6 +1815,7 @@ class Trainer:
                     terminal,
                     important,
                     group,
+                    route_labels,
                 )
                 self.env_steps += 1
                 ready = max(self.cfg.batch_size, self.cfg.replay_warmup)

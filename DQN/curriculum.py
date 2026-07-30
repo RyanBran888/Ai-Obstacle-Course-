@@ -26,6 +26,7 @@ from DQN.DQN_model import (
     POLICY_CONTRACT,
 )
 from DQN.DQN_train import (
+    DEFAULT_ROUTE_AUX_WEIGHT,
     Config,
     Evaluation,
     EvaluationEpisode,
@@ -316,6 +317,35 @@ def _test_result_from_payload(payload: Mapping[str, Any]) -> StageTestResult:
         evaluation=evaluation,
         episodes=episodes,
     )
+
+
+def _with_recorded_route_aux_weight(
+    contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Fill in the route auxiliary weight a pre-v4 state actually trained with.
+
+    Older recovery states predate the setting, so comparing them against a
+    current contract would flag a difference that says nothing about whether
+    the run is resumable. Back then the loss was applied in assisted mode and
+    skipped in learned mode, so recording those two values is not a default --
+    it is what the saved run did, which lets an assisted state resume cleanly
+    and correctly stops a learned one, whose weights came from a different
+    objective.
+    """
+    payload = dict(contract)
+    trainer = payload.get("trainer")
+    if not isinstance(trainer, Mapping) or "route_aux_weight" in trainer:
+        return payload
+    # Absent policy_mode means assisted; that is the same reading the rest of
+    # the recovery path uses for states written before the mode was recorded.
+    mode = str(trainer.get("policy_mode", "assisted"))
+    payload["trainer"] = {
+        **trainer,
+        "route_aux_weight": (
+            0.0 if mode == "learned" else DEFAULT_ROUTE_AUX_WEIGHT
+        ),
+    }
+    return payload
 
 
 def _hash_payload(payload: Mapping[str, Any]) -> str:
@@ -1790,13 +1820,15 @@ class CurriculumRunner:
         if payload.get("contract_sha256") != _hash_payload(saved_contract):
             raise ValueError("curriculum recovery contract is corrupted")
         contract = self._progress_contract()
+        saved_contract = _with_recorded_route_aux_weight(saved_contract)
         exact_contract = saved_contract == contract
         if not exact_contract and not self._compatible_source_upgrade(
             saved_contract,
             contract,
         ):
             raise ValueError(
-                "recovery state does not match this code, seed, or training config"
+                "recovery state does not match this code, seed, or training "
+                "config" + self._route_aux_note(saved_contract)
             )
         if self._dynamic_door_upgrade and not exact_contract:
             self._validate_dynamic_door_cursor(payload)
@@ -2161,6 +2193,23 @@ class CurriculumRunner:
         migrated = dict(payload)
         migrated["stages"] = stages
         return migrated
+
+    @staticmethod
+    def _route_aux_note(saved: Mapping[str, Any]) -> str:
+        trainer = saved.get("trainer")
+        weight = (
+            trainer.get("route_aux_weight")
+            if isinstance(trainer, Mapping)
+            else None
+        )
+        if weight == 0.0:
+            return (
+                "\nThat state was trained with no route auxiliary loss, which "
+                "is the setting that stalled near 70% on held-out rooms. Its "
+                "weights were shaped by a different objective, so start a "
+                "fresh run rather than resuming it."
+            )
+        return ""
 
     def _compatible_source_upgrade(
         self,

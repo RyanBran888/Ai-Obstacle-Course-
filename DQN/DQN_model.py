@@ -144,12 +144,26 @@ POLICY_CONTRACT = {
     "mask_invalid_interact": True,
 }
 ASSISTED_POLICY_CONTRACT = POLICY_CONTRACT
-LEARNED_POLICY_CONTRACT = {
+# The learned-v3 contract trained with no route auxiliary loss at all, which
+# left the network nothing pushing it to read route_dx/route_dy -- the two
+# observation features that name the correct step. It memorized training rooms
+# instead and stalled near 70% on held-out ones. Kept only so those checkpoints
+# can be recognized and upgraded.
+LEGACY_LEARNED_POLICY_CONTRACT = {
     "version": 3,
     "mode": LEARNED_POLICY_MODE,
     "action_scores": "raw_masked_q",
     "double_dqn_next_action": "raw_masked_online_q",
     "route_auxiliary_loss": False,
+    "future_survival_action_mask": False,
+    "mask_invalid_interact": True,
+}
+LEARNED_POLICY_CONTRACT = {
+    "version": 4,
+    "mode": LEARNED_POLICY_MODE,
+    "action_scores": "raw_masked_q",
+    "double_dqn_next_action": "raw_masked_online_q",
+    "route_auxiliary_loss": True,
     "future_survival_action_mask": False,
     "mask_invalid_interact": True,
 }

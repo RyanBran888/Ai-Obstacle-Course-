@@ -52,6 +52,7 @@ from DQN.DQN_model import (
     HIDDEN,
     LEARNED_POLICY_CONTRACT,
     LEARNED_POLICY_MODE,
+    LEGACY_LEARNED_POLICY_CONTRACT,
     LEGACY_POLICY_CONTRACT,
     N_ACTIONS,
     OBS_DIM,
@@ -111,20 +112,23 @@ def _checkpoint_policy_mode(checkpoint: Any) -> str:
     contract = checkpoint.get("policy")
     if explicit is not None:
         mode = str(explicit)
-        expected = (
-            LEARNED_POLICY_CONTRACT
+        # learned-v3 and learned-v4 differ only in whether the route auxiliary
+        # loss ran while training, which does not change how an action is
+        # picked from the resulting Q-values, so both act correctly here.
+        accepted = (
+            (LEARNED_POLICY_CONTRACT, LEGACY_LEARNED_POLICY_CONTRACT)
             if mode == LEARNED_POLICY_MODE
             else (
-                ASSISTED_POLICY_CONTRACT
+                (ASSISTED_POLICY_CONTRACT,)
                 if mode == ASSISTED_POLICY_MODE
-                else None
+                else ()
             )
         )
-        if expected is None or contract != expected:
+        if contract not in accepted:
             raise ValueError("checkpoint action policy does not match")
         return mode
 
-    if contract == LEARNED_POLICY_CONTRACT:
+    if contract in (LEARNED_POLICY_CONTRACT, LEGACY_LEARNED_POLICY_CONTRACT):
         return LEARNED_POLICY_MODE
     if contract in (
         None,
