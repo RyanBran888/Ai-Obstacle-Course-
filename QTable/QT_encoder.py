@@ -284,21 +284,22 @@ def _hold_duty(bridge: Any, agent: int) -> int:
     return 0
 
 
-def _ball_threat(bridge: Any, agent: int) -> int:
-    """1 if a wipeout ball occupies or is about to occupy an adjacent tile.
-
-    Worth its own field because a ball is the only thing in the environment that
-    ends an episode outright, at -10.0 -- an order of magnitude worse than any
-    other penalty. A table that cannot see one coming cannot learn to dodge.
-    """
+def _ball_threat(bridge, agent, route):
+    """0 none · 1 clear · 2 route hit now · 3 route hit next tick
+       4 my tile hit next tick · 5 ball near, off-route"""
     if not bridge._wipeout_balls:
         return 0
+    tick, me = bridge.state.tick, bridge.pos[agent]
 
-    tick = bridge.state.tick
-    me = bridge.pos[agent]
-    for offset in (Vec2(0, 0), *DIRS):
-        p = me + offset
-        for when in (tick, tick + 1):
-            if bridge._wipeout_at(p, when) is not None:
-                return 1
-    return 0
+    if bridge._wipeout_at(me, tick + 1) is not None:
+        return 4
+    if route != NO_ROUTE:
+        ahead = me + DIRS[route]
+        if bridge._wipeout_at(ahead, tick) is not None:
+            return 2
+        if bridge._wipeout_at(ahead, tick + 1) is not None:
+            return 3
+    for d in DIRS:
+        if bridge._wipeout_at(me + d, tick) is not None:
+            return 5
+    return 1
