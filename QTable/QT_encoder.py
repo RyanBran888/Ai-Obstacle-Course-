@@ -125,7 +125,7 @@ class StateEncoder:
             _switch_mode(g),
             _mechanism(g),
             teammate,
-            _ball_threat(bridge, agent),
+            _ball_threat(bridge, agent, route),
             _hold_duty(bridge, agent),
         )
 
