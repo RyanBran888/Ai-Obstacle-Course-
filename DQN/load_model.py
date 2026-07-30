@@ -1,9 +1,16 @@
 """Load a trained agent from a .pt checkpoint in one call, from any script.
 
-    from DQN.load_model import load_agent
+    from DQN.load_model import configure_environment, load_agent
 
-    agent = load_agent("agent0.pt")     # net + target + optimizer restored
-    action = agent.act(obs, eps=0.0)    # greedy action, int
+    agent = load_agent("agent_0.pt")       # net + target + optimizer restored
+    configure_environment(agent, env)      # important for legacy agent-7 files
+    observations = env.reset(seed=42)
+    masks = env.wipeout_action_masks()
+    action = agent.act(                     # greedy action for agent 0
+        observations[0],
+        eps=0.0,
+        action_mask=masks[0],
+    )
 
 ``load_agent`` returns a fully restored ``DQN_train.Agent``, so every method on
 it works: ``act``, ``remember``, ``learn_batch``, ``sync``, ``save``. Pass
@@ -40,19 +47,40 @@ for _path in (str(_HERE.parent), str(_HERE)):
 
 from DQN.DQN_model import (
     ACTION_SAFETY_CONTRACT,
+    ASSISTED_POLICY_CONTRACT,
+    ASSISTED_POLICY_MODE,
     HIDDEN,
+    LEARNED_POLICY_CONTRACT,
+    LEARNED_POLICY_MODE,
     LEGACY_POLICY_CONTRACT,
     N_ACTIONS,
     OBS_DIM,
-    POLICY_CONTRACT,
     QNetwork,
-    policy_scores,
+    action_scores,
 )
 
 if TYPE_CHECKING:
     from DQN.DQN_train import Agent
 
 ArrayLike = torch.Tensor | np.ndarray | list | tuple
+
+
+def configure_environment(policy: Any, env: Any) -> Any:
+    """Match a bridge to a loaded learned or legacy-assisted policy.
+
+    ``Trainer`` and the built-in evaluation helpers do this automatically.
+    Call this helper for manual inference, especially with agent 7: a legacy
+    assisted checkpoint needs the bridge to expose its historical route and
+    safety fields.
+    """
+    mode = getattr(policy, "policy_mode", None)
+    configure = getattr(env, "set_policy_mode", None)
+    if mode not in (LEARNED_POLICY_MODE, ASSISTED_POLICY_MODE):
+        raise ValueError("loaded policy has no recognized policy mode")
+    if not callable(configure):
+        raise TypeError("environment does not support policy-mode selection")
+    configure(mode)
+    return env
 
 
 def resolve_device(requested: str | torch.device = "auto") -> torch.device:
@@ -74,14 +102,37 @@ def _net_state(checkpoint: Any) -> dict:
     return checkpoint
 
 
-def _validate_policy(checkpoint: Any) -> None:
-    if (
-        isinstance(checkpoint, dict)
-        and checkpoint.get("policy") is not None
-        and checkpoint.get("policy")
-        not in (POLICY_CONTRACT, LEGACY_POLICY_CONTRACT)
+def _checkpoint_policy_mode(checkpoint: Any) -> str:
+    """Return the action contract, treating historical files as assisted."""
+    if not isinstance(checkpoint, dict):
+        return ASSISTED_POLICY_MODE
+
+    explicit = checkpoint.get("policy_mode")
+    contract = checkpoint.get("policy")
+    if explicit is not None:
+        mode = str(explicit)
+        expected = (
+            LEARNED_POLICY_CONTRACT
+            if mode == LEARNED_POLICY_MODE
+            else (
+                ASSISTED_POLICY_CONTRACT
+                if mode == ASSISTED_POLICY_MODE
+                else None
+            )
+        )
+        if expected is None or contract != expected:
+            raise ValueError("checkpoint action policy does not match")
+        return mode
+
+    if contract == LEARNED_POLICY_CONTRACT:
+        return LEARNED_POLICY_MODE
+    if contract in (
+        None,
+        ASSISTED_POLICY_CONTRACT,
+        LEGACY_POLICY_CONTRACT,
     ):
-        raise ValueError("checkpoint action policy does not match")
+        return ASSISTED_POLICY_MODE
+    raise ValueError("checkpoint action policy does not match")
 
 
 def _validate_action_safety(checkpoint: Any) -> None:
@@ -91,6 +142,15 @@ def _validate_action_safety(checkpoint: Any) -> None:
         and checkpoint.get("action_safety") != ACTION_SAFETY_CONTRACT
     ):
         raise ValueError("checkpoint action safety does not match")
+
+    if (
+        isinstance(checkpoint, dict)
+        and _checkpoint_policy_mode(checkpoint) == LEARNED_POLICY_MODE
+        and checkpoint.get("action_safety") is not None
+    ):
+        raise ValueError(
+            "learned checkpoints cannot require the assisted safety oracle"
+        )
 
 
 def load_agent(
@@ -109,10 +169,20 @@ def load_agent(
 
     resolved = resolve_device(device)
     checkpoint = torch.load(path, map_location=resolved)
-    _validate_policy(checkpoint)
+    policy_mode = _checkpoint_policy_mode(checkpoint)
     _validate_action_safety(checkpoint)
 
-    agent = Agent(device=resolved, **agent_kwargs)
+    requested_mode = agent_kwargs.pop("policy_mode", policy_mode)
+    if requested_mode != policy_mode:
+        raise ValueError(
+            f"checkpoint requires policy_mode={policy_mode!r}, "
+            f"not {requested_mode!r}"
+        )
+    agent = Agent(
+        device=resolved,
+        policy_mode=policy_mode,
+        **agent_kwargs,
+    )
     agent.net.load_state_dict(_net_state(checkpoint))
 
     if isinstance(checkpoint, dict) and checkpoint.get("target"):
@@ -132,6 +202,7 @@ def load_agent(
         isinstance(checkpoint, dict)
         and checkpoint.get("action_safety") is not None
     )
+    agent.policy_mode = policy_mode
     agent.net.train(train)
     agent.target.train(train)
     return agent
@@ -144,10 +215,12 @@ class Policy:
         self,
         net: QNetwork,
         device: torch.device,
+        policy_mode: str,
         action_safety: dict[str, Any] | None = None,
     ) -> None:
         self.net = net
         self.device = device
+        self.policy_mode = policy_mode
         self.action_safety = action_safety
 
     @torch.no_grad()
@@ -159,6 +232,10 @@ class Policy:
 
     def q_values(self, obs: ArrayLike) -> np.ndarray:
         return self(obs)
+
+    def configure_environment(self, env: Any) -> Any:
+        """Configure a bridge for this checkpoint's action contract."""
+        return configure_environment(self, env)
 
     def act(
         self,
@@ -172,9 +249,10 @@ class Policy:
         t = torch.as_tensor(obs, dtype=torch.float32).to(self.device)
         with torch.no_grad():
             raw = self.net(t.unsqueeze(0) if t.dim() == 1 else t)
-            scores = policy_scores(
+            scores = action_scores(
                 raw,
                 t.unsqueeze(0) if t.dim() == 1 else t,
+                self.policy_mode,
             )
         scores = scores.squeeze(0)
         if action_mask is not None:
@@ -204,7 +282,7 @@ def load_policy(
     """Load just the policy network, for greedy inference."""
     resolved = resolve_device(device)
     checkpoint = torch.load(path, map_location=resolved)
-    _validate_policy(checkpoint)
+    policy_mode = _checkpoint_policy_mode(checkpoint)
     _validate_action_safety(checkpoint)
 
     net = QNetwork(obs_dim=obs_dim, n_actions=n_actions, hidden=hidden)
@@ -216,7 +294,7 @@ def load_policy(
         and isinstance(checkpoint.get("action_safety"), dict)
         else None
     )
-    return Policy(net, resolved, action_safety)
+    return Policy(net, resolved, policy_mode, action_safety)
 
 
 def _main(argv: list[str]) -> int:
@@ -236,7 +314,11 @@ def _main(argv: list[str]) -> int:
         else None
     )
     print(f"loaded {args.checkpoint} on {policy.device}")
-    print(f"  obs_dim={policy.net.obs_dim} n_actions={policy.net.n_actions}")
+    print(
+        f"  obs_dim={policy.net.obs_dim} "
+        f"n_actions={policy.net.n_actions} "
+        f"policy_mode={policy.policy_mode}"
+    )
     print(
         f"  q(zeros)={np.round(policy.q_values(obs), 4)} "
         f"-> act={policy.act(obs, action_mask)}"

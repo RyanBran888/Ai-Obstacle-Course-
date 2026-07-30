@@ -14,7 +14,12 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from env_bridge import CoopEnvBridge, GenerationConfig
+from env_bridge import (
+    POLICY_MODE_ASSISTED,
+    POLICY_MODE_LEARNED,
+    CoopEnvBridge,
+    GenerationConfig,
+)
 from DQN.DQN_model import (
     ACTION_SAFETY_CONTRACT,
     LEGACY_POLICY_CONTRACT,
@@ -63,6 +68,115 @@ FULL_COURSE_HORIZON = 200
 CONSOLIDATION_ROLLBACK_PATIENCE = 8
 REPAIR_BRIDGE_INDEX = 13
 REPAIR_BRIDGE_STAGE = "oneshot_hazard_detour"
+
+
+def _environment_policy_mode(policy_owner: Any) -> str:
+    """Translate the Trainer policy contract to the environment contract."""
+    policy_mode = str(getattr(policy_owner, "policy_mode", "assisted"))
+    if policy_mode == "learned":
+        return POLICY_MODE_LEARNED
+    if policy_mode == "assisted":
+        return POLICY_MODE_ASSISTED
+    raise ValueError(f"unsupported trainer policy mode {policy_mode!r}")
+
+
+def _training_requirements_satisfied(
+    active: Mapping[str, Any],
+) -> bool:
+    return (
+        int(active["total_rounds"])
+        >= int(active.get("minimum_training_rounds", 0))
+        and int(active.get("optimizer_updates_completed", 0))
+        >= int(active.get("minimum_optimizer_updates", 0))
+    )
+
+
+def _promotion_ready(
+    active: Mapping[str, Any],
+    promotion_passes: int,
+) -> bool:
+    return (
+        int(active["streak"]) >= promotion_passes
+        and _training_requirements_satisfied(active)
+        and bool(active.get("best_meets_training_gate", True))
+    )
+
+
+def _trained_round_is_best(
+    active: Mapping[str, Any],
+    rank: Sequence[float],
+) -> bool:
+    """Keep an ineligible baseline from surviving the learning gate."""
+    return (
+        (
+            not bool(active.get("best_meets_training_gate", True))
+            and _training_requirements_satisfied(active)
+        )
+        or not active["best_rank"]
+        or tuple(rank) > tuple(active["best_rank"])
+    )
+
+
+def _save_trained_best(
+    active: dict[str, Any],
+    *,
+    rank: Sequence[float],
+    training: Evaluation,
+    validation: Evaluation | None,
+    retention: tuple[tuple[str, float], ...],
+    failures: tuple[str, ...],
+    retention_deficits: Mapping[str, float],
+    learner_state: Callable[[], Any],
+) -> bool:
+    if not _trained_round_is_best(active, rank):
+        return False
+    active["best_rank"] = tuple(rank)
+    active["best_round"] = int(active["total_rounds"])
+    active["best_training"] = training
+    active["best_validation"] = validation
+    active["best_retention"] = retention
+    active["best_failures"] = failures
+    active["best_retention_deficits"] = dict(retention_deficits)
+    active["best_learner_state"] = learner_state()
+    active["best_meets_training_gate"] = (
+        _training_requirements_satisfied(active)
+    )
+    return True
+
+
+def _learning_metrics(trainer: Trainer) -> dict[str, float]:
+    """Read optional Trainer telemetry without imposing a core API dependency."""
+    names = ("total_loss", "td_loss", "grad_norm")
+
+    def number(value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float("nan")
+
+    for attribute in (
+        "rolling_learning_metrics",
+        "latest_learning_metrics",
+        "learning_metrics",
+    ):
+        candidate = getattr(trainer, attribute, None)
+        if callable(candidate):
+            candidate = candidate()
+        if isinstance(candidate, Mapping):
+            return {
+                name: number(candidate.get(name, float("nan")))
+                for name in names
+            }
+    return {
+        name: number(
+            getattr(
+                trainer,
+                f"last_{name}",
+                getattr(trainer, name, float("nan")),
+            )
+        )
+        for name in names
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -1233,6 +1347,7 @@ class CurriculumRunner:
         plot_max_points: int = 5_000,
         graph_path: str | None = "curriculum_training.png",
         promotion_passes: int = 1,
+        minimum_fresh_training_rounds: int = 1,
         require_full_coverage: bool = True,
         retention_size: int = 8,
         retention_margin: float = 0.15,
@@ -1263,6 +1378,8 @@ class CurriculumRunner:
             raise ValueError("plot settings must be positive")
         if promotion_passes < 1:
             raise ValueError("promotion_passes must be positive")
+        if minimum_fresh_training_rounds < 0:
+            raise ValueError("minimum fresh training rounds cannot be negative")
         if (
             retention_size < 1
             or retention_size > validation_size
@@ -1294,6 +1411,7 @@ class CurriculumRunner:
         self.plot_max_points = plot_max_points
         self.graph_path = graph_path
         self.promotion_passes = promotion_passes
+        self.minimum_fresh_training_rounds = minimum_fresh_training_rounds
         self.require_full_coverage = require_full_coverage
         self.retention_size = retention_size
         self.retention_margin = retention_margin
@@ -1304,6 +1422,17 @@ class CurriculumRunner:
             Path(progress_path).expanduser() if progress_path else None
         )
         self._external_progress_contract = dict(progress_contract or {})
+        self.policy_mode = str(
+            getattr(
+                self.trainer,
+                "policy_mode",
+                getattr(self.trainer.cfg, "policy_mode", "assisted"),
+            )
+        )
+        self._fresh_learned_run = (
+            self.policy_mode == "learned"
+            and self._external_progress_contract.get("warm_start") is None
+        )
         self.extend_stopped_rounds = extend_stopped_rounds
         if sum(
             bool(value)
@@ -1360,6 +1489,34 @@ class CurriculumRunner:
     def model_sha256(self) -> str:
         return self._model_sha256()
 
+    def _initial_training_round_requirement(
+        self,
+        stage_index: int,
+        pool_index: int,
+    ) -> int:
+        if (
+            self._fresh_learned_run
+            and stage_index == 0
+            and pool_index == 0
+            and int(getattr(self.trainer, "updates", 0)) == 0
+        ):
+            return self.minimum_fresh_training_rounds
+        return 0
+
+    def _initial_optimizer_update_requirement(
+        self,
+        stage_index: int,
+        pool_index: int,
+    ) -> int:
+        if (
+            self._fresh_learned_run
+            and stage_index == 0
+            and pool_index == 0
+            and int(getattr(self.trainer, "updates", 0)) == 0
+        ):
+            return 1
+        return 0
+
     def prepare_room_manifest(self) -> CurriculumRoomManifest:
         self.room_manifest = self._manifest_builder.snapshot()
         return self.room_manifest
@@ -1382,6 +1539,15 @@ class CurriculumRunner:
             "episodes_per_seed": self.episodes_per_seed,
             "max_rounds": self.max_rounds,
             "promotion_passes": self.promotion_passes,
+            **(
+                {
+                    "minimum_fresh_training_rounds": (
+                        self.minimum_fresh_training_rounds
+                    )
+                }
+                if "training_honesty" in self._external_progress_contract
+                else {}
+            ),
             "retention_size": self.retention_size,
             "retention_margin": self.retention_margin,
             "recovery_rounds": self.recovery_rounds,
@@ -1460,6 +1626,18 @@ class CurriculumRunner:
             "needs_baseline_assessment": bool(
                 active.get("needs_baseline_assessment", False)
             ),
+            "minimum_training_rounds": int(
+                active.get("minimum_training_rounds", 0)
+            ),
+            "minimum_optimizer_updates": int(
+                active.get("minimum_optimizer_updates", 0)
+            ),
+            "optimizer_updates_completed": int(
+                active.get("optimizer_updates_completed", 0)
+            ),
+            "best_meets_training_gate": bool(
+                active.get("best_meets_training_gate", True)
+            ),
             "consolidation_bad_rounds": int(
                 active.get("consolidation_bad_rounds", 0)
             ),
@@ -1470,6 +1648,24 @@ class CurriculumRunner:
         training = _evaluation_from_payload(payload["best_training"])
         if training is None:
             raise ValueError("active recovery state is missing training metrics")
+        minimum_training_rounds = int(
+            payload.get("minimum_training_rounds", 0)
+        )
+        minimum_optimizer_updates = int(
+            payload.get("minimum_optimizer_updates", 0)
+        )
+        optimizer_updates_completed = int(
+            payload.get("optimizer_updates_completed", 0)
+        )
+        best_round = int(payload["best_round"])
+        best_meets_training_gate = bool(
+            payload.get(
+                "best_meets_training_gate",
+                best_round >= minimum_training_rounds
+                and optimizer_updates_completed
+                >= minimum_optimizer_updates,
+            )
+        )
         return {
             "stage_index": int(payload["stage_index"]),
             "pool_index": int(payload["pool_index"]),
@@ -1488,7 +1684,7 @@ class CurriculumRunner:
             "best_rank": tuple(
                 float(value) for value in payload["best_rank"]
             ),
-            "best_round": int(payload["best_round"]),
+            "best_round": best_round,
             "best_training": training,
             "best_validation": _evaluation_from_payload(
                 payload.get("best_validation")
@@ -1533,6 +1729,10 @@ class CurriculumRunner:
             "needs_baseline_assessment": bool(
                 payload.get("needs_baseline_assessment", False)
             ),
+            "minimum_training_rounds": minimum_training_rounds,
+            "minimum_optimizer_updates": minimum_optimizer_updates,
+            "optimizer_updates_completed": optimizer_updates_completed,
+            "best_meets_training_gate": best_meets_training_gate,
             "consolidation_bad_rounds": int(
                 payload.get("consolidation_bad_rounds", 0)
             ),
@@ -1979,6 +2179,18 @@ class CurriculumRunner:
 
         saved_copy = dict(saved)
         current_copy = dict(current)
+        saved_trainer = saved_copy.get("trainer")
+        current_trainer = current_copy.get("trainer")
+        if (
+            isinstance(saved_trainer, Mapping)
+            and isinstance(current_trainer, Mapping)
+            and "policy_mode" not in saved_trainer
+            and current_trainer.get("policy_mode") == "assisted"
+        ):
+            saved_copy["trainer"] = {
+                **saved_trainer,
+                "policy_mode": "assisted",
+            }
         if self._retention_upgrade:
             if int(saved.get("retention_size", -1)) != 8:
                 return False
@@ -1990,6 +2202,7 @@ class CurriculumRunner:
             expected_kind = "retention_v2"
             allowed_changes = {
                 "DQN/DQN_train.py",
+                "DQN/DQN_rewards.py",
                 "DQN/curriculum.py",
                 "DQN/run_curriculum.py",
             }
@@ -2019,6 +2232,7 @@ class CurriculumRunner:
             allowed_changes = {
                 "DQN/DQN_model.py",
                 "DQN/DQN_train.py",
+                "DQN/DQN_rewards.py",
                 "DQN/curriculum.py",
                 "DQN/env_bridge.py",
                 "DQN/load_model.py",
@@ -2033,6 +2247,7 @@ class CurriculumRunner:
             allowed_changes = {
                 "DQN/DQN_model.py",
                 "DQN/DQN_train.py",
+                "DQN/DQN_rewards.py",
                 "DQN/curriculum.py",
                 "DQN/env_bridge.py",
                 "DQN/load_model.py",
@@ -2045,6 +2260,7 @@ class CurriculumRunner:
                 return False
             expected_kind = "planner_v3"
             allowed_changes = {
+                "DQN/DQN_rewards.py",
                 "DQN/curriculum.py",
                 "DQN/env_bridge.py",
                 "DQN/run_curriculum.py",
@@ -2058,6 +2274,7 @@ class CurriculumRunner:
             allowed_changes = {
                 "DQN/DQN_model.py",
                 "DQN/DQN_train.py",
+                "DQN/DQN_rewards.py",
                 "DQN/curriculum.py",
                 "DQN/env_bridge.py",
                 "DQN/load_model.py",
@@ -2070,6 +2287,7 @@ class CurriculumRunner:
                 return False
             expected_kind = "dynamic_door_safety_v1"
             allowed_changes = {
+                "DQN/DQN_rewards.py",
                 "DQN/curriculum.py",
                 "DQN/env_bridge.py",
                 "DQN/run_curriculum.py",
@@ -2602,6 +2820,10 @@ class CurriculumRunner:
         plot_resets = array("f")
         plot_steps = array("f")
         plot_epsilons = array("f")
+        plot_updates = array("f")
+        plot_td_losses = array("f")
+        plot_total_losses = array("f")
+        plot_grad_norms = array("f")
         stage_marks: list[tuple[int, str]] = []
         evaluation_marks: list[
             tuple[int, float, float | None, float | None]
@@ -2634,6 +2856,10 @@ class CurriculumRunner:
                 bridge_falls=plot_bridge_falls,
                 crate_switches=plot_crate_switches,
                 resets=plot_resets,
+                updates=plot_updates,
+                td_losses=plot_td_losses,
+                total_losses=plot_total_losses,
+                grad_norms=plot_grad_norms,
                 force=True,
             )
             if self.graph_path:
@@ -2705,6 +2931,11 @@ class CurriculumRunner:
             )
             plot_steps.append(float(outcome.steps))
             plot_epsilons.append(self.trainer.epsilon())
+            learning = _learning_metrics(self.trainer)
+            plot_updates.append(float(getattr(self.trainer, "updates", 0)))
+            plot_td_losses.append(learning["td_loss"])
+            plot_total_losses.append(learning["total_loss"])
+            plot_grad_norms.append(learning["grad_norm"])
             if plot is not None and plot.visible:
                 plot.update(
                     plot_returns,
@@ -2716,6 +2947,10 @@ class CurriculumRunner:
                     bridge_falls=plot_bridge_falls,
                     crate_switches=plot_crate_switches,
                     resets=plot_resets,
+                    updates=plot_updates,
+                    td_losses=plot_td_losses,
+                    total_losses=plot_total_losses,
+                    grad_norms=plot_grad_norms,
                 )
                 pump_every = min(50, self.plot_every)
                 if (
@@ -2799,6 +3034,7 @@ class CurriculumRunner:
                     max_steps=self.trainer.cfg.max_steps,
                     shaping_gamma=self.trainer.cfg.gamma,
                     record_metrics=False,
+                    policy_mode=_environment_policy_mode(self.trainer),
                 )
                 train_env.set_room_cache_limit(cache_limit)
                 training_eval_env = CoopEnvBridge(
@@ -2807,6 +3043,7 @@ class CurriculumRunner:
                     max_steps=self.trainer.cfg.max_steps,
                     shaping_gamma=self.trainer.cfg.gamma,
                     record_metrics=False,
+                    policy_mode=_environment_policy_mode(self.trainer),
                 )
                 training_eval_env.set_room_cache_limit(cache_limit)
                 validation_eval_env = CoopEnvBridge(
@@ -2815,6 +3052,7 @@ class CurriculumRunner:
                     max_steps=self.trainer.cfg.max_steps,
                     shaping_gamma=self.trainer.cfg.gamma,
                     record_metrics=False,
+                    policy_mode=_environment_policy_mode(self.trainer),
                 )
                 validation_eval_env.set_room_cache_limit(self.validation_size)
                 saved_stage = self._manifest_builder.snapshot().stage(stage.name)
@@ -2953,6 +3191,20 @@ class CurriculumRunner:
                             "best_learner_state": None,
                             "needs_replay_refill": False,
                             "needs_baseline_assessment": True,
+                            "minimum_training_rounds": (
+                                self._initial_training_round_requirement(
+                                    stage_index,
+                                    pool_index,
+                                )
+                            ),
+                            "minimum_optimizer_updates": (
+                                self._initial_optimizer_update_requirement(
+                                    stage_index,
+                                    pool_index,
+                                )
+                            ),
+                            "optimizer_updates_completed": 0,
+                            "best_meets_training_gate": False,
                             "consolidation_bad_rounds": 0,
                         }
                     if self._force_replay_refill:
@@ -3016,7 +3268,25 @@ class CurriculumRunner:
                         active["best_learner_state"] = (
                             self.trainer.learner_state()
                         )
-                        active["streak"] = 1 if not failures else 0
+                        active["best_meets_training_gate"] = (
+                            _training_requirements_satisfied(active)
+                        )
+                        baseline_training_required = (
+                            not failures
+                            and not _training_requirements_satisfied(active)
+                        )
+                        displayed_failures = failures
+                        if baseline_training_required:
+                            displayed_failures = (
+                                *failures,
+                                "fresh learned policy has not completed its "
+                                "required optimizer training",
+                            )
+                        active["streak"] = (
+                            1
+                            if not failures and not baseline_training_required
+                            else 0
+                        )
                         active["consolidation_bad_rounds"] = 0
                         active["needs_baseline_assessment"] = False
                         self._print_round(
@@ -3026,10 +3296,26 @@ class CurriculumRunner:
                             training_eval,
                             validation_eval,
                             retention_eval,
-                            failures,
+                            displayed_failures,
                             "baseline",
                         )
-                        if int(active["streak"]) >= self.promotion_passes:
+                        print(
+                            "  learning: optimizer_updates="
+                            f"{int(getattr(self.trainer, 'updates', 0))} "
+                            "(+0; baseline evaluation only)",
+                            flush=True,
+                        )
+                        if baseline_training_required:
+                            print(
+                                "  baseline: the current policy passes, but "
+                                "this fresh learned run requires "
+                                f"{int(active['minimum_training_rounds'])} "
+                                "real training round(s) and at least "
+                                f"{int(active['minimum_optimizer_updates'])} "
+                                "optimizer update(s) before promotion.",
+                                flush=True,
+                            )
+                        if _promotion_ready(active, self.promotion_passes):
                             result = StageResult(
                                 stage=stage.name,
                                 pool_size=int(active["active_pool_size"]),
@@ -3049,7 +3335,7 @@ class CurriculumRunner:
                             self._force_replay_refill = True
                             self._save_progress("training", None)
                             print(
-                                "  baseline: the saved model already "
+                                "  baseline: the current policy already "
                                 "meets every promotion requirement.",
                                 flush=True,
                             )
@@ -3135,6 +3421,9 @@ class CurriculumRunner:
                                 ),
                                 flush=True,
                             )
+                        updates_before_round = int(
+                            getattr(self.trainer, "updates", 0)
+                        )
                         training_started = time.perf_counter()
                         if active["needs_replay_refill"]:
                             ready = max(
@@ -3182,6 +3471,15 @@ class CurriculumRunner:
                         for group in episode_plan():
                             record_outcome(run_source(group))
 
+                        updates_after_round = int(
+                            getattr(self.trainer, "updates", 0)
+                        )
+                        active["optimizer_updates_completed"] = int(
+                            active.get("optimizer_updates_completed", 0)
+                        ) + max(
+                            0,
+                            updates_after_round - updates_before_round,
+                        )
                         self.trainer.synchronize()
                         training_seconds = (
                             time.perf_counter() - training_started
@@ -3262,27 +3560,20 @@ class CurriculumRunner:
                         active["streak"] = (
                             int(active["streak"]) + 1 if passed else 0
                         )
-                        improved = (
-                            not active["best_rank"]
-                            or rank > tuple(active["best_rank"])
-                        )
                         regressed = (
                             bool(active["best_rank"])
                             and rank < tuple(active["best_rank"])
                         )
-                        if improved:
-                            active["best_rank"] = rank
-                            active["best_round"] = active["total_rounds"]
-                            active["best_training"] = training_eval
-                            active["best_validation"] = validation_eval
-                            active["best_retention"] = retention_eval
-                            active["best_failures"] = failures
-                            active["best_retention_deficits"] = dict(
-                                retention_deficits
-                            )
-                            active["best_learner_state"] = (
-                                self.trainer.learner_state()
-                            )
+                        _save_trained_best(
+                            active,
+                            rank=rank,
+                            training=training_eval,
+                            validation=validation_eval,
+                            retention=retention_eval,
+                            failures=failures,
+                            retention_deficits=retention_deficits,
+                            learner_state=self.trainer.learner_state,
+                        )
                         if protect_best and regressed:
                             active["consolidation_bad_rounds"] = (
                                 int(active["consolidation_bad_rounds"]) + 1
@@ -3320,6 +3611,10 @@ class CurriculumRunner:
                                     bridge_falls=plot_bridge_falls,
                                     crate_switches=plot_crate_switches,
                                     resets=plot_resets,
+                                    updates=plot_updates,
+                                    td_losses=plot_td_losses,
+                                    total_losses=plot_total_losses,
+                                    grad_norms=plot_grad_norms,
                                     force=True,
                                 )
                         plot_seconds = time.perf_counter() - plot_started
@@ -3340,15 +3635,30 @@ class CurriculumRunner:
                             failures,
                             phase,
                         )
+                        learning = _learning_metrics(self.trainer)
+                        def metric_text(name: str) -> str:
+                            value = learning[name]
+                            return "n/a" if value != value else f"{value:.5g}"
+
+                        print(
+                            "  learning: optimizer_updates="
+                            f"{updates_after_round} "
+                            f"(+{updates_after_round - updates_before_round}) "
+                            f"td_loss={metric_text('td_loss')} "
+                            f"total_loss={metric_text('total_loss')} "
+                            f"grad_norm={metric_text('grad_norm')}",
+                            flush=True,
+                        )
                         best_training = active["best_training"]
                         if not isinstance(best_training, Evaluation):
                             raise RuntimeError("best training evaluation was not saved")
                         best_validation = active["best_validation"]
                         best_retention = active["best_retention"]
 
-                        if int(active["streak"]) >= self.promotion_passes:
+                        if _promotion_ready(active, self.promotion_passes):
                             self.trainer.load_learner_state(
-                                active["best_learner_state"]
+                                active["best_learner_state"],
+                                clear_learning_metrics=False,
                             )
                             if int(active["best_round"]) != int(
                                 active["total_rounds"]
@@ -3610,6 +3920,7 @@ class CurriculumRunner:
                 max_steps=self.trainer.cfg.max_steps,
                 shaping_gamma=self.trainer.cfg.gamma,
                 record_metrics=False,
+                policy_mode=_environment_policy_mode(self.trainer),
             )
             test_env.set_room_cache_limit(self.test_size)
             test_env.cache_rooms(room for _, room in generated)
@@ -3747,6 +4058,7 @@ def make_runner(
         max_steps=training_config.max_steps,
         shaping_gamma=training_config.gamma,
         record_metrics=False,
+        policy_mode=_environment_policy_mode(training_config),
     )
     trainer = Trainer(env, training_config)
     kwargs.setdefault("require_full_coverage", stages is None)

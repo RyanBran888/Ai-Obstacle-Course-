@@ -59,6 +59,25 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="consecutive passing greedy evaluations needed to advance",
     )
+    parser.add_argument(
+        "--minimum-fresh-training-rounds",
+        type=int,
+        default=1,
+        help=(
+            "minimum real training rounds before a fresh learned policy may "
+            "leave its first curriculum pool"
+        ),
+    )
+    parser.add_argument(
+        "--policy-mode",
+        choices=("learned", "assisted"),
+        default="learned",
+        help=(
+            "learned hides exact route-action and future-safety answers "
+            "(default); assisted preserves the legacy planner-guided policy "
+            "for compatibility/diagnostics"
+        ),
+    )
     parser.add_argument("--validation-seeds", type=int, default=64)
     parser.add_argument(
         "--test-seeds",
@@ -212,6 +231,31 @@ def _payload_sha256(payload: Mapping[str, Any]) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _trainer_learning_report(trainer: Any) -> dict[str, Any]:
+    def metrics(attribute: str) -> dict[str, float]:
+        candidate = getattr(trainer, attribute, None)
+        if callable(candidate):
+            candidate = candidate()
+        if not isinstance(candidate, Mapping):
+            return {}
+        values: dict[str, float] = {}
+        for name, raw_value in candidate.items():
+            try:
+                values[str(name)] = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+        return values
+
+    return {
+        "policy_mode": str(getattr(trainer, "policy_mode", "unknown")),
+        "episodes": int(getattr(trainer, "episodes", 0)),
+        "environment_steps": int(getattr(trainer, "env_steps", 0)),
+        "optimizer_updates": int(getattr(trainer, "updates", 0)),
+        "latest_metrics": metrics("latest_learning_metrics"),
+        "rolling_metrics": metrics("rolling_learning_metrics"),
+    }
 
 
 def _source_hashes() -> dict[str, str]:
@@ -657,10 +701,49 @@ def main() -> None:
                     "recovery source-upgrade provenance is invalid"
                 )
             source_upgrade_info = dict(recovered_source_upgrade)
+    training_honesty_info: dict[str, Any] | None = None
+    if resume_payload is not None:
+        recovered_honesty = resume_external.get("training_honesty")
+        if recovered_honesty is not None:
+            if not isinstance(recovered_honesty, dict):
+                raise ValueError(
+                    "recovery training-honesty provenance is invalid"
+                )
+            training_honesty_info = dict(recovered_honesty)
+            required_rounds = int(
+                training_honesty_info["minimum_fresh_training_rounds"]
+            )
+            if args.minimum_fresh_training_rounds != required_rounds:
+                raise ValueError(
+                    "recovery requires --minimum-fresh-training-rounds "
+                    f"{required_rounds}; received "
+                    f"{args.minimum_fresh_training_rounds}"
+                )
+    else:
+        training_honesty_info = {
+            "minimum_fresh_training_rounds": (
+                args.minimum_fresh_training_rounds
+            ),
+        }
+    if warm_start_payload is not None:
+        warm_contract = warm_start_payload.get("contract", {})
+        warm_trainer = warm_contract.get("trainer", {})
+        warm_policy_mode = str(warm_trainer.get("policy_mode", "assisted"))
+        if args.policy_mode != warm_policy_mode:
+            raise ValueError(
+                f"warm start requires --policy-mode {warm_policy_mode}; "
+                f"received {args.policy_mode}"
+            )
     if resume_payload is not None:
         saved_contract = resume_payload.get("contract", {})
         saved_trainer = saved_contract.get("trainer", {})
         saved_request = saved_trainer.get("device")
+        saved_policy_mode = str(saved_trainer.get("policy_mode", "assisted"))
+        if args.policy_mode != saved_policy_mode:
+            raise ValueError(
+                f"recovery requires --policy-mode {saved_policy_mode}; "
+                f"received {args.policy_mode}"
+            )
         if args.device != saved_request:
             raise ValueError(
                 f"recovery requires --device {saved_request}; "
@@ -684,6 +767,7 @@ def main() -> None:
         max_steps=args.max_steps,
         device=args.device,
         seed=args.seed,
+        policy_mode=args.policy_mode,
     )
     runner = make_runner(
         cfg,
@@ -698,6 +782,7 @@ def main() -> None:
         plot_max_points=args.plot_max_points,
         graph_path=str(graph_path),
         promotion_passes=args.promotion_passes,
+        minimum_fresh_training_rounds=args.minimum_fresh_training_rounds,
         retention_size=args.validation_seeds,
         recovery_rounds=args.recovery_rounds,
         recovery_pool_max=args.recovery_pool_max,
@@ -708,6 +793,11 @@ def main() -> None:
             "source_sha256": source_hashes,
             "warm_start": warm_start_info,
             "source_upgrade": source_upgrade_info,
+            **(
+                {"training_honesty": training_honesty_info}
+                if training_honesty_info is not None
+                else {}
+            ),
         },
         extend_stopped_rounds=args.extend_stopped_rounds,
         retention_upgrade=args.resume_retention_upgrade,
@@ -749,6 +839,16 @@ def main() -> None:
             f"{manifest_path} exists but this recovery state is still training"
         )
     print(f"Training on {runner.trainer.device}")
+    print(
+        "Policy mode: "
+        f"{runner.trainer.policy_mode} "
+        + (
+            "(route/safety oracles hidden; network actions and TD learning)"
+            if runner.trainer.policy_mode == "learned"
+            else "(legacy planner assistance enabled)"
+        ),
+        flush=True,
+    )
     if runner.recovery_status == "test_started" and not args.final_test:
         raise ValueError(
             "this recovery state has a sealed partial final test; "
@@ -902,10 +1002,13 @@ def main() -> None:
         "final_test_evaluated": bool(runner.test_results),
         "run_seed": args.seed,
         "data_seed": args.data_seed,
+        "policy_mode": args.policy_mode,
         "source_sha256": source_hashes,
         "training_coverage": list(runner.training_features),
         "training_config": asdict(cfg),
+        "learning": _trainer_learning_report(runner.trainer),
         "model_contract": {
+            "policy_mode": args.policy_mode,
             "schema": OBSERVATION_SCHEMA,
             "obs_dim": OBS_DIM,
             "actions": list(ACTIONS),
@@ -927,6 +1030,12 @@ def main() -> None:
         "designer_maps": designer_maps,
         "graph": {
             "path": str(graph_path) if graph_path.is_file() else None,
+            "learning_telemetry": [
+                "optimizer_updates",
+                "td_loss",
+                "total_loss",
+                "gradient_norm",
+            ],
             "scope": (
                 "post_resume_segment"
                 if resume_path is not None
@@ -985,6 +1094,9 @@ def main() -> None:
             "minimum_success_rate": 0.50,
         },
         "promotion_passes": runner.promotion_passes,
+        "minimum_fresh_training_rounds": (
+            runner.minimum_fresh_training_rounds
+        ),
         "recovery": {
             "state": str(progress_path),
             "replay_restored": False,

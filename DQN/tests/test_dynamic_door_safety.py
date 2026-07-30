@@ -19,7 +19,11 @@ from helpers import (  # pyright: ignore[reportMissingImports]  # noqa: E402
 from coop_env import RoomGenerator, Vec2  # noqa: E402
 from coop_env.entities import PushableBlock, WipeoutBall  # noqa: E402
 from DQN.curriculum import CurriculumRunner, default_stages  # noqa: E402
-from DQN.env_bridge import CoopEnvBridge, WAIT  # noqa: E402
+from DQN.env_bridge import (  # noqa: E402
+    POLICY_MODE_ASSISTED,
+    CoopEnvBridge,
+    WAIT,
+)
 
 
 EAST = 1
@@ -38,7 +42,11 @@ def with_stationary_ball(room, *entities):
 
 class TestProjectedHoldDoorSafety(unittest.TestCase):
     def make_env(self, room) -> CoopEnvBridge:
-        env = CoopEnvBridge(max_steps=40, record_metrics=False)
+        env = CoopEnvBridge(
+            max_steps=40,
+            record_metrics=False,
+            policy_mode=POLICY_MODE_ASSISTED,
+        )
         env.load_room(room)
         return env
 
@@ -116,6 +124,7 @@ class TestProjectedHoldDoorSafety(unittest.TestCase):
             seed=16,
             max_steps=200,
             record_metrics=False,
+            policy_mode=POLICY_MODE_ASSISTED,
         )
         env.load_room(room)
 

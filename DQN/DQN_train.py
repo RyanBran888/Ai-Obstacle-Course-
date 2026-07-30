@@ -16,17 +16,21 @@ from env_bridge import CoopEnvBridge, GenerationConfig
 from DQN.DQN_model import (
     ACTIONS,
     ACTION_SAFETY_CONTRACT,
+    ASSISTED_POLICY_CONTRACT,
+    ASSISTED_POLICY_MODE,
     CHANNEL_NAMES,
     GLOBAL_NAMES,
     HIDDEN,
+    LEARNED_POLICY_CONTRACT,
+    LEARNED_POLICY_MODE,
     N_ACTIONS,
     OBS_DIM,
     OBSERVATION_SCHEMA,
     LEGACY_POLICY_CONTRACT,
-    POLICY_CONTRACT,
+    POLICY_MODES,
     QNetwork,
+    action_scores,
     action_mask,
-    policy_scores,
     route_actions,
 )
 
@@ -84,8 +88,38 @@ def _action_masks(
 
 
 def _environment_action_masks(env, observations) -> np.ndarray:
+    return _environment_action_masks_for_modes(
+        env,
+        observations,
+        [ASSISTED_POLICY_MODE] * len(observations),
+    )
+
+
+def _environment_action_masks_for_modes(
+    env,
+    observations,
+    policy_modes: Sequence[str],
+) -> np.ndarray:
+    if len(policy_modes) != len(observations):
+        raise ValueError("policy mode count does not match observations")
+    use_safety = [
+        mode == ASSISTED_POLICY_MODE
+        for mode in policy_modes
+    ]
     provider = getattr(env, "wipeout_action_masks", None)
-    safety_masks = provider() if callable(provider) else None
+    provided: Any = (
+        provider()
+        if any(use_safety) and callable(provider)
+        else None
+    )
+    safety_masks = (
+        [
+            provided[index] if use_safety[index] else None
+            for index in range(len(observations))
+        ]
+        if provided is not None
+        else None
+    )
     return _action_masks(observations, safety_masks)
 
 
@@ -93,8 +127,9 @@ def _masked_policy_scores(
     q_values: torch.Tensor,
     observations: torch.Tensor,
     valid_masks=None,
+    policy_mode: str = LEARNED_POLICY_MODE,
 ) -> torch.Tensor:
-    scores = policy_scores(q_values, observations)
+    scores = action_scores(q_values, observations, policy_mode)
     if valid_masks is None:
         return scores
     masks = torch.as_tensor(
@@ -161,6 +196,52 @@ def _route_auxiliary_loss(
     ).mean()
 
 
+def _normalize_policy_mode(value: str) -> str:
+    mode = str(value).strip().lower()
+    if mode not in POLICY_MODES:
+        raise ValueError(
+            f"policy_mode must be one of {POLICY_MODES}, got {value!r}"
+        )
+    return mode
+
+
+def _policy_contract(mode: str) -> dict[str, Any]:
+    normalized = _normalize_policy_mode(mode)
+    if normalized == LEARNED_POLICY_MODE:
+        return dict(LEARNED_POLICY_CONTRACT)
+    return dict(ASSISTED_POLICY_CONTRACT)
+
+
+def _checkpoint_policy_mode(checkpoint: Mapping[str, Any]) -> str:
+    """Resolve explicit new checkpoints and implicit historical checkpoints."""
+    explicit = checkpoint.get("policy_mode")
+    contract = checkpoint.get("policy")
+    if explicit is not None:
+        mode = _normalize_policy_mode(str(explicit))
+        expected = (
+            LEARNED_POLICY_CONTRACT
+            if mode == LEARNED_POLICY_MODE
+            else ASSISTED_POLICY_CONTRACT
+        )
+        if contract != expected:
+            raise ValueError(
+                "checkpoint policy mode and policy contract do not match"
+            )
+        return mode
+
+    if contract == LEARNED_POLICY_CONTRACT:
+        return LEARNED_POLICY_MODE
+    if contract in (
+        None,
+        ASSISTED_POLICY_CONTRACT,
+        LEGACY_POLICY_CONTRACT,
+    ):
+        # Before policy_mode was serialized, every action path used the
+        # planner-assisted scorer. Treat absent metadata the same way.
+        return ASSISTED_POLICY_MODE
+    raise ValueError("checkpoint action policy does not match")
+
+
 def _cpu_copy(value):
     if isinstance(value, torch.Tensor):
         return value.detach().cpu().clone()
@@ -203,6 +284,7 @@ class Config:
     important_fraction: float = 0.25
     shared_net: bool = True
     seed: int = 0
+    policy_mode: str = LEARNED_POLICY_MODE
 
 
 def eps_at(step: int, cfg: Config) -> float:
@@ -826,12 +908,15 @@ class Agent:
         replay_capacity: int = 20_000,
         replay_seed: int = 0,
         important_fraction: float = 0.25,
+        policy_mode: str = LEARNED_POLICY_MODE,
     ) -> None:
         self.device = torch.device(device)
         self.gamma = gamma
         self.clip = clip
         self.important_fraction = important_fraction
+        self.policy_mode = _normalize_policy_mode(policy_mode)
         self.require_action_mask = False
+        self.latest_learning_metrics: dict[str, float] = {}
         self.replay_group_weights: dict[int, float] | None = None
         self.replay = ReplayBuffer(replay_capacity, obs_dim, replay_seed)
 
@@ -868,6 +953,7 @@ class Agent:
                 q_values,
                 batch,
                 masks,
+                self.policy_mode,
             ).argmax(dim=1).tolist()
         return [int(action) for action in actions]
 
@@ -903,7 +989,7 @@ class Agent:
             next_mask,
         )
 
-    def learn_batch(self, batch_size: int) -> None:
+    def learn_batch(self, batch_size: int) -> dict[str, float]:
         batch = self.replay.sample(
             batch_size,
             self.important_fraction,
@@ -944,20 +1030,42 @@ class Agent:
                 next_online,
                 next_obs_t,
                 next_masks_t,
+                self.policy_mode,
             ).argmax(dim=1, keepdim=True)
             next_q = self.target(next_obs_t).gather(1, best).squeeze(1)
             target = rewards_t + discount_t * next_q * (1.0 - terminal_t)
 
-        route_loss = _route_auxiliary_loss(
-            q_values,
-            obs_t,
-            current_masks_t,
+        td_loss = self.loss_fn(q, target)
+        route_loss = (
+            _route_auxiliary_loss(
+                q_values,
+                obs_t,
+                current_masks_t,
+            )
+            if self.policy_mode == ASSISTED_POLICY_MODE
+            else q_values.new_zeros(())
         )
-        loss = self.loss_fn(q, target) + _ROUTE_AUX_WEIGHT * route_loss
+        loss = td_loss + _ROUTE_AUX_WEIGHT * route_loss
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
-        nn.utils.clip_grad_norm_(self.net.parameters(), self.clip)
+        grad_norm = nn.utils.clip_grad_norm_(
+            self.net.parameters(),
+            self.clip,
+        )
         self.opt.step()
+        self.latest_learning_metrics = {
+            "total_loss": float(loss.detach().item()),
+            "td_loss": float(td_loss.detach().item()),
+            "route_aux_loss": float(route_loss.detach().item()),
+            "grad_norm": float(
+                grad_norm.detach().item()
+                if isinstance(grad_norm, torch.Tensor)
+                else grad_norm
+            ),
+            "q_mean": float(q.detach().mean().item()),
+            "q_abs_mean": float(q.detach().abs().mean().item()),
+        }
+        return dict(self.latest_learning_metrics)
 
     def save(self, path: str) -> None:
         torch.save(
@@ -969,8 +1077,13 @@ class Agent:
                 "actions": ACTIONS,
                 "channels": CHANNEL_NAMES,
                 "globals": GLOBAL_NAMES,
-                "policy": dict(POLICY_CONTRACT),
-                "action_safety": dict(ACTION_SAFETY_CONTRACT),
+                "policy_mode": self.policy_mode,
+                "policy": _policy_contract(self.policy_mode),
+                "action_safety": (
+                    dict(ACTION_SAFETY_CONTRACT)
+                    if self.policy_mode == ASSISTED_POLICY_MODE
+                    else None
+                ),
                 "net": self.net.state_dict(),
                 "target": self.target.state_dict(),
                 "opt": self.opt.state_dict(),
@@ -987,14 +1100,21 @@ class Agent:
             "actions": ACTIONS,
             "channels": CHANNEL_NAMES,
             "globals": GLOBAL_NAMES,
-            "policy": dict(POLICY_CONTRACT),
-            "action_safety": dict(ACTION_SAFETY_CONTRACT),
+            "policy_mode": self.policy_mode,
+            "policy": _policy_contract(self.policy_mode),
+            "action_safety": (
+                dict(ACTION_SAFETY_CONTRACT)
+                if self.policy_mode == ASSISTED_POLICY_MODE
+                else None
+            ),
             "net": _cpu_copy(self.net.state_dict()),
             "target": _cpu_copy(self.target.state_dict()),
             "opt": _cpu_copy(self.opt.state_dict()),
         }
 
     def load_learning_state(self, checkpoint: dict[str, Any]) -> None:
+        policy_mode = _checkpoint_policy_mode(checkpoint)
+        action_safety = checkpoint.get("action_safety")
         if (
             checkpoint.get("schema") != OBSERVATION_SCHEMA
             or checkpoint.get("obs_dim") != self.net.obs_dim
@@ -1003,10 +1123,13 @@ class Agent:
             or tuple(checkpoint.get("actions", ())) != ACTIONS
             or tuple(checkpoint.get("channels", ())) != CHANNEL_NAMES
             or tuple(checkpoint.get("globals", ())) != GLOBAL_NAMES
-            or checkpoint.get("action_safety") != ACTION_SAFETY_CONTRACT
             or (
-                checkpoint.get("policy") is not None
-                and checkpoint.get("policy") != POLICY_CONTRACT
+                policy_mode == ASSISTED_POLICY_MODE
+                and action_safety != ACTION_SAFETY_CONTRACT
+            )
+            or (
+                policy_mode == LEARNED_POLICY_MODE
+                and action_safety is not None
             )
         ):
             raise ValueError(
@@ -1016,10 +1139,14 @@ class Agent:
         self.target.load_state_dict(checkpoint["target"])
         self.opt.load_state_dict(checkpoint["opt"])
         _optimizer_to(self.opt, self.device)
-        self.require_action_mask = True
+        self.policy_mode = policy_mode
+        self.require_action_mask = action_safety is not None
+        self.latest_learning_metrics = {}
 
     def load(self, path: str) -> None:
         checkpoint = torch.load(path, map_location=self.device)
+        policy_mode = _checkpoint_policy_mode(checkpoint)
+        action_safety = checkpoint.get("action_safety")
         if (
             checkpoint.get("schema") != OBSERVATION_SCHEMA
             or checkpoint.get("obs_dim") != self.net.obs_dim
@@ -1028,12 +1155,10 @@ class Agent:
             or tuple(checkpoint.get("actions", ())) != ACTIONS
             or tuple(checkpoint.get("channels", ())) != CHANNEL_NAMES
             or tuple(checkpoint.get("globals", ())) != GLOBAL_NAMES
-            or checkpoint.get("action_safety")
-            not in (None, ACTION_SAFETY_CONTRACT)
+            or action_safety not in (None, ACTION_SAFETY_CONTRACT)
             or (
-                checkpoint.get("policy") is not None
-                and checkpoint.get("policy")
-                not in (POLICY_CONTRACT, LEGACY_POLICY_CONTRACT)
+                policy_mode == LEARNED_POLICY_MODE
+                and action_safety is not None
             )
         ):
             raise ValueError(
@@ -1046,7 +1171,10 @@ class Agent:
             self.sync()
         if "opt" in checkpoint:
             self.opt.load_state_dict(checkpoint["opt"])
-        self.require_action_mask = checkpoint.get("action_safety") is not None
+            _optimizer_to(self.opt, self.device)
+        self.policy_mode = policy_mode
+        self.require_action_mask = action_safety is not None
+        self.latest_learning_metrics = {}
 
     def _tensor(self, obs) -> torch.Tensor:
         if isinstance(obs, torch.Tensor):
@@ -1242,6 +1370,7 @@ class Trainer:
         torch.manual_seed(self.cfg.seed)
 
         self.device = resolve_device(self.cfg.device)
+        self.policy_mode = _normalize_policy_mode(self.cfg.policy_mode)
         self.env = env
         self._configure_env(env)
 
@@ -1256,6 +1385,7 @@ class Trainer:
                 replay_capacity=self.cfg.replay_capacity,
                 replay_seed=replay_seed,
                 important_fraction=self.cfg.important_fraction,
+                policy_mode=self.policy_mode,
             )
 
         if self.cfg.shared_net:
@@ -1277,6 +1407,10 @@ class Trainer:
         self._reheat_from = 0.0
         self._reheat_steps = 0
         self.replay_group_weights: dict[int, float] | None = None
+        self.latest_learning_metrics: dict[str, float] = {}
+        self._learning_metrics_window: deque[dict[str, float]] = deque(
+            maxlen=100
+        )
 
     @staticmethod
     def _validate(cfg: Config) -> None:
@@ -1292,10 +1426,31 @@ class Trainer:
             raise ValueError("n_step must be at least 1")
         if not 0.0 <= cfg.important_fraction <= 1.0:
             raise ValueError("important_fraction must be between 0 and 1")
+        _normalize_policy_mode(cfg.policy_mode)
+
+    @property
+    def rolling_learning_metrics(self) -> dict[str, float]:
+        if not self._learning_metrics_window:
+            return {}
+        keys = self._learning_metrics_window[0]
+        return {
+            key: float(
+                np.mean(
+                    [
+                        metrics[key]
+                        for metrics in self._learning_metrics_window
+                    ]
+                )
+            )
+            for key in keys
+        }
 
     def _configure_env(self, env) -> None:
         if getattr(env, "max_steps", self.cfg.max_steps) != self.cfg.max_steps:
             raise ValueError("trainer and environment max_steps must match")
+        set_policy_mode = getattr(env, "set_policy_mode", None)
+        if callable(set_policy_mode):
+            set_policy_mode(self.policy_mode)
         if hasattr(env, "shaping_gamma"):
             env.shaping_gamma = self.cfg.gamma
 
@@ -1337,11 +1492,28 @@ class Trainer:
     def learner_state(self) -> list[dict[str, Any]]:
         return [learner.learning_state() for learner in self.learners]
 
-    def load_learner_state(self, states: Sequence[dict[str, Any]]) -> None:
+    def load_learner_state(
+        self,
+        states: Sequence[dict[str, Any]],
+        *,
+        clear_learning_metrics: bool = True,
+    ) -> None:
         if len(states) != len(self.learners):
             raise ValueError("recovery learner count does not match")
         for learner, state in zip(self.learners, states, strict=True):
             learner.load_learning_state(state)
+        modes = {learner.policy_mode for learner in self.learners}
+        if len(modes) != 1:
+            raise ValueError("recovery learners use different policy modes")
+        self.policy_mode = modes.pop()
+        for agent in self.agents:
+            if agent.policy_mode != self.policy_mode:
+                raise ValueError("recovery agents use different policy modes")
+        self.cfg.policy_mode = self.policy_mode
+        self._configure_env(self.env)
+        if clear_learning_metrics:
+            self.latest_learning_metrics = {}
+            self._learning_metrics_window.clear()
 
     def recovery_state(self) -> dict[str, Any]:
         if any(self._pending):
@@ -1516,7 +1688,11 @@ class Trainer:
         active_env = env or self.env
         self._configure_env(active_env)
         obs = active_env.reset(seed=seed) if seed is not None else active_env.reset()
-        current_masks = _environment_action_masks(active_env, obs)
+        current_masks = _environment_action_masks_for_modes(
+            active_env,
+            obs,
+            [agent.policy_mode for agent in self.agents],
+        )
         total = 0.0
         final_info: dict[str, Any] = {}
 
@@ -1533,7 +1709,11 @@ class Trainer:
             next_masks = (
                 _action_masks(next_obs)
                 if terminal
-                else _environment_action_masks(active_env, next_obs)
+                else _environment_action_masks_for_modes(
+                    active_env,
+                    next_obs,
+                    [agent.policy_mode for agent in self.agents],
+                )
             )
 
             if learn:
@@ -1566,8 +1746,24 @@ class Trainer:
                     and self.env_steps % self.cfg.train_every == 0
                     and len(self.learners[0].replay) >= ready
                 ):
-                    for learner in self.learners:
+                    learning_metrics = [
                         learner.learn_batch(self.cfg.batch_size)
+                        for learner in self.learners
+                    ]
+                    self.latest_learning_metrics = {
+                        key: float(
+                            np.mean(
+                                [
+                                    metrics[key]
+                                    for metrics in learning_metrics
+                                ]
+                            )
+                        )
+                        for key in learning_metrics[0]
+                    }
+                    self._learning_metrics_window.append(
+                        dict(self.latest_learning_metrics)
+                    )
                     self.updates += 1
                     if self.updates % self.cfg.target_sync_updates == 0:
                         for learner in self.learners:
@@ -1750,7 +1946,15 @@ def _evaluate_episodes(
     if not seeds:
         return []
 
+    policy_modes = {agent.policy_mode for agent in agents}
+    if len(policy_modes) != 1:
+        raise ValueError("evaluation agents use different policy modes")
+    policy_mode = policy_modes.pop()
     lanes = _evaluation_envs(env, min(batch_size, len(seeds)))
+    for lane in lanes:
+        set_policy_mode = getattr(lane, "set_policy_mode", None)
+        if callable(set_policy_mode):
+            set_policy_mode(policy_mode)
     lane_count = len(lanes)
     episodes: list[EvaluationEpisode] = []
     for start in range(0, len(seeds), lane_count):
@@ -1760,7 +1964,11 @@ def _evaluate_episodes(
             for index, seed in enumerate(group)
         ]
         action_masks_by_lane = [
-            _environment_action_masks(lanes[index], observation)
+            _environment_action_masks_for_modes(
+                lanes[index],
+                observation,
+                [agent.policy_mode for agent in agents],
+            )
             for index, observation in enumerate(observations)
         ]
         returns = [0.0] * len(group)
@@ -1795,9 +2003,10 @@ def _evaluate_episodes(
                     )
                 else:
                     action_masks_by_lane[active_index] = (
-                        _environment_action_masks(
+                        _environment_action_masks_for_modes(
                             lanes[active_index],
                             obs,
+                            [agent.policy_mode for agent in agents],
                         )
                     )
                     next_active.append(active_index)

@@ -14,9 +14,16 @@ def _pyplot(interactive: bool):
     if "matplotlib.pyplot" not in sys.modules:
         if interactive and sys.platform == "darwin":
             try:
-                matplotlib.use("TkAgg", force=True)
+                # The native backend avoids Tk's nested ``mainloop`` inside
+                # ``pyplot.pause``. Interrupting that loop on Python 3.13 can
+                # abort the process with PyEval_RestoreThread instead of
+                # raising a normal KeyboardInterrupt.
+                matplotlib.use("MacOSX", force=True)
             except ImportError:
-                pass
+                try:
+                    matplotlib.use("TkAgg", force=True)
+                except ImportError:
+                    pass
         elif not interactive:
             matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
@@ -69,7 +76,8 @@ class LivePlot:
         self.ax.legend(loc="lower right", framealpha=0.9)
         self.fig.tight_layout()
         self.plt.show(block=False)
-        self.plt.pause(0.1)
+        self.fig.canvas.draw_idle()
+        self.fig.canvas.flush_events()
 
     @property
     def backend(self) -> str:
@@ -95,7 +103,6 @@ class LivePlot:
     def pump(self) -> None:
         if self.on:
             self.fig.canvas.flush_events()
-            self.plt.pause(0.001)
 
     def close(self) -> None:
         if self.on:
@@ -126,9 +133,10 @@ class CurriculumPlot:
         self.max_points = max_points
         self.visible = interactive and self.plt.get_backend().lower() != "agg"
 
-        self.fig, axes = self.plt.subplots(2, 2, figsize=(12, 8))
+        self.fig, axes = self.plt.subplots(3, 2, figsize=(12, 11))
         self.reward_ax, self.success_ax = axes[0]
         self.steps_ax, self.eval_ax = axes[1]
+        self.learning_ax, self.updates_ax = axes[2]
         self.epsilon_ax = self.steps_ax.twinx()
 
         (self.reward_raw,) = self.reward_ax.plot(
@@ -178,6 +186,18 @@ class CurriculumPlot:
         (self.retention_eval,) = self.eval_ax.plot(
             [], [], marker="^", color="#2ca02c", label="prior-stage retention"
         )
+        (self.total_loss_line,) = self.learning_ax.plot(
+            [], [], lw=1.5, color="#6f42c1", label="total loss"
+        )
+        (self.td_loss_line,) = self.learning_ax.plot(
+            [], [], lw=1.5, color="#0366d6", label="TD loss"
+        )
+        (self.grad_norm_line,) = self.learning_ax.plot(
+            [], [], lw=1.2, color="#d73a49", label="gradient norm"
+        )
+        (self.updates_line,) = self.updates_ax.plot(
+            [], [], lw=1.8, color="#24292f", label="optimizer updates"
+        )
 
         self.eval_episodes: list[int] = []
         self.train_rates: list[float] = []
@@ -196,7 +216,8 @@ class CurriculumPlot:
         if self.visible:
             self.plt.ion()
             self.plt.show(block=False)
-            self.plt.pause(0.1)
+            self.fig.canvas.draw_idle()
+            self.fig.canvas.flush_events()
 
     @property
     def backend(self) -> str:
@@ -215,11 +236,17 @@ class CurriculumPlot:
         self.eval_ax.set_title("Greedy evaluation")
         self.eval_ax.set_ylabel("success rate")
         self.eval_ax.set_ylim(-0.02, 1.02)
+        self.learning_ax.set_title("Learning signal")
+        self.learning_ax.set_ylabel("rolling value")
+        self.updates_ax.set_title("Optimizer progress")
+        self.updates_ax.set_ylabel("cumulative updates")
         for axis in (
             self.reward_ax,
             self.success_ax,
             self.steps_ax,
             self.eval_ax,
+            self.learning_ax,
+            self.updates_ax,
         ):
             axis.set_xlabel("training episode")
             axis.grid(alpha=0.2)
@@ -228,6 +255,8 @@ class CurriculumPlot:
         lines = [self.steps_mean, self.epsilon_line]
         self.steps_ax.legend(lines, [line.get_label() for line in lines], loc="upper right")
         self.eval_ax.legend(loc="lower right")
+        self.learning_ax.legend(loc="upper right")
+        self.updates_ax.legend(loc="upper left")
         self.fig.tight_layout()
 
     def set_context(self, stage: str, pool_size: int) -> None:
@@ -242,7 +271,6 @@ class CurriculumPlot:
     def pump(self) -> None:
         if self.visible:
             self.fig.canvas.flush_events()
-            self.plt.pause(0.001)
 
     def mark_stage(self, episode: int, name: str) -> None:
         for axis in (
@@ -250,6 +278,8 @@ class CurriculumPlot:
             self.success_ax,
             self.steps_ax,
             self.eval_ax,
+            self.learning_ax,
+            self.updates_ax,
         ):
             axis.axvline(episode, lw=0.8, ls=":", color="#777", alpha=0.6)
         self.reward_ax.annotate(
@@ -289,6 +319,10 @@ class CurriculumPlot:
         bridge_falls: Sequence[float] | None = None,
         crate_switches: Sequence[float] | None = None,
         resets: Sequence[float] | None = None,
+        updates: Sequence[float] | None = None,
+        td_losses: Sequence[float] | None = None,
+        total_losses: Sequence[float] | None = None,
+        grad_norms: Sequence[float] | None = None,
         force: bool = False,
     ) -> None:
         if not returns or (not force and len(returns) % self.every):
@@ -340,8 +374,22 @@ class CurriculumPlot:
         self.train_eval.set_data(self.eval_episodes, self.train_rates)
         self.validation_eval.set_data(self.eval_episodes, self.validation_rates)
         self.retention_eval.set_data(self.eval_episodes, self.retention_rates)
+        if total_losses is not None:
+            self.total_loss_line.set_data(episodes, shown(total_losses))
+        if td_losses is not None:
+            self.td_loss_line.set_data(episodes, shown(td_losses))
+        if grad_norms is not None:
+            self.grad_norm_line.set_data(episodes, shown(grad_norms))
+        if updates is not None:
+            self.updates_line.set_data(episodes, shown(updates))
 
-        for axis in (self.reward_ax, self.steps_ax, self.eval_ax):
+        for axis in (
+            self.reward_ax,
+            self.steps_ax,
+            self.eval_ax,
+            self.learning_ax,
+            self.updates_ax,
+        ):
             axis.relim()
             axis.autoscale_view()
         self.success_ax.set_xlim(0, max(1, len(returns) - 1))

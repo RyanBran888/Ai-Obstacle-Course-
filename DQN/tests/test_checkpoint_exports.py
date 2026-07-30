@@ -11,7 +11,11 @@ sys.path.insert(0, str(ROOT / "DQN"))
 sys.path.insert(0, str(ROOT / "Architecture"))
 
 from DQN.DQN_train import Agent  # noqa: E402
-from DQN.load_model import load_agent, load_policy  # noqa: E402
+from DQN.load_model import (  # noqa: E402
+    configure_environment,
+    load_agent,
+    load_policy,
+)
 from DQN.run_curriculum import _export_checkpoint_bundle  # noqa: E402
 
 
@@ -88,6 +92,18 @@ class TestCheckpointExports(unittest.TestCase):
                 conflicting.read_bytes(),
                 b"not the frozen checkpoint",
             )
+
+    def test_manual_inference_helper_configures_the_environment(self):
+        class Environment:
+            policy_mode = None
+
+            def set_policy_mode(self, mode):
+                self.policy_mode = mode
+
+        policy = type("Policy", (), {"policy_mode": "learned"})()
+        env = Environment()
+        self.assertIs(configure_environment(policy, env), env)
+        self.assertEqual(env.policy_mode, "learned")
 
 
 if __name__ == "__main__":

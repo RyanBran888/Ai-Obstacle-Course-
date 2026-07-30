@@ -37,10 +37,13 @@ from coop_env.state import EpisodeState
 from coop_env.tiles import Tile, is_hazard
 
 from DQN.DQN_model import (
+    ASSISTED_POLICY_MODE,
     CHANNELS,
     GLOBALS,
+    LEARNED_POLICY_MODE,
     N_ACTIONS,
     OBS_DIM,
+    POLICY_MODES,
     VIEW,
     WIPEOUT_ACTION_MASK_HORIZON,
 )
@@ -108,6 +111,9 @@ R_TIMEOUT = -2.0
 
 SOLID = (Tile.VOID, Tile.WALL, Tile.OBSTACLE)
 TIME_SCALE = 64.0
+
+POLICY_MODE_LEARNED = LEARNED_POLICY_MODE
+POLICY_MODE_ASSISTED = ASSISTED_POLICY_MODE
 
 
 class _ProjectedWipeoutState:
@@ -209,11 +215,13 @@ class CoopEnvBridge:
         micro=None,
         shaping_gamma=0.99,
         record_metrics=True,
+        policy_mode: str = LEARNED_POLICY_MODE,
     ):
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1")
         if not 0.0 <= shaping_gamma <= 1.0:
             raise ValueError("shaping_gamma must be between 0 and 1")
+        self.set_policy_mode(policy_mode)
         self.cfg = config or GenerationConfig.preset("standard")
         self.sess = EnvironmentSession(self.cfg, master_seed=seed)
         self.max_steps = max_steps
@@ -281,6 +289,26 @@ class CoopEnvBridge:
         self.metrics_history: list[dict[str, Any]] = []
         self._terminated = False
         self._metrics_recorded = False
+
+    def set_policy_mode(self, policy_mode: str) -> None:
+        """Select what teacher information the acting policy may consume.
+
+        Learned mode is the default for fresh training. It keeps the exact
+        planner available internally for goal conditioning and potential-based
+        reward shaping, but does not expose its next route action or recursive
+        future-survival mask. Legacy-assisted mode preserves those features for
+        checkpoints trained under the older policy contract.
+        """
+        if policy_mode not in POLICY_MODES:
+            choices = ", ".join(sorted(POLICY_MODES))
+            raise ValueError(
+                f"unknown policy mode {policy_mode!r}; expected one of: {choices}"
+            )
+        self.policy_mode = policy_mode
+
+    @property
+    def legacy_assistance_enabled(self) -> bool:
+        return self.policy_mode == ASSISTED_POLICY_MODE
 
 
     def reset(self, seed=None):
@@ -593,6 +621,11 @@ class CoopEnvBridge:
         if action_index == INTERACT:
             return self._use(i)
         if action_index == WAIT:
+            if not self.legacy_assistance_enabled:
+                # Waiting is an ordinary learned action.  Do not use the
+                # planner's next-step answer to decide whether it deserves an
+                # additional idle penalty.
+                return 0.0, None
             _, _, delta, _, _, _, route_wait = self._goal_info(i)
             if route_wait or delta == Vec2(0, 0):
                 return 0.0, None
@@ -718,6 +751,12 @@ class CoopEnvBridge:
             raise RuntimeError("call reset() before requesting action masks")
         if horizon < 1:
             raise ValueError("wipeout action-mask horizon must be positive")
+        if not self.legacy_assistance_enabled:
+            # The trainer combines this neutral mask with ordinary semantic
+            # action validity. Fresh agents must learn moving-hazard behavior
+            # from observations and outcomes rather than a recursive oracle.
+            neutral = (True,) * N_ACTIONS
+            return (neutral,) * N_AGENTS
         if not self._wipeout_danger_phases:
             safe = (True,) * N_ACTIONS
             return (safe,) * N_AGENTS
@@ -1987,6 +2026,11 @@ class CoopEnvBridge:
             bridge_on_ticks = bridge.on_ticks
             bridge_off_ticks = bridge.period - bridge.on_ticks
 
+        observed_route = route if self.legacy_assistance_enabled else Vec2(0, 0)
+        observed_route_wait = (
+            route_wait if self.legacy_assistance_enabled else False
+        )
+
         def completed_keys(keys_for_agent):
             if not keys_for_agent:
                 return 1.0
@@ -2008,8 +2052,8 @@ class CoopEnvBridge:
             (mate[1] - me[1]) / height,
             delta[0] / width,
             delta[1] / height,
-            float(route[0]),
-            float(route[1]),
+            float(observed_route[0]),
+            float(observed_route[1]),
             min(1.0, distance / max(1, self.max_steps)),
             float(reachable),
             float(kind == "key"),
@@ -2038,7 +2082,7 @@ class CoopEnvBridge:
             completed_keys(teammate_keys),
             opened_doors(own_doors),
             opened_doors(teammate_doors),
-            float(route_wait),
+            float(observed_route_wait),
             timed_delta[0] / width,
             timed_delta[1] / height,
             float(timed_door is not None),

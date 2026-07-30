@@ -119,11 +119,17 @@ ACTION_SAFETY_CONTRACT = {
     "wipeout_action_mask_horizon": WIPEOUT_ACTION_MASK_HORIZON,
     "mask_source": "authoritative_environment_state",
 }
+LEARNED_POLICY_MODE = "learned"
+ASSISTED_POLICY_MODE = "assisted"
+POLICY_MODES = (LEARNED_POLICY_MODE, ASSISTED_POLICY_MODE)
 LEGACY_POLICY_CONTRACT = {
     "version": 1,
     "route_q_bias": ROUTE_Q_BIAS,
     "mask_invalid_interact": True,
 }
+# This is the assisted policy-v2 contract used by the existing agent-7
+# checkpoints. Keep its value stable so those checkpoints retain their exact
+# historical action-selection behavior.
 POLICY_CONTRACT = {
     "version": 2,
     "route_q_bias": ROUTE_Q_BIAS,
@@ -135,6 +141,16 @@ POLICY_CONTRACT = {
         "on_goal",
         "route_wait",
     ),
+    "mask_invalid_interact": True,
+}
+ASSISTED_POLICY_CONTRACT = POLICY_CONTRACT
+LEARNED_POLICY_CONTRACT = {
+    "version": 3,
+    "mode": LEARNED_POLICY_MODE,
+    "action_scores": "raw_masked_q",
+    "double_dqn_next_action": "raw_masked_online_q",
+    "route_auxiliary_loss": False,
+    "future_survival_action_mask": False,
     "mask_invalid_interact": True,
 }
 
@@ -203,6 +219,12 @@ def policy_scores(
     q_values: torch.Tensor,
     observations: torch.Tensor,
 ) -> torch.Tensor:
+    """Return the historical assisted-policy scores.
+
+    This function intentionally retains the route and hold-wait bonuses used
+    by policy-v2 checkpoints. New learned-only agents use
+    :func:`learned_policy_scores` instead.
+    """
     single = observations.ndim == 1
     batch = observations.unsqueeze(0) if single else observations
     scores = q_values.unsqueeze(0).clone() if single else q_values.clone()
@@ -215,6 +237,33 @@ def policy_scores(
         scores[hold_rows, _WAIT_ACTION] += HOLD_WAIT_Q_BIAS
     scores = scores.masked_fill(~action_mask(batch), -torch.inf)
     return scores.squeeze(0) if single else scores
+
+
+def learned_policy_scores(
+    q_values: torch.Tensor,
+    observations: torch.Tensor,
+) -> torch.Tensor:
+    """Mask only semantically invalid actions without altering learned Q."""
+    single = observations.ndim == 1
+    batch = observations.unsqueeze(0) if single else observations
+    scores = q_values.unsqueeze(0).clone() if single else q_values.clone()
+    scores = scores.masked_fill(~action_mask(batch), -torch.inf)
+    return scores.squeeze(0) if single else scores
+
+
+def action_scores(
+    q_values: torch.Tensor,
+    observations: torch.Tensor,
+    policy_mode: str = LEARNED_POLICY_MODE,
+) -> torch.Tensor:
+    """Return action scores for an explicit learned or assisted contract."""
+    if policy_mode == LEARNED_POLICY_MODE:
+        return learned_policy_scores(q_values, observations)
+    if policy_mode == ASSISTED_POLICY_MODE:
+        return policy_scores(q_values, observations)
+    raise ValueError(
+        f"policy_mode must be one of {POLICY_MODES}, got {policy_mode!r}"
+    )
 
 
 class QNetwork(nn.Module):
@@ -256,11 +305,21 @@ class QNetwork(nn.Module):
         return self.forward(obs).squeeze(0)
 
     @torch.no_grad()
-    def best(self, obs: torch.Tensor) -> int:
-        return int(policy_scores(self.q_values(obs), obs).argmax().item())
+    def best(
+        self,
+        obs: torch.Tensor,
+        policy_mode: str = LEARNED_POLICY_MODE,
+    ) -> int:
+        scores = action_scores(self.q_values(obs), obs, policy_mode)
+        return int(scores.argmax().item())
 
-    def act(self, obs: torch.Tensor, eps: float) -> int:
+    def act(
+        self,
+        obs: torch.Tensor,
+        eps: float,
+        policy_mode: str = LEARNED_POLICY_MODE,
+    ) -> int:
         if random.random() < eps:
             valid = action_mask(obs).nonzero().flatten().tolist()
             return random.choice(valid)
-        return self.best(obs)
+        return self.best(obs, policy_mode)
