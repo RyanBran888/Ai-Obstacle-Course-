@@ -132,6 +132,29 @@ class CurriculumPlot:
         (self.success_mean,) = self.success_ax.plot(
             [], [], lw=2.0, color="#238636", label=f"{metric_window}-episode success"
         )
+        (self.death_mean,) = self.success_ax.plot(
+            [],
+            [],
+            lw=1.5,
+            color="#d73a49",
+            label=f"{metric_window}-episode wipeout rate",
+        )
+        (self.hazard_mean,) = self.success_ax.plot(
+            [], [], lw=1.2, color="#e67e22",
+            label=f"{metric_window}-episode hazard rate",
+        )
+        (self.bridge_fall_mean,) = self.success_ax.plot(
+            [], [], lw=1.2, color="#8e44ad",
+            label=f"{metric_window}-episode bridge-fall rate",
+        )
+        (self.crate_mean,) = self.success_ax.plot(
+            [], [], lw=1.2, ls="--", color="#2980b9",
+            label=f"{metric_window}-episode crate-solve rate",
+        )
+        (self.reset_mean,) = self.success_ax.plot(
+            [], [], lw=1.2, ls="--", color="#7f8c8d",
+            label=f"{metric_window}-episode reset rate",
+        )
         (self.steps_mean,) = self.steps_ax.plot(
             [], [], lw=2.0, color="#8e44ad", label=f"{metric_window}-episode steps"
         )
@@ -144,10 +167,14 @@ class CurriculumPlot:
         (self.validation_eval,) = self.eval_ax.plot(
             [], [], marker="s", color="#ff7f0e", label="greedy validation seeds"
         )
+        (self.retention_eval,) = self.eval_ax.plot(
+            [], [], marker="^", color="#2ca02c", label="prior-stage retention"
+        )
 
         self.eval_episodes: list[int] = []
         self.train_rates: list[float] = []
         self.validation_rates: list[float] = []
+        self.retention_rates: list[float] = []
         self._format_axes()
 
         if self.visible:
@@ -162,7 +189,7 @@ class CurriculumPlot:
     def _format_axes(self) -> None:
         self.reward_ax.set_title("Reward")
         self.reward_ax.set_ylabel("return")
-        self.success_ax.set_title("Training success")
+        self.success_ax.set_title("Training outcomes")
         self.success_ax.set_ylabel("rolling rate")
         self.success_ax.set_ylim(-0.02, 1.02)
         self.steps_ax.set_title("Episode length and exploration")
@@ -191,6 +218,16 @@ class CurriculumPlot:
         self.fig.suptitle(f"Curriculum: {stage} — {pool_size} training seeds")
         self.fig.tight_layout(rect=(0, 0, 1, 0.96))
 
+    def set_status(self, status: str) -> None:
+        self.fig.suptitle(status)
+        self.fig.canvas.draw_idle()
+        self.pump()
+
+    def pump(self) -> None:
+        if self.visible:
+            self.fig.canvas.flush_events()
+            self.plt.pause(0.001)
+
     def mark_stage(self, episode: int, name: str) -> None:
         for axis in (
             self.reward_ax,
@@ -213,20 +250,29 @@ class CurriculumPlot:
         episode: int,
         training_rate: float,
         validation_rate: float | None,
+        retention_rate: float | None = None,
     ) -> None:
         self.eval_episodes.append(episode)
         self.train_rates.append(training_rate)
         self.validation_rates.append(
             float("nan") if validation_rate is None else validation_rate
         )
+        self.retention_rates.append(
+            float("nan") if retention_rate is None else retention_rate
+        )
 
     def update(
         self,
         returns: list[float],
         completed: list[float],
+        deaths: list[float],
         steps: list[float],
         epsilons: list[float],
         *,
+        hazards: list[float] | None = None,
+        bridge_falls: list[float] | None = None,
+        crate_switches: list[float] | None = None,
+        resets: list[float] | None = None,
         force: bool = False,
     ) -> None:
         if not returns or (not force and len(returns) % self.every):
@@ -237,10 +283,27 @@ class CurriculumPlot:
         self.success_mean.set_data(
             episodes, running_mean(completed, self.metric_window)
         )
+        self.death_mean.set_data(
+            episodes, running_mean(deaths, self.metric_window)
+        )
+        zeros = [0.0] * len(returns)
+        self.hazard_mean.set_data(
+            episodes, running_mean(hazards or zeros, self.metric_window)
+        )
+        self.bridge_fall_mean.set_data(
+            episodes, running_mean(bridge_falls or zeros, self.metric_window)
+        )
+        self.crate_mean.set_data(
+            episodes, running_mean(crate_switches or zeros, self.metric_window)
+        )
+        self.reset_mean.set_data(
+            episodes, running_mean(resets or zeros, self.metric_window)
+        )
         self.steps_mean.set_data(episodes, running_mean(steps, self.metric_window))
         self.epsilon_line.set_data(episodes, epsilons)
         self.train_eval.set_data(self.eval_episodes, self.train_rates)
         self.validation_eval.set_data(self.eval_episodes, self.validation_rates)
+        self.retention_eval.set_data(self.eval_episodes, self.retention_rates)
 
         for axis in (self.reward_ax, self.steps_ax, self.eval_ax):
             axis.relim()
@@ -249,9 +312,7 @@ class CurriculumPlot:
         self.steps_ax.set_xlim(0, max(1, len(returns) - 1))
         self.epsilon_ax.set_xlim(0, max(1, len(returns) - 1))
         self.fig.canvas.draw_idle()
-        if self.visible:
-            self.fig.canvas.flush_events()
-            self.plt.pause(0.001)
+        self.pump()
 
     def save(self, path: str) -> None:
         self.fig.savefig(path, dpi=150)

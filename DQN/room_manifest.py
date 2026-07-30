@@ -12,8 +12,19 @@ from typing import Any, Protocol
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "Architecture"))
 
 import coop_env
-from coop_env import GenerationConfig, Room, RoomGenerator
+from coop_env import (
+    EntityKind,
+    GenerationConfig,
+    Room,
+    RoomGenerator,
+    RoomShape,
+    SwitchMode,
+    Tile,
+    WipeoutBallSize,
+)
+from coop_env.generation import GateKind
 from coop_env.rng import derive_seed
+from coop_env.tiles import HAZARD_TILES, tile_name
 
 
 class RoomStage(Protocol):
@@ -25,6 +36,9 @@ class RoomStage(Protocol):
 
     @property
     def accepts(self) -> Callable[[Room], bool]: ...
+
+    @property
+    def required_features(self) -> tuple[str, ...]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +52,7 @@ class RoomRecord:
     height: int
     shape: str
     counts: tuple[tuple[str, int], ...]
+    features: tuple[str, ...]
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -50,6 +65,7 @@ class RoomRecord:
             "height": self.height,
             "shape": self.shape,
             "counts": dict(self.counts),
+            "features": list(self.features),
         }
 
 
@@ -95,7 +111,7 @@ class CurriculumRoomManifest:
     data_seed: int
     stages: tuple[StageRoomManifest, ...]
     generator_version: str = coop_env.__version__
-    schema_version: int = 1
+    schema_version: int = 3
 
     def stage(self, name: str) -> StageRoomManifest:
         for stage in self.stages:
@@ -180,6 +196,7 @@ def build_manifest_suite(
     train_size: int,
     validation_size: int,
     test_size: int,
+    progress: Callable[[str], None] | None = None,
 ) -> CurriculumRoomManifest:
     if min(train_size, validation_size, test_size) < 1:
         raise ValueError("room split sizes must be positive")
@@ -188,33 +205,44 @@ def build_manifest_suite(
     if len({stage.name for stage in stages}) != len(stages):
         raise ValueError("curriculum stage names must be unique")
 
-    generators = [RoomGenerator(stage.config) for stage in stages]
     buckets: dict[str, dict[str, list[RoomRecord]]] = {
         stage.name: {"train": [], "validation": [], "test": []}
         for stage in stages
     }
     used_seeds: set[int] = set()
-    used_geometry: set[str] = set()
+    used_navigation: set[str] = set()
     used_tasks: set[str] = set()
 
-    for split, count in (
-        ("test", test_size),
-        ("validation", validation_size),
-        ("train", train_size),
-    ):
-        accepted = 0
-        attempt = 0
-        while accepted < count:
-            if attempt >= count * 1_000:
-                raise RuntimeError(f"could not generate enough {split} room families")
-            seed = derive_seed(data_seed, f"curriculum-manifest:v1:{split}:{attempt}")
-            attempt += 1
-            if seed in used_seeds:
-                continue
+    for stage in stages:
+        generator = RoomGenerator(stage.config)
+        for split, count in (
+            ("test", test_size),
+            ("validation", validation_size),
+            ("train", train_size),
+        ):
+            required_features = set(stage.required_features)
+            missing_features = (
+                set(required_features)
+                if count >= len(required_features)
+                else set()
+            )
+            accepted = 0
+            attempt = 0
+            attempt_limit = max(1_000, count * 200)
+            while accepted < count:
+                if attempt >= attempt_limit:
+                    raise RuntimeError(
+                        f"{stage.name} {split} accepted {accepted}/{count} "
+                        f"rooms after {attempt_limit} candidates"
+                    )
+                seed = derive_seed(
+                    data_seed,
+                    f"curriculum-manifest:v2:{stage.name}:{split}:{attempt}",
+                )
+                attempt += 1
+                if seed in used_seeds:
+                    continue
 
-            candidate: list[tuple[str, RoomRecord]] = []
-            valid = True
-            for stage, generator in zip(stages, generators, strict=True):
                 outcome = generator.generate_with_report(seed)
                 room = outcome.room
                 if (
@@ -223,41 +251,34 @@ def build_manifest_suite(
                     or bool(room.metadata.get("fallback"))
                     or not stage.accepts(room)
                 ):
-                    valid = False
-                    break
+                    continue
                 geometry, navigation, task = room_fingerprints(room)
-                candidate.append(
-                    (
-                        stage.name,
-                        RoomRecord(
-                            seed=seed,
-                            geometry_sha256=geometry,
-                            navigation_sha256=navigation,
-                            task_sha256=task,
-                            attempts=outcome.attempts,
-                            width=room.width,
-                            height=room.height,
-                            shape=room.shape.value,
-                            counts=tuple(room.counts().items()),
-                        ),
-                    )
+                if navigation in used_navigation or task in used_tasks:
+                    continue
+                features = room_features(room)
+                if missing_features and not missing_features.intersection(features):
+                    continue
+
+                record = RoomRecord(
+                    seed=seed,
+                    geometry_sha256=geometry,
+                    navigation_sha256=navigation,
+                    task_sha256=task,
+                    attempts=outcome.attempts,
+                    width=room.width,
+                    height=room.height,
+                    shape=room.shape.value,
+                    counts=tuple(room.counts().items()),
+                    features=features,
                 )
-
-            geometries = {record.geometry_sha256 for _, record in candidate}
-            tasks = {record.task_sha256 for _, record in candidate}
-            if (
-                not valid
-                or geometries & used_geometry
-                or tasks & used_tasks
-            ):
-                continue
-
-            for stage_name, record in candidate:
-                buckets[stage_name][split].append(record)
-            used_seeds.add(seed)
-            used_geometry.update(geometries)
-            used_tasks.update(tasks)
-            accepted += 1
+                buckets[stage.name][split].append(record)
+                used_seeds.add(seed)
+                used_navigation.add(navigation)
+                used_tasks.add(task)
+                missing_features.difference_update(features)
+                accepted += 1
+            if progress is not None:
+                progress(f"  {stage.name}: {split} {accepted}/{count}")
 
     stage_manifests = tuple(
         StageRoomManifest(
@@ -280,10 +301,8 @@ def assert_disjoint(manifest: CurriculumRoomManifest) -> None:
         raise ValueError("room manifest contains duplicate stage names")
 
     seed_owner: dict[int, str] = {}
-    geometry_owner: dict[str, str] = {}
+    navigation_owner: dict[str, str] = {}
     task_owner: dict[str, str] = {}
-    expected_seeds: dict[str, tuple[int, ...]] = {}
-
     for stage in manifest.stages:
         if _hash_text(stage.config_json) != stage.config_sha256:
             raise ValueError(f"{stage.stage} config hash does not match its snapshot")
@@ -292,24 +311,22 @@ def assert_disjoint(manifest: CurriculumRoomManifest) -> None:
             seeds = tuple(record.seed for record in records)
             if len(seeds) != len(set(seeds)):
                 raise ValueError(f"{stage.stage} {split} contains duplicate seeds")
-            if split in expected_seeds and seeds != expected_seeds[split]:
-                raise ValueError(f"{stage.stage} does not share the {split} seed families")
-            expected_seeds.setdefault(split, seeds)
-            geometries = [record.geometry_sha256 for record in records]
+            navigations = [record.navigation_sha256 for record in records]
             tasks = [record.task_sha256 for record in records]
-            if len(geometries) != len(set(geometries)):
-                raise ValueError(f"{stage.stage} {split} contains duplicate geometry")
+            if len(navigations) != len(set(navigations)):
+                raise ValueError(f"{stage.stage} {split} contains duplicate navigation")
             if len(tasks) != len(set(tasks)):
                 raise ValueError(f"{stage.stage} {split} contains duplicate tasks")
             for record in records:
-                _claim(seed_owner, record.seed, split, "seed")
+                owner = f"{stage.stage}:{split}"
+                _claim(seed_owner, record.seed, owner, "seed")
                 _claim(
-                    geometry_owner,
-                    record.geometry_sha256,
-                    split,
-                    "geometry",
+                    navigation_owner,
+                    record.navigation_sha256,
+                    owner,
+                    "navigation",
                 )
-                _claim(task_owner, record.task_sha256, split, "task")
+                _claim(task_owner, record.task_sha256, owner, "task")
 
 
 def verify_manifest(
@@ -325,6 +342,10 @@ def verify_manifest(
         stage.stage for stage in manifest.stages
     ):
         raise ValueError("curriculum stages do not match the room manifest")
+    for split in splits:
+        sizes = {len(stage.records(split)) for stage in manifest.stages}
+        if len(sizes) != 1 or not sizes or next(iter(sizes)) < 1:
+            raise ValueError(f"{split} split sizes are incomplete or inconsistent")
 
     for stage in stages:
         saved = manifest.stage(stage.name)
@@ -332,6 +353,22 @@ def verify_manifest(
             raise ValueError(f"{stage.name} config changed after room staging")
         generator = RoomGenerator(saved.config)
         for split in splits:
+            covered = {
+                feature
+                for record in saved.records(split)
+                for feature in record.features
+            }
+            required_features = set(stage.required_features)
+            missing = (
+                sorted(required_features - covered)
+                if len(saved.records(split)) >= len(required_features)
+                else []
+            )
+            if missing:
+                raise ValueError(
+                    f"{stage.name} {split} lacks required features: "
+                    + ", ".join(missing)
+                )
             for record in saved.records(split):
                 outcome = generator.generate_with_report(record.seed)
                 room = outcome.room
@@ -360,10 +397,89 @@ def verify_manifest(
                     or room.height != record.height
                     or room.shape.value != record.shape
                     or tuple(room.counts().items()) != record.counts
+                    or room_features(room) != record.features
                 ):
                     raise ValueError(
                         f"{stage.name} {split} seed {record.seed} metadata changed"
                     )
+
+
+def room_features(room: Room) -> tuple[str, ...]:
+    features = {
+        f"shape:{room.shape.value}",
+        *(f"entity:{entity.kind.name.lower()}" for entity in room.entities),
+        *(
+            f"tile:{tile_name(tile)}"
+            for tile in Tile
+            if room.terrain.count(tile) > 0
+        ),
+        *(
+            f"switch_mode:{switch.mode.value}"
+            for switch in room.switches
+        ),
+        *(
+            f"wipeout_size:{ball.size.value}"
+            for ball in room.wipeout_balls
+        ),
+        *(
+            f"gate:{gate.get('kind')}"
+            for gate in room.metadata.get("gates", ())
+        ),
+    }
+    for name in (
+        "require_wipeout_crossing",
+        "require_bridge_crossing",
+        "require_reset_detour",
+        "require_key_for_each_agent",
+        "require_combined_course",
+    ):
+        if getattr(room.config, name):
+            features.add(f"contract:{name.removeprefix('require_')}")
+    course = room.metadata.get("combined_course")
+    if isinstance(course, dict):
+        required_size = course.get("required_ball_size")
+        if required_size in {"normal", "big"}:
+            features.add(f"contract:required_wipeout:{required_size}")
+    return tuple(sorted(features))
+
+
+def verify_training_coverage(
+    manifest: CurriculumRoomManifest,
+    train_limits: Mapping[str, int],
+    *,
+    require_all: bool = True,
+) -> tuple[str, ...]:
+    features: set[str] = set()
+    for stage in manifest.stages:
+        limit = train_limits.get(stage.stage)
+        if limit is None or limit < 1:
+            raise ValueError(f"missing positive train limit for {stage.stage}")
+        for record in stage.train[:limit]:
+            features.update(record.features)
+
+    required = {
+        *(f"entity:{kind.name.lower()}" for kind in EntityKind),
+        *(f"shape:{shape.value}" for shape in RoomShape),
+        *(f"switch_mode:{mode.value}" for mode in SwitchMode),
+        *(f"wipeout_size:{size.value}" for size in WipeoutBallSize),
+        *(f"gate:{kind.value}" for kind in GateKind),
+        "tile:obstacle",
+        *(f"tile:{tile_name(tile)}" for tile in HAZARD_TILES),
+        "contract:wipeout_crossing",
+        "contract:bridge_crossing",
+        "contract:reset_detour",
+        "contract:key_for_each_agent",
+        "contract:combined_course",
+        "contract:required_wipeout:normal",
+        "contract:required_wipeout:big",
+    }
+    missing = sorted(required - features)
+    if require_all and missing:
+        raise ValueError(
+            "training rooms do not cover generated mechanics: "
+            + ", ".join(missing)
+        )
+    return tuple(sorted(features))
 
 
 def save_manifest(manifest: CurriculumRoomManifest, path: str | Path) -> Path:
@@ -385,12 +501,12 @@ def save_manifest(manifest: CurriculumRoomManifest, path: str | Path) -> Path:
 def _claim(
     owners: dict[Any, str],
     value: Any,
-    split: str,
+    claimant: str,
     label: str,
 ) -> None:
-    owner = owners.setdefault(value, split)
-    if owner != split:
-        raise ValueError(f"{label} appears in both {owner} and {split}")
+    owner = owners.setdefault(value, claimant)
+    if owner != claimant:
+        raise ValueError(f"{label} appears in both {owner} and {claimant}")
 
 
 def _hash_json(value: Any) -> str:
