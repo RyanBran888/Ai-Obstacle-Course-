@@ -7,15 +7,22 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from curriculum import make_runner
+from curriculum import FULL_COURSE_HORIZON, make_runner
+from DQN.DQN_model import ACTIONS, CHANNEL_NAMES, GLOBAL_NAMES, OBS_DIM, OBSERVATION_SCHEMA
 from DQN.DQN_train import Config
+from preview_maps import export_manifest_site, load_manifest
 from room_manifest import save_manifest
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train with procedural seed pools")
     parser.add_argument("--device", choices=("auto", "cpu", "mps"), default="auto")
-    parser.add_argument("--max-steps", type=int, default=200)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=FULL_COURSE_HORIZON,
+        help=f"episode horizon (minimum {FULL_COURSE_HORIZON})",
+    )
     parser.add_argument("--episodes-per-seed", type=int, default=50)
     parser.add_argument("--max-rounds", type=int, default=8)
     parser.add_argument("--validation-seeds", type=int, default=64)
@@ -35,19 +42,34 @@ def parse_args() -> argparse.Namespace:
         "--data-seed",
         type=int,
         default=0,
-        help="fixed Architecture room benchmark",
+        help="deterministic source for every staged room split",
     )
     parser.add_argument("--output", default="curriculum_agent.pt")
     parser.add_argument("--graph-output", default="curriculum_training.png")
     parser.add_argument("--manifest-output", default="curriculum_rooms.json")
     parser.add_argument("--report-output", default="curriculum_report.json")
-    parser.add_argument("--plot-every", type=int, default=10)
+    parser.add_argument(
+        "--maps-output",
+        default=None,
+        help="designer map folder (default: <manifest stem>_maps)",
+    )
+    parser.add_argument("--map-cell", type=int, default=12)
+    parser.add_argument(
+        "--plot-every",
+        type=int,
+        default=10,
+        help="refresh the live dashboard every N training episodes",
+    )
     parser.add_argument(
         "--final-test",
         action="store_true",
         help="spend the untouched test set after a successful run",
     )
-    parser.add_argument("--no-live", action="store_true")
+    parser.add_argument(
+        "--no-live",
+        action="store_true",
+        help="save the dashboard without opening a live window",
+    )
     return parser.parse_args()
 
 
@@ -61,15 +83,16 @@ def _file_sha256(path: str | Path) -> str:
 
 def _source_hashes() -> dict[str, str]:
     root = Path(__file__).resolve().parent.parent
-    files = (
-        "QN/QN_model.py",
-        "QN/QN_train.py",
-        "QN/env_bridge.py",
-        "QN/curriculum.py",
-        "QN/room_manifest.py",
-        "Architecture/coop_env/generation/generator.py",
+    paths = sorted(
+        (
+            *list((root / "DQN").glob("*.py")),
+            *list((root / "Architecture" / "coop_env").rglob("*.py")),
+        )
     )
-    return {name: _file_sha256(root / name) for name in files}
+    return {
+        str(path.relative_to(root)): _file_sha256(path)
+        for path in paths
+    }
 
 
 def _write_report(path: str | Path, payload: dict[str, Any]) -> None:
@@ -91,6 +114,13 @@ def main() -> None:
     graph_path = Path(args.graph_output).expanduser()
     manifest_path = Path(args.manifest_output).expanduser()
     report_path = Path(args.report_output).expanduser()
+    maps_path = (
+        Path(args.maps_output).expanduser()
+        if args.maps_output
+        else manifest_path.parent / f"{manifest_path.stem}_maps"
+    )
+    if args.map_cell < 4:
+        raise ValueError("--map-cell must be at least 4")
     artifacts = {
         "checkpoint": checkpoint,
         "graph": graph_path,
@@ -108,6 +138,11 @@ def main() -> None:
         if path.exists() and not path.is_file():
             raise IsADirectoryError(f"{path} is not a file")
         path.parent.mkdir(parents=True, exist_ok=True)
+    if maps_path.resolve() in normalized:
+        raise ValueError("maps output must differ from file outputs")
+    if maps_path.exists():
+        raise FileExistsError(f"{maps_path} already exists; choose a new --maps-output")
+    maps_path.parent.mkdir(parents=True, exist_ok=True)
     if checkpoint.exists():
         raise FileExistsError(f"{checkpoint} already exists; choose a new --output")
     if report_path.exists():
@@ -138,6 +173,7 @@ def main() -> None:
     manifest_path = save_manifest(manifest, manifest_path)
     manifest_file_hash = _file_sha256(manifest_path)
     print(f"Staged room manifest saved to {manifest_path}")
+    manifest_data = load_manifest(manifest_path)
 
     results = runner.run()
     final = results[-1]
@@ -149,6 +185,35 @@ def main() -> None:
     checkpoint_hash = _file_sha256(checkpoint)
     print(f"Frozen checkpoint saved to {checkpoint}")
 
+    train_limits = {stage.name: 0 for stage in runner.stages}
+    validation_limits = {stage.name: 0 for stage in runner.stages}
+    for result in results:
+        train_limits[result.stage] = max(
+            train_limits[result.stage],
+            result.pool_size,
+        )
+        if result.validation is not None:
+            validation_limits[result.stage] = args.validation_seeds
+    map_limits = {
+        "train": train_limits,
+        "validation": validation_limits,
+    }
+    map_splits = ("train", "validation")
+    map_rooms, map_pages = export_manifest_site(
+        manifest_path,
+        manifest_data,
+        maps_path,
+        splits=map_splits,
+        stage_name=None,
+        count=None,
+        cell=args.map_cell,
+        limits=map_limits,
+    )
+    print(
+        f"Designer maps saved to {maps_path / 'index.html'} "
+        f"({map_rooms} rooms used, {map_pages} pages)"
+    )
+
     if runner.completed and args.final_test:
         if _file_sha256(manifest_path) != manifest_file_hash:
             raise RuntimeError("the saved room manifest changed during training")
@@ -156,6 +221,21 @@ def main() -> None:
             raise RuntimeError("final testing requires the shared-network trainer")
         runner.trainer.learners[0].load(str(checkpoint))
         runner.evaluate_final_test()
+        map_splits = ("train", "validation", "test")
+        map_rooms, map_pages = export_manifest_site(
+            manifest_path,
+            manifest_data,
+            maps_path,
+            splits=map_splits,
+            stage_name=None,
+            count=None,
+            cell=args.map_cell,
+            limits=map_limits,
+        )
+        print(
+            f"Test maps added to {maps_path / 'index.html'} "
+            f"({map_rooms} rooms, {map_pages} pages)"
+        )
     elif runner.completed:
         print("Final test remains unevaluated; use --final-test only for the chosen run.")
     else:
@@ -168,18 +248,39 @@ def main() -> None:
     if _source_hashes() != source_hashes:
         raise RuntimeError("training source files changed during the run")
     report = {
-        "schema_version": 1,
+        "schema_version": 3,
         "curriculum_completed": runner.completed,
         "final_test_requested": args.final_test,
         "final_test_evaluated": bool(runner.test_results),
         "run_seed": args.seed,
         "data_seed": args.data_seed,
         "source_sha256": source_hashes,
+        "training_coverage": list(runner.training_features),
         "training_config": asdict(cfg),
+        "model_contract": {
+            "schema": OBSERVATION_SCHEMA,
+            "obs_dim": OBS_DIM,
+            "actions": list(ACTIONS),
+            "channels": list(CHANNEL_NAMES),
+            "globals": list(GLOBAL_NAMES),
+        },
         "manifest": {
             "path": str(manifest_path),
             "content_sha256": manifest.sha256,
             "file_sha256": manifest_file_hash,
+            "schema": manifest.schema_version,
+            "disjoint_by": [
+                "seed",
+                "navigation_sha256",
+                "task_sha256",
+            ],
+        },
+        "designer_maps": {
+            "path": str(maps_path),
+            "index": str(maps_path / "index.html"),
+            "splits": list(map_splits),
+            "rooms": map_rooms,
+            "pages": map_pages,
         },
         "checkpoint": {
             "path": str(checkpoint),
@@ -197,9 +298,28 @@ def main() -> None:
                     if result.validation is not None
                     else None
                 ),
+                "retention": dict(result.retention),
             }
             for result in results
         ],
+        "curriculum_contract": [
+            {
+                "stage": stage.name,
+                "lesson": stage.lesson,
+                "objective": stage.objective,
+                "pool_sizes": list(stage.pool_sizes or runner.pool_sizes),
+                "train_threshold": stage.train_threshold,
+                "validation_threshold": stage.validation_threshold,
+                "max_wipeout_death_rate": stage.max_wipeout_death_rate,
+                "required_features": list(stage.required_features),
+            }
+            for stage in runner.stages
+        ],
+        "retention_contract": {
+            "validation_rooms_per_prior_stage": runner.retention_size,
+            "validation_margin": runner.retention_margin,
+            "minimum_success_rate": 0.50,
+        },
         "final_test": (
             [
                 {
