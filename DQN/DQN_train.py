@@ -4,7 +4,7 @@ import copy
 import random
 import time
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -292,6 +292,64 @@ def resolve_device(requested: str = "auto") -> torch.device:
     return torch.device(name)
 
 
+def _replay_group(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise TypeError("replay_group must be an integer")
+    group = int(value)
+    if group < 0:
+        raise ValueError("replay_group cannot be negative")
+    return group
+
+
+def _replay_group_weights(
+    weights: Mapping[int, float] | None,
+) -> dict[int, float] | None:
+    if not weights:
+        return None
+    normalized: dict[int, float] = {}
+    for raw_group, raw_weight in weights.items():
+        group = _replay_group(raw_group)
+        weight = float(raw_weight)
+        if not np.isfinite(weight) or weight < 0.0:
+            raise ValueError("replay group weights must be finite and nonnegative")
+        normalized[group] = weight
+    if not any(weight > 0.0 for weight in normalized.values()):
+        raise ValueError("at least one replay group weight must be positive")
+    return normalized
+
+
+class _DenseReplayIndex:
+    def __init__(self) -> None:
+        self.values = np.empty(16, dtype=np.int64)
+        self.size = 0
+
+    def __len__(self) -> int:
+        return self.size
+
+    def add(self, slot: int) -> int:
+        if self.size == len(self.values):
+            expanded = np.empty(len(self.values) * 2, dtype=np.int64)
+            expanded[: self.size] = self.values
+            self.values = expanded
+        position = self.size
+        self.values[position] = slot
+        self.size += 1
+        return position
+
+    def remove(self, position: int) -> int | None:
+        if position < 0 or position >= self.size:
+            raise RuntimeError("replay group index is inconsistent")
+        self.size -= 1
+        if position == self.size:
+            return None
+        replacement = int(self.values[self.size])
+        self.values[position] = replacement
+        return replacement
+
+    def active(self) -> np.ndarray:
+        return self.values[: self.size]
+
+
 class ReplayBuffer:
     def __init__(self, capacity: int, obs_dim: int, seed: int = 0) -> None:
         if capacity < 1:
@@ -304,9 +362,14 @@ class ReplayBuffer:
         self.terminal = np.empty(capacity, dtype=np.float32)
         self.discount = np.empty(capacity, dtype=np.float32)
         self.important = np.empty(capacity, dtype=np.bool_)
+        self.replay_groups = np.empty(capacity, dtype=np.int64)
         self._important_indices = np.empty(capacity, dtype=np.int64)
         self._important_positions = np.full(capacity, -1, dtype=np.int64)
         self._important_count = 0
+        self._group_positions = np.full(capacity, -1, dtype=np.int64)
+        self._group_indices: dict[
+            tuple[int, bool], _DenseReplayIndex
+        ] = {}
         self.index = 0
         self.size = 0
         self.rng = np.random.default_rng(seed)
@@ -318,8 +381,46 @@ class ReplayBuffer:
         active = self._important_indices[: self._important_count]
         self._important_positions[active] = -1
         self._important_count = 0
+        self._group_positions.fill(-1)
+        self._group_indices.clear()
         self.index = 0
         self.size = 0
+
+    def group_counts(self) -> dict[int, tuple[int, int]]:
+        counts: dict[int, list[int]] = {}
+        for (group, important), index in self._group_indices.items():
+            values = counts.setdefault(group, [0, 0])
+            values[int(important)] = len(index)
+        return {
+            group: (values[0], values[1])
+            for group, values in sorted(counts.items())
+        }
+
+    def _remove_group_slot(self, slot: int) -> None:
+        position = int(self._group_positions[slot])
+        if position < 0:
+            return
+        key = (int(self.replay_groups[slot]), bool(self.important[slot]))
+        index = self._group_indices[key]
+        replacement = index.remove(position)
+        if replacement is not None:
+            self._group_positions[replacement] = position
+        self._group_positions[slot] = -1
+        if not index:
+            del self._group_indices[key]
+
+    def _add_group_slot(
+        self,
+        slot: int,
+        replay_group: int,
+        important: bool,
+    ) -> None:
+        key = (replay_group, important)
+        index = self._group_indices.get(key)
+        if index is None:
+            index = _DenseReplayIndex()
+            self._group_indices[key] = index
+        self._group_positions[slot] = index.add(slot)
 
     def add(
         self,
@@ -330,8 +431,11 @@ class ReplayBuffer:
         terminal: bool,
         discount: float,
         important: bool,
+        replay_group: int = 0,
     ) -> None:
+        group = _replay_group(replay_group)
         slot = self.index
+        self._remove_group_slot(slot)
         position = int(self._important_positions[slot])
         if position >= 0:
             self._important_count -= 1
@@ -346,6 +450,7 @@ class ReplayBuffer:
             self._important_positions[slot] = self._important_count
             self._important_count += 1
 
+        self._add_group_slot(slot, group, bool(important))
         self.obs[slot] = obs
         self.actions[slot] = action
         self.rewards[slot] = reward
@@ -353,26 +458,201 @@ class ReplayBuffer:
         self.terminal[slot] = float(terminal)
         self.discount[slot] = discount
         self.important[slot] = important
+        self.replay_groups[slot] = group
         self.index = (self.index + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
-    def sample(self, batch_size: int, important_fraction: float):
+    def _weighted_group_quotas(
+        self,
+        batch_size: int,
+        group_weights: Mapping[int, float],
+    ) -> dict[int, int]:
+        weights: dict[int, float] = {}
+        capacities: dict[int, int] = {}
+        for group, weight in sorted(group_weights.items()):
+            if weight <= 0.0:
+                continue
+            important = self._group_indices.get((group, True))
+            ordinary = self._group_indices.get((group, False))
+            size = (
+                (len(important) if important is not None else 0)
+                + (len(ordinary) if ordinary is not None else 0)
+            )
+            if size:
+                weights[group] = weight
+                capacities[group] = size
+
+        if not weights:
+            raise RuntimeError(
+                "no replay transitions match a positive group weight"
+            )
+        if sum(capacities.values()) < batch_size:
+            raise RuntimeError(
+                "weighted replay groups contain fewer transitions than the batch"
+            )
+
+        original_weights = dict(weights)
+        quotas = {group: 0 for group in weights}
+        if batch_size >= len(quotas):
+            for group in quotas:
+                quotas[group] = 1
+            total_weight = sum(original_weights.values())
+            weights = {
+                group: max(
+                    0.0,
+                    (
+                        batch_size
+                        * original_weights[group]
+                        / total_weight
+                        - quotas[group]
+                    ),
+                )
+                for group in quotas
+            }
+        remaining = batch_size - sum(quotas.values())
+        while remaining:
+            open_groups = [
+                group
+                for group in weights
+                if quotas[group] < capacities[group]
+            ]
+            total_weight = sum(weights[group] for group in open_groups)
+            if not open_groups:
+                raise RuntimeError("weighted replay quota allocation failed")
+            allocation_weights = weights
+            if total_weight <= 0.0:
+                allocation_weights = original_weights
+                total_weight = sum(
+                    allocation_weights[group] for group in open_groups
+                )
+
+            desired = {
+                group: remaining * allocation_weights[group] / total_weight
+                for group in open_groups
+            }
+            progress = 0
+            for group in open_groups:
+                count = min(
+                    capacities[group] - quotas[group],
+                    int(desired[group]),
+                )
+                quotas[group] += count
+                remaining -= count
+                progress += count
+            if not remaining:
+                break
+
+            candidates = [
+                group
+                for group in open_groups
+                if quotas[group] < capacities[group]
+            ]
+            tie_breakers = {
+                group: float(self.rng.random())
+                for group in candidates
+            }
+            order = sorted(
+                candidates,
+                key=lambda group: (
+                    -(desired[group] - int(desired[group])),
+                    tie_breakers[group],
+                ),
+            )
+            for group in order:
+                if not remaining:
+                    break
+                quotas[group] += 1
+                remaining -= 1
+                progress += 1
+            if not progress:
+                raise RuntimeError("weighted replay quota allocation stalled")
+        return quotas
+
+    def _sample_weighted(
+        self,
+        batch_size: int,
+        important_fraction: float,
+        group_weights: Mapping[int, float],
+    ) -> np.ndarray:
+        quotas = self._weighted_group_quotas(batch_size, group_weights)
+        selected: list[np.ndarray] = []
+        for group, quota in quotas.items():
+            if not quota:
+                continue
+            important = self._group_indices.get((group, True))
+            ordinary = self._group_indices.get((group, False))
+            important_size = len(important) if important is not None else 0
+            ordinary_size = len(ordinary) if ordinary is not None else 0
+            wanted_important = quota * important_fraction
+            n_important = int(wanted_important)
+            if self.rng.random() < wanted_important - n_important:
+                n_important += 1
+            n_important = min(n_important, important_size)
+            n_ordinary = quota - n_important
+            if n_ordinary > ordinary_size:
+                n_important += n_ordinary - ordinary_size
+                n_ordinary = ordinary_size
+
+            if n_important:
+                if important is None:
+                    raise RuntimeError("important replay index is missing")
+                selected.append(
+                    self.rng.choice(
+                        important.active(),
+                        size=n_important,
+                        replace=False,
+                    )
+                )
+            if n_ordinary:
+                if ordinary is None:
+                    raise RuntimeError("ordinary replay index is missing")
+                selected.append(
+                    self.rng.choice(
+                        ordinary.active(),
+                        size=n_ordinary,
+                        replace=False,
+                    )
+                )
+
+        indices = np.concatenate(selected)
+        if len(indices) != batch_size:
+            raise RuntimeError("weighted replay batch size is inconsistent")
+        self.rng.shuffle(indices)
+        return indices
+
+    def sample(
+        self,
+        batch_size: int,
+        important_fraction: float,
+        group_weights: Mapping[int, float] | None = None,
+    ):
         if batch_size < 1 or batch_size > self.size:
             raise ValueError("batch size must be between 1 and the buffer size")
 
-        wanted = int(round(batch_size * important_fraction))
-        important_indices = self._important_indices[: self._important_count]
-        n_important = min(wanted, self._important_count)
-        selected = (
-            self.rng.choice(important_indices, size=n_important, replace=False)
-            if n_important
-            else np.empty(0, dtype=np.int64)
-        )
-        rest = self.rng.choice(
-            self.size, size=batch_size - n_important, replace=False
-        )
-        indices = np.concatenate((selected, rest))
-        self.rng.shuffle(indices)
+        if group_weights is None:
+            wanted = int(round(batch_size * important_fraction))
+            important_indices = self._important_indices[: self._important_count]
+            n_important = min(wanted, self._important_count)
+            selected = (
+                self.rng.choice(
+                    important_indices,
+                    size=n_important,
+                    replace=False,
+                )
+                if n_important
+                else np.empty(0, dtype=np.int64)
+            )
+            rest = self.rng.choice(
+                self.size, size=batch_size - n_important, replace=False
+            )
+            indices = np.concatenate((selected, rest))
+            self.rng.shuffle(indices)
+        else:
+            indices = self._sample_weighted(
+                batch_size,
+                important_fraction,
+                group_weights,
+            )
 
         return (
             self.obs[indices],
@@ -402,6 +682,7 @@ class Agent:
         self.gamma = gamma
         self.clip = clip
         self.important_fraction = important_fraction
+        self.replay_group_weights: dict[int, float] | None = None
         self.replay = ReplayBuffer(replay_capacity, obs_dim, replay_seed)
 
         self.net = QNetwork(obs_dim, n_actions, hidden).to(self.device)
@@ -423,6 +704,12 @@ class Agent:
             actions = self.net(batch).argmax(dim=1).tolist()
         return [int(action) for action in actions]
 
+    def set_replay_group_weights(
+        self,
+        weights: Mapping[int, float] | None,
+    ) -> None:
+        self.replay_group_weights = _replay_group_weights(weights)
+
     def remember(
         self,
         obs,
@@ -432,13 +719,25 @@ class Agent:
         terminal: bool,
         discount: float,
         important: bool,
+        replay_group: int = 0,
     ) -> None:
         self.replay.add(
-            obs, action, reward, next_obs, terminal, discount, important
+            obs,
+            action,
+            reward,
+            next_obs,
+            terminal,
+            discount,
+            important,
+            replay_group,
         )
 
     def learn_batch(self, batch_size: int) -> None:
-        batch = self.replay.sample(batch_size, self.important_fraction)
+        batch = self.replay.sample(
+            batch_size,
+            self.important_fraction,
+            self.replay_group_weights,
+        )
         obs, actions, rewards, next_obs, terminal, discount = batch
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
         actions_t = torch.as_tensor(actions, dtype=torch.int64, device=self.device)
@@ -700,7 +999,7 @@ class EvaluationEpisode:
         }
 
 
-Transition = tuple[Any, int, float, Any, bool, bool]
+Transition = tuple[Any, int, float, Any, bool, bool, int]
 EVALUATION_BATCH_SIZE = 64
 
 
@@ -747,6 +1046,7 @@ class Trainer:
         self._reheat_step = 0
         self._reheat_from = 0.0
         self._reheat_steps = 0
+        self.replay_group_weights: dict[int, float] | None = None
 
     @staticmethod
     def _validate(cfg: Config) -> None:
@@ -782,6 +1082,23 @@ class Trainer:
             learner.replay.clear()
         for pending in self._pending:
             pending.clear()
+
+    def set_replay_group_weights(
+        self,
+        weights: Mapping[int, float] | None,
+    ) -> None:
+        normalized = _replay_group_weights(weights)
+        self.replay_group_weights = normalized
+        for learner in self.learners:
+            learner.set_replay_group_weights(normalized)
+
+    def set_learning_rate(self, value: float) -> None:
+        learning_rate = float(value)
+        if not np.isfinite(learning_rate) or learning_rate <= 0.0:
+            raise ValueError("learning rate must be finite and positive")
+        for learner in self.learners:
+            for group in learner.opt.param_groups:
+                group["lr"] = learning_rate
 
     def synchronize(self) -> None:
         if self.device.type == "mps":
@@ -820,6 +1137,11 @@ class Trainer:
                 copy.deepcopy(learner.replay.rng.bit_generator.state)
                 for learner in self.learners
             ],
+            "replay_group_weights": (
+                dict(self.replay_group_weights)
+                if self.replay_group_weights is not None
+                else None
+            ),
             "replay_included": False,
         }
 
@@ -836,6 +1158,7 @@ class Trainer:
         self._reheat_from = float(state["reheat_from"])
         self._reheat_steps = int(state["reheat_steps"])
         self.clear_replay()
+        self.set_replay_group_weights(state.get("replay_group_weights"))
         replay_rngs = state["replay_rngs"]
         if len(replay_rngs) != len(self.learners):
             raise ValueError("recovery replay RNG count does not match")
@@ -875,9 +1198,20 @@ class Trainer:
         terminal = False
         important = False
         last_next_obs = pending[0][3]
+        replay_group = pending[0][6]
         used = 0
         for used, transition in enumerate(list(pending)[:count], start=1):
-            _, _, step_reward, next_obs, step_terminal, step_important = transition
+            (
+                _,
+                _,
+                step_reward,
+                next_obs,
+                step_terminal,
+                step_important,
+                step_group,
+            ) = transition
+            if step_group != replay_group:
+                raise RuntimeError("n-step transition crossed replay groups")
             reward += (self.cfg.gamma ** (used - 1)) * step_reward
             last_next_obs = next_obs
             terminal = terminal or step_terminal
@@ -894,6 +1228,7 @@ class Trainer:
             terminal,
             self.cfg.gamma ** used,
             important,
+            replay_group,
         )
         pending.popleft()
 
@@ -905,7 +1240,9 @@ class Trainer:
         next_obs,
         terminal: bool,
         important: bool,
+        replay_group: int = 0,
     ) -> None:
+        group = _replay_group(replay_group)
         for index in range(N_AGENTS):
             self._pending[index].append(
                 (
@@ -915,6 +1252,7 @@ class Trainer:
                     next_obs[index],
                     terminal,
                     important,
+                    group,
                 )
             )
             if len(self._pending[index]) >= self.cfg.n_step:
@@ -930,7 +1268,10 @@ class Trainer:
         learn: bool = True,
         epsilon: float | None = None,
         env=None,
+        replay_group: int = 0,
+        optimize: bool = True,
     ) -> EpisodeResult:
+        group = _replay_group(replay_group)
         active_env = env or self.env
         self._configure_env(active_env)
         obs = active_env.reset(seed=seed) if seed is not None else active_env.reset()
@@ -956,12 +1297,19 @@ class Trainer:
                     )
                 )
                 self._remember(
-                    obs, actions, rewards, next_obs, terminal, important
+                    obs,
+                    actions,
+                    rewards,
+                    next_obs,
+                    terminal,
+                    important,
+                    group,
                 )
                 self.env_steps += 1
                 ready = max(self.cfg.batch_size, self.cfg.replay_warmup)
                 if (
-                    self.env_steps % self.cfg.train_every == 0
+                    optimize
+                    and self.env_steps % self.cfg.train_every == 0
                     and len(self.learners[0].replay) >= ready
                 ):
                     for learner in self.learners:

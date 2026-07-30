@@ -6,7 +6,7 @@ import json
 import tempfile
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import torch
 
@@ -86,6 +86,14 @@ def parse_args() -> argparse.Namespace:
         help="continue a compatible recovery state",
     )
     parser.add_argument(
+        "--resume-retention-upgrade",
+        action="store_true",
+        help=(
+            "resume one stopped retention-v1 state under retention-v2 rules "
+            "and write recovery to a new file"
+        ),
+    )
+    parser.add_argument(
         "--warm-start-progress",
         default=None,
         help=(
@@ -143,6 +151,15 @@ def _file_sha256(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def _payload_sha256(payload: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _source_hashes() -> dict[str, str]:
     root = Path(__file__).resolve().parent.parent
     paths = sorted(
@@ -182,6 +199,11 @@ def _load_progress_payload(path: Path) -> dict[str, Any]:
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict) or payload.get("schema_version") != 1:
         raise ValueError(f"{path} is not a compatible curriculum progress state")
+    contract = payload.get("contract")
+    if not isinstance(contract, dict):
+        raise ValueError(f"{path} has no curriculum recovery contract")
+    if payload.get("contract_sha256") != _payload_sha256(contract):
+        raise ValueError(f"{path} has a corrupted curriculum recovery contract")
     return payload
 
 
@@ -211,6 +233,47 @@ def _warm_start_metadata(
     }
 
 
+def _retention_upgrade_metadata(
+    path: Path,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    status = str(payload.get("status"))
+    if status != "stopped":
+        raise ValueError(
+            "retention upgrades require a stopped curriculum state"
+        )
+    if not isinstance(payload.get("active"), dict):
+        raise ValueError(
+            "retention-upgrade progress must contain an active pool"
+        )
+    if payload.get("test_results"):
+        raise ValueError(
+            "retention-upgrade progress must not contain final-test results"
+        )
+    if payload.get("test_model_sha256") is not None:
+        raise ValueError(
+            "retention-upgrade progress must not contain a final-test model"
+        )
+    contract_sha256 = payload.get("contract_sha256")
+    if not isinstance(contract_sha256, str) or not contract_sha256:
+        raise ValueError(
+            "retention-upgrade progress has no source contract hash"
+        )
+    results = payload.get("results", ())
+    if not isinstance(results, (list, tuple)):
+        raise ValueError(
+            "retention-upgrade progress has invalid curriculum results"
+        )
+    return {
+        "kind": "retention_v2",
+        "path": str(path.resolve()),
+        "file_sha256": _file_sha256(path),
+        "source_contract_sha256": contract_sha256,
+        "completed_pool_gates": len(results),
+        "original_status": status,
+    }
+
+
 def main() -> None:
     args = parse_args()
     checkpoint = Path(args.output).expanduser()
@@ -226,6 +289,23 @@ def main() -> None:
         if args.warm_start_progress
         else None
     )
+    if args.resume_retention_upgrade and warm_start_path is not None:
+        raise ValueError(
+            "--resume-retention-upgrade cannot be combined with "
+            "--warm-start-progress"
+        )
+    if args.resume_retention_upgrade and resume_path is None:
+        raise ValueError(
+            "--resume-retention-upgrade requires --resume-from"
+        )
+    if (
+        args.resume_retention_upgrade
+        and args.extend_stopped_rounds <= 0
+    ):
+        raise ValueError(
+            "--resume-retention-upgrade requires "
+            "--extend-stopped-rounds greater than zero"
+        )
     if resume_path is not None and warm_start_path is not None:
         raise ValueError(
             "--warm-start-progress starts a new run and cannot be combined "
@@ -242,6 +322,15 @@ def main() -> None:
             else checkpoint.with_name(f"{checkpoint.stem}.progress.pt")
         )
     )
+    if (
+        args.resume_retention_upgrade
+        and resume_path is not None
+        and progress_path.resolve() == resume_path.resolve()
+    ):
+        raise ValueError(
+            "--resume-retention-upgrade requires --progress-output to use "
+            "a different path from --resume-from"
+        )
     if args.map_cell < 4:
         raise ValueError("--map-cell must be at least 4")
     artifacts = {
@@ -297,6 +386,18 @@ def main() -> None:
         raise FileExistsError(
             f"{progress_path} already exists; choose a new --progress-output"
         )
+    if args.resume_retention_upgrade:
+        for label, path in (
+            ("checkpoint", checkpoint),
+            ("graph", graph_path),
+            ("manifest", manifest_path),
+            ("report", report_path),
+        ):
+            if path.exists():
+                raise FileExistsError(
+                    f"{path} already exists; retention upgrade {label} "
+                    "output must use a new path"
+                )
     if checkpoint.exists() and resume_path is None:
         raise FileExistsError(f"{checkpoint} already exists; choose a new --output")
     if manifest_path.exists() and resume_path is None:
@@ -318,6 +419,16 @@ def main() -> None:
         if resume_path is not None
         else None
     )
+    resume_external: dict[str, Any] = {}
+    if resume_payload is not None:
+        resume_contract = resume_payload.get("contract")
+        if isinstance(resume_contract, dict):
+            external = resume_contract.get("external", {})
+            if not isinstance(external, dict):
+                raise ValueError(
+                    "recovery external provenance is invalid"
+                )
+            resume_external = external
     warm_start_info: dict[str, Any] | None = None
     if warm_start_path is not None and warm_start_payload is not None:
         warm_start_info = _warm_start_metadata(
@@ -325,12 +436,29 @@ def main() -> None:
             warm_start_payload,
         )
     elif resume_payload is not None:
-        external = resume_payload.get("contract", {}).get("external", {})
-        recovered_warm_start = external.get("warm_start")
+        recovered_warm_start = resume_external.get("warm_start")
         if recovered_warm_start is not None:
             if not isinstance(recovered_warm_start, dict):
                 raise ValueError("recovery warm-start provenance is invalid")
             warm_start_info = dict(recovered_warm_start)
+    source_upgrade_info: dict[str, Any] | None = None
+    if (
+        args.resume_retention_upgrade
+        and resume_path is not None
+        and resume_payload is not None
+    ):
+        source_upgrade_info = _retention_upgrade_metadata(
+            resume_path,
+            resume_payload,
+        )
+    elif resume_payload is not None:
+        recovered_source_upgrade = resume_external.get("source_upgrade")
+        if recovered_source_upgrade is not None:
+            if not isinstance(recovered_source_upgrade, dict):
+                raise ValueError(
+                    "recovery source-upgrade provenance is invalid"
+                )
+            source_upgrade_info = dict(recovered_source_upgrade)
     if resume_payload is not None:
         saved_contract = resume_payload.get("contract", {})
         saved_trainer = saved_contract.get("trainer", {})
@@ -372,6 +500,7 @@ def main() -> None:
         plot_max_points=args.plot_max_points,
         graph_path=str(graph_path),
         promotion_passes=args.promotion_passes,
+        retention_size=args.validation_seeds,
         recovery_rounds=args.recovery_rounds,
         recovery_pool_max=args.recovery_pool_max,
         recovery_expansions=args.recovery_expansions,
@@ -380,8 +509,10 @@ def main() -> None:
         progress_contract={
             "source_sha256": source_hashes,
             "warm_start": warm_start_info,
+            "source_upgrade": source_upgrade_info,
         },
         extend_stopped_rounds=args.extend_stopped_rounds,
+        retention_upgrade=args.resume_retention_upgrade,
     )
     if warm_start_payload is not None:
         if warm_start_info is None:
@@ -583,6 +714,7 @@ def main() -> None:
             ),
         },
         "warm_start": warm_start_info,
+        "source_upgrade": source_upgrade_info,
         "checkpoint": {
             "path": str(checkpoint),
             "sha256": checkpoint_hash,
