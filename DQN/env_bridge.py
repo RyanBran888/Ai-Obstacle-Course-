@@ -96,7 +96,7 @@ R_RESET_ZONE = -0.5
 R_INVALID_ACTION = -0.1
 R_WRONG_KEY = -0.05
 R_WIPEOUT = -10.0
-R_TIMEOUT = 0.0
+R_TIMEOUT = -2.0
 
 SOLID = (Tile.VOID, Tile.WALL, Tile.OBSTACLE)
 TIME_SCALE = 64.0
@@ -437,7 +437,7 @@ class CoopEnvBridge:
 
         self._invalidate_goal_cache()
         for i in range(N_AGENTS):
-            next_phi = 0.0 if terminal else self._potential(i)
+            next_phi = 0.0 if done else self._potential(i)
             if not fatal:
                 own[i] += self.shaping_gamma * next_phi - self._phi[i]
             self._phi[i] = next_phi
@@ -550,7 +550,10 @@ class CoopEnvBridge:
         if action_index == INTERACT:
             return self._use(i)
         if action_index == WAIT:
-            return 0.0, None
+            _, _, delta, _, _, _, route_wait = self._goal_info(i)
+            if route_wait or delta == Vec2(0, 0):
+                return 0.0, None
+            return R_BLOCKED, "idle"
         return self._move(i, action_index)
 
     def _move(self, i, action):
@@ -589,9 +592,11 @@ class CoopEnvBridge:
                     continue
                 self._used_switches.add(e.id)
                 self.state.set_switch(e.id, not self.state.is_switch_active(e.id))
+                return 0.0, None
             elif isinstance(e, Checkpoint) and not self.state.is_checkpoint_reached(e.id):
                 self.state.reach_checkpoint(e.id)
-        return 0.0, None
+                return 0.0, None
+        return R_INVALID_ACTION, "invalid_action"
 
     def _push(self, dest, d):
         crate = self.state.blocking_entity_at(dest)

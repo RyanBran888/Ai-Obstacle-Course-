@@ -53,8 +53,11 @@ if TYPE_CHECKING:
 
 RoomCheck = Callable[[Room], bool]
 EvaluationCheck = Callable[[Evaluation], bool]
+EvaluationDeficit = Callable[[Evaluation], float]
 FULL_COURSE_HORIZON = 200
-CONSOLIDATION_ROLLBACK_PATIENCE = 3
+CONSOLIDATION_ROLLBACK_PATIENCE = 8
+REPAIR_BRIDGE_INDEX = 13
+REPAIR_BRIDGE_STAGE = "oneshot_hazard_detour"
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +71,7 @@ class CurriculumStage:
     lesson: str = ""
     pool_sizes: tuple[int, ...] | None = None
     objective_check: EvaluationCheck | None = None
+    objective_deficit: EvaluationDeficit | None = None
     objective: str = ""
     required_features: tuple[str, ...] = ()
 
@@ -408,6 +412,14 @@ def default_stages() -> tuple[CurriculumStage, ...]:
         num_switches=(1, 1),
         exit_objective_count=1,
     )
+    oneshot_hazard_config = switch_exit_config.with_overrides(
+        width=(14, 20),
+        height=(11, 16),
+        region_count=(2, 4),
+        obstacle_density=0.0,
+        hazard_density=0.08,
+        hazard_blob_size=(1, 3),
+    )
     timed_switch_config = switch_config.with_overrides(
         timed_door_probability=1.0,
     )
@@ -691,6 +703,18 @@ def default_stages() -> tuple[CurriculumStage, ...]:
             and isinstance(room.exit.requirement, SwitchRequirement)
         )
 
+    def oneshot_hazard_detour(room: Room) -> bool:
+        hazards = {
+            pos
+            for pos in room.terrain.positions()
+            if is_hazard(room.terrain[pos])
+        }
+        return (
+            switch_exit(room)
+            and bool(hazards)
+            and _forces_detour(room, hazards)
+        )
+
     def timed_switch_door(room: Room) -> bool:
         return (
             not room.keys
@@ -877,6 +901,10 @@ def default_stages() -> tuple[CurriculumStage, ...]:
             lesson="Route both agents around hazards that force a safe detour.",
             pool_sizes=(1, 4, 16),
             objective_check=lambda result: result.hazard_entry_rate <= 0.10,
+            objective_deficit=lambda result: max(
+                0.0,
+                result.hazard_entry_rate - 0.10,
+            ) / 0.10,
             objective="hazard_entry_rate <= 10%",
         ),
         CurriculumStage(
@@ -963,6 +991,28 @@ def default_stages() -> tuple[CurriculumStage, ...]:
             pool_sizes=(1, 4, 16),
         ),
         CurriculumStage(
+            "oneshot_hazard_detour",
+            oneshot_hazard_config,
+            oneshot_hazard_detour,
+            0.90,
+            0.80,
+            lesson="Activate a one-shot switch while routing around hazards.",
+            pool_sizes=(1, 4, 16),
+            objective_check=lambda result: result.hazard_entry_rate <= 0.10,
+            objective_deficit=lambda result: max(
+                0.0,
+                result.hazard_entry_rate - 0.10,
+            ) / 0.10,
+            objective="hazard_entry_rate <= 10%",
+            required_features=(
+                "switch_mode:oneshot",
+                "tile:lava",
+                "tile:spikes",
+                "tile:water",
+                "tile:pit",
+            ),
+        ),
+        CurriculumStage(
             "switch_door",
             switch_config,
             switch_door,
@@ -1006,6 +1056,10 @@ def default_stages() -> tuple[CurriculumStage, ...]:
             lesson="Push the aligned crate onto a HOLD switch.",
             pool_sizes=(1, 4, 16),
             objective_check=lambda result: result.crate_switch_rate >= 0.70,
+            objective_deficit=lambda result: max(
+                0.0,
+                0.70 - result.crate_switch_rate,
+            ) / 0.70,
             objective="crate_switch_rate >= 70%",
         ),
         CurriculumStage(
@@ -1017,6 +1071,10 @@ def default_stages() -> tuple[CurriculumStage, ...]:
             lesson="Recognize the reset shortcut and take the safe detour.",
             pool_sizes=(1, 4, 16),
             objective_check=lambda result: result.mean_reset_entries <= 0.15,
+            objective_deficit=lambda result: max(
+                0.0,
+                result.mean_reset_entries - 0.15,
+            ) / 0.15,
             objective="mean_reset_entries <= 0.15",
         ),
         CurriculumStage(
@@ -1028,6 +1086,10 @@ def default_stages() -> tuple[CurriculumStage, ...]:
             lesson="Wait for a required temporary bridge and cross safely.",
             pool_sizes=(1, 4, 16),
             objective_check=lambda result: result.bridge_fall_rate <= 0.10,
+            objective_deficit=lambda result: max(
+                0.0,
+                result.bridge_fall_rate - 0.10,
+            ) / 0.10,
             objective="bridge_fall_rate <= 10%",
         ),
         CurriculumStage(
@@ -1125,6 +1187,12 @@ def default_stages() -> tuple[CurriculumStage, ...]:
                 and result.mean_reset_entries <= 0.15
                 and result.hazard_entry_rate <= 0.15
             ),
+            objective_deficit=lambda result: max(
+                max(0.0, 0.70 - result.crate_switch_rate) / 0.70,
+                max(0.0, result.bridge_fall_rate - 0.10) / 0.10,
+                max(0.0, result.mean_reset_entries - 0.15) / 0.15,
+                max(0.0, result.hazard_entry_rate - 0.15) / 0.15,
+            ),
             objective=(
                 "crate >= 70%, bridge falls <= 10%, "
                 "reset entries <= 0.15, hazard entries <= 15%"
@@ -1171,6 +1239,7 @@ class CurriculumRunner:
         progress_contract: Mapping[str, Any] | None = None,
         extend_stopped_rounds: int = 0,
         retention_upgrade: bool = False,
+        repair_upgrade: bool = False,
     ) -> None:
         if not pool_sizes or any(size < 1 for size in pool_sizes):
             raise ValueError("pool_sizes must contain positive values")
@@ -1227,7 +1296,10 @@ class CurriculumRunner:
         )
         self._external_progress_contract = dict(progress_contract or {})
         self.extend_stopped_rounds = extend_stopped_rounds
+        if retention_upgrade and repair_upgrade:
+            raise ValueError("only one recovery upgrade may be selected")
         self._retention_upgrade = bool(retention_upgrade)
+        self._repair_upgrade = bool(repair_upgrade)
         self.results: list[StageResult] = []
         self.test_results: list[StageTestResult] = []
         self._manifest_builder = LazyRoomManifestBuilder(
@@ -1496,7 +1568,7 @@ class CurriculumRunner:
             raise ValueError("curriculum recovery contract is corrupted")
         contract = self._progress_contract()
         exact_contract = saved_contract == contract
-        if not exact_contract and not self._compatible_retention_upgrade(
+        if not exact_contract and not self._compatible_source_upgrade(
             saved_contract,
             contract,
         ):
@@ -1504,8 +1576,13 @@ class CurriculumRunner:
                 "recovery state does not match this code, seed, or training config"
             )
         if not exact_contract:
+            label = (
+                "training-repair-v4"
+                if self._repair_upgrade
+                else "retention-v2"
+            )
             print(
-                "Accepted the retention-v2 source upgrade; the next recovery "
+                f"Accepted the {label} source upgrade; the next recovery "
                 "checkpoint will use the new contract.",
                 flush=True,
             )
@@ -1522,7 +1599,12 @@ class CurriculumRunner:
             raise ValueError(
                 "--extend-stopped-rounds only applies to a stopped state"
             )
-        manifest = manifest_from_dict(payload["manifest"])
+        if self._repair_upgrade and not exact_contract:
+            self._validate_repair_cursor(payload)
+            manifest_payload = self._repair_manifest(payload["manifest"])
+        else:
+            manifest_payload = payload["manifest"]
+        manifest = manifest_from_dict(manifest_payload)
         self._manifest_builder = LazyRoomManifestBuilder(
             self.stages,
             data_seed=self.data_seed,
@@ -1596,31 +1678,176 @@ class CurriculumRunner:
                 self._force_replay_refill = True
             print("The replay buffer will warm up again.", flush=True)
 
-    def _compatible_retention_upgrade(
+    def _validate_repair_cursor(self, payload: Mapping[str, Any]) -> None:
+        if (
+            payload.get("status") != "stopped"
+            or payload.get("test_results")
+            or payload.get("test_model_sha256") is not None
+        ):
+            raise ValueError("training repair requires an untested stopped state")
+        active = payload.get("active")
+        if not isinstance(active, Mapping):
+            raise ValueError("training repair requires an active pool")
+        if (
+            int(active.get("stage_index", -1)) != REPAIR_BRIDGE_INDEX - 1
+            or int(active.get("pool_index", -1)) != 2
+            or int(active.get("scheduled_pool_size", -1)) != 16
+        ):
+            raise ValueError("training repair source cursor is not supported")
+
+        expected: list[tuple[str, int]] = []
+        for stage_index, stage in enumerate(
+            self.stages[:REPAIR_BRIDGE_INDEX]
+        ):
+            pools = tuple(sorted(set(stage.pool_sizes or self.pool_sizes)))
+            limit = 2 if stage_index == REPAIR_BRIDGE_INDEX - 1 else len(pools)
+            expected.extend((stage.name, pool) for pool in pools[:limit])
+        results = payload.get("results", ())
+        if not isinstance(results, (list, tuple)) or len(results) != len(expected):
+            raise ValueError("training repair results are not the expected prefix")
+        for result, (stage_name, pool_size) in zip(
+            results,
+            expected,
+            strict=True,
+        ):
+            if not isinstance(result, Mapping):
+                raise ValueError("training repair result is invalid")
+            scheduled = result.get("scheduled_pool_size")
+            if scheduled is None:
+                scheduled = result.get("pool_size")
+            if (
+                result.get("stage") != stage_name
+                or int(scheduled) != pool_size
+                or not bool(result.get("promoted"))
+            ):
+                raise ValueError("training repair results are not the expected prefix")
+
+    def _repair_manifest(
+        self,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        saved_stages = payload.get("stages", ())
+        if not isinstance(saved_stages, (list, tuple)) or any(
+            not isinstance(stage, Mapping) for stage in saved_stages
+        ):
+            raise ValueError("training repair room manifest is invalid")
+        stages: list[dict[str, Any]] = [
+            dict(stage) for stage in saved_stages
+        ]
+        current_names = [stage.name for stage in self.stages]
+        saved_names = [str(stage.get("stage")) for stage in stages]
+        expected_saved = (
+            current_names[:REPAIR_BRIDGE_INDEX]
+            + current_names[REPAIR_BRIDGE_INDEX + 1 :]
+        )
+        if saved_names != expected_saved:
+            raise ValueError("training repair room manifest is not compatible")
+
+        bridge = self.stages[REPAIR_BRIDGE_INDEX]
+        config = bridge.config.to_dict()
+        config_json = json.dumps(
+            config,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        stages.insert(
+            REPAIR_BRIDGE_INDEX,
+            {
+                "stage": bridge.name,
+                "config": config,
+                "config_sha256": hashlib.sha256(
+                    config_json.encode("utf-8")
+                ).hexdigest(),
+                "splits": {
+                    "train": [],
+                    "validation": [],
+                    "test": [],
+                },
+                "selection_cursors": {
+                    "train": 0,
+                    "validation": 0,
+                    "test": 0,
+                },
+                "feature_targets": {
+                    "train": 0,
+                    "validation": 0,
+                    "test": 0,
+                },
+            },
+        )
+        migrated = dict(payload)
+        migrated["stages"] = stages
+        return migrated
+
+    def _compatible_source_upgrade(
         self,
         saved: Mapping[str, Any],
         current: Mapping[str, Any],
     ) -> bool:
-        if not self._retention_upgrade:
-            return False
-        if int(saved.get("retention_size", -1)) != 8:
-            return False
-        if int(current.get("retention_size", -1)) != int(
-            current.get("validation_size", -2)
-        ):
+        if not (self._retention_upgrade or self._repair_upgrade):
             return False
 
         saved_copy = dict(saved)
         current_copy = dict(current)
-        saved_copy["retention_size"] = current_copy["retention_size"]
+        if self._retention_upgrade:
+            if int(saved.get("retention_size", -1)) != 8:
+                return False
+            if int(current.get("retention_size", -1)) != int(
+                current.get("validation_size", -2)
+            ):
+                return False
+            saved_copy["retention_size"] = current_copy["retention_size"]
+            expected_kind = "retention_v2"
+            allowed_changes = {
+                "DQN/DQN_train.py",
+                "DQN/curriculum.py",
+                "DQN/run_curriculum.py",
+            }
+        else:
+            if saved.get("retention_size") != current.get("retention_size"):
+                return False
+            saved_stages = saved_copy.get("stages")
+            current_stages = current_copy.get("stages")
+            if not isinstance(saved_stages, list) or not isinstance(
+                current_stages,
+                list,
+            ):
+                return False
+            if (
+                len(current_stages) != len(saved_stages) + 1
+                or current_stages[REPAIR_BRIDGE_INDEX].get("name")
+                != REPAIR_BRIDGE_STAGE
+                or (
+                    current_stages[:REPAIR_BRIDGE_INDEX]
+                    + current_stages[REPAIR_BRIDGE_INDEX + 1 :]
+                )
+                != saved_stages
+            ):
+                return False
+            current_copy["stages"] = saved_stages
+            expected_kind = "training_repair_v4"
+            allowed_changes = {
+                "DQN/DQN_model.py",
+                "DQN/DQN_train.py",
+                "DQN/curriculum.py",
+                "DQN/env_bridge.py",
+                "DQN/load_model.py",
+                "DQN/run_curriculum.py",
+            }
         saved_external = dict(saved_copy.get("external", {}))
         current_external = dict(current_copy.get("external", {}))
         current_upgrade = current_external.get("source_upgrade")
         if (
             not isinstance(current_upgrade, Mapping)
-            or current_upgrade.get("kind") != "retention_v2"
+            or current_upgrade.get("kind") != expected_kind
             or current_upgrade.get("source_contract_sha256")
             != _hash_payload(saved)
+        ):
+            return False
+        if self._repair_upgrade and (
+            current_upgrade.get("inserted_stage") != REPAIR_BRIDGE_STAGE
+            or current_upgrade.get("inserted_stage_index")
+            != REPAIR_BRIDGE_INDEX
         ):
             return False
         saved_sources = saved_external.pop("source_sha256", None)
@@ -1641,11 +1868,7 @@ class CurriculumRunner:
             for name in set(saved_sources) | set(current_sources)
             if saved_sources.get(name) != current_sources.get(name)
         }
-        return bool(changed) and changed <= {
-            "DQN/DQN_train.py",
-            "DQN/curriculum.py",
-            "DQN/run_curriculum.py",
-        }
+        return bool(changed) and changed <= allowed_changes
 
     def _training_failures(
         self,
@@ -1766,6 +1989,17 @@ class CurriculumRunner:
     def _safety_deficit(rate: float, maximum: float) -> float:
         return max(0.0, rate - maximum) / max(maximum, 0.05)
 
+    @staticmethod
+    def _objective_deficit(
+        stage: CurriculumStage,
+        evaluation: Evaluation,
+    ) -> float:
+        if stage.objective_check is None or stage.objective_check(evaluation):
+            return 0.0
+        if stage.objective_deficit is None:
+            return 1.0
+        return max(0.0, float(stage.objective_deficit(evaluation)))
+
     def _retention_stage_deficits(
         self,
         retention: Sequence[tuple[str, float]],
@@ -1789,11 +2023,7 @@ class CurriculumRunner:
                         stage.max_wipeout_death_rate,
                     )
                 )
-                if (
-                    stage.objective_check is not None
-                    and not stage.objective_check(evaluation)
-                ):
-                    values.append(1.0)
+                values.append(self._objective_deficit(stage, evaluation))
             deficits[name] = max(values)
         return deficits
 
@@ -1826,8 +2056,7 @@ class CurriculumRunner:
                 stage.max_wipeout_death_rate,
             ),
         ]
-        if any("training objective" in item for item in training_failures):
-            deficits.append(1.0)
+        deficits.append(self._objective_deficit(stage, training))
         generalization = training.success_rate
         if validation is not None:
             deficits.extend(
@@ -1842,11 +2071,7 @@ class CurriculumRunner:
                     ),
                 )
             )
-            if any(
-                "validation objective" in item
-                for item in validation_failures
-            ):
-                deficits.append(1.0)
+            deficits.append(self._objective_deficit(stage, validation))
             generalization = validation.success_rate
         stage_by_name = {item.name: item for item in self.stages}
         for name, rate in retention:
@@ -1868,11 +2093,9 @@ class CurriculumRunner:
                     retained_stage.max_wipeout_death_rate,
                 )
             )
-            if (
-                retained_stage.objective_check is not None
-                and not retained_stage.objective_check(evaluation)
-            ):
-                deficits.append(1.0)
+            deficits.append(
+                self._objective_deficit(retained_stage, evaluation)
+            )
         if retention:
             generalization = min(
                 generalization,
@@ -2037,7 +2260,7 @@ class CurriculumRunner:
         )
         if consolidation:
             current_share = 0.50 if current_failed else 0.25
-            maintenance = 0.10 if current_failed else 0.20
+            maintenance = 0.15 if current_failed else 0.25
             learning_rate_scale = 0.50 if current_failed else 0.25
         else:
             current_share = 0.80
@@ -2068,7 +2291,7 @@ class CurriculumRunner:
             correction, unused = self._capped_allocation(
                 corrective,
                 scores,
-                0.15,
+                0.35 if current_failed else 0.50,
             )
             maintenance += unused
             group_by_name = {
@@ -2281,6 +2504,37 @@ class CurriculumRunner:
         retention_sets: list[
             tuple[str, CoopEnvBridge, tuple[int, ...]]
         ] = []
+
+        def expand_rehearsal_sources(names: Sequence[str]) -> None:
+            requested = set(names)
+            for index, (name, old_env, old_seeds, group) in enumerate(
+                rehearsal
+            ):
+                if name not in requested:
+                    continue
+                target = max(
+                    len(old_seeds),
+                    min(self.validation_size, self.recovery_pool_max),
+                )
+                if len(old_seeds) >= target:
+                    continue
+                saved = self._manifest_builder.snapshot().stage(name)
+                feature_target = saved.feature_target("train")
+                expanded, new_rooms = stage_rooms(
+                    self.stages[group],
+                    "train",
+                    target,
+                    feature_target,
+                )
+                old_env.set_room_cache_limit(target)
+                old_env.cache_rooms(new_rooms)
+                rehearsal[index] = (name, old_env, expanded, group)
+                print(
+                    f"  repair pool: {name} train rooms "
+                    f"{len(old_seeds)} -> {len(expanded)}.",
+                    flush=True,
+                )
+
         result_ordinal = 0
         resume_active = self._resume_active
         resume_warmup_pending = self._resume_status in {"training", "stopped"}
@@ -2458,7 +2712,7 @@ class CurriculumRunner:
                             "latest_retention_deficits": {},
                             "best_learner_state": None,
                             "needs_replay_refill": False,
-                            "needs_baseline_assessment": False,
+                            "needs_baseline_assessment": True,
                             "consolidation_bad_rounds": 0,
                         }
                     if self._force_replay_refill:
@@ -2470,8 +2724,7 @@ class CurriculumRunner:
                     if active["needs_baseline_assessment"]:
                         pool = train_seeds[: int(active["active_pool_size"])]
                         print(
-                            "  retention-v2: evaluating the saved model before "
-                            "any more training.",
+                            "  baseline: evaluating before any training.",
                             flush=True,
                         )
                         training_eval = evaluate(
@@ -2556,7 +2809,7 @@ class CurriculumRunner:
                             self._force_replay_refill = True
                             self._save_progress("training", None)
                             print(
-                                "  retention-v2: the saved model already "
+                                "  baseline: the saved model already "
                                 "meets every promotion requirement.",
                                 flush=True,
                             )
@@ -2581,6 +2834,7 @@ class CurriculumRunner:
                             rehearsal,
                             active,
                         )
+                        expand_rehearsal_sources(weak_stages)
                         self.trainer.set_replay_group_weights(replay_weights)
                         self.trainer.set_learning_rate(
                             self.trainer.cfg.lr * learning_rate_scale
@@ -3036,18 +3290,10 @@ class CurriculumRunner:
                         finish_plot()
                         return list(self.results)
 
-                stage_results = [
-                    result
-                    for result in self.results
-                    if result.stage == stage.name
-                ]
-                effective_pool = max(
-                    result.pool_size for result in stage_results
-                )
                 saved_stage = self._manifest_builder.snapshot().stage(stage.name)
-                train_seeds = saved_stage.seeds("train")[:effective_pool]
+                train_seeds = saved_stage.seeds("train")
                 validation_seeds = saved_stage.seeds("validation")
-                train_env.set_room_cache_limit(effective_pool)
+                train_env.set_room_cache_limit(len(train_seeds))
                 rehearsal.append(
                     (stage.name, train_env, train_seeds, stage_index)
                 )

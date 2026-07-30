@@ -38,7 +38,14 @@ for _path in (str(_HERE.parent), str(_HERE)):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-from DQN.DQN_model import HIDDEN, N_ACTIONS, OBS_DIM, QNetwork
+from DQN.DQN_model import (
+    HIDDEN,
+    N_ACTIONS,
+    OBS_DIM,
+    POLICY_CONTRACT,
+    QNetwork,
+    policy_scores,
+)
 
 if TYPE_CHECKING:
     from DQN.DQN_train import Agent
@@ -65,6 +72,15 @@ def _net_state(checkpoint: Any) -> dict:
     return checkpoint
 
 
+def _validate_policy(checkpoint: Any) -> None:
+    if (
+        isinstance(checkpoint, dict)
+        and checkpoint.get("policy") is not None
+        and checkpoint.get("policy") != POLICY_CONTRACT
+    ):
+        raise ValueError("checkpoint action policy does not match")
+
+
 def load_agent(
     path: str | Path,
     device: str | torch.device = "auto",
@@ -81,6 +97,7 @@ def load_agent(
 
     resolved = resolve_device(device)
     checkpoint = torch.load(path, map_location=resolved)
+    _validate_policy(checkpoint)
 
     agent = Agent(device=resolved, **agent_kwargs)
     agent.net.load_state_dict(_net_state(checkpoint))
@@ -121,7 +138,14 @@ class Policy:
         return self(obs)
 
     def act(self, obs: ArrayLike) -> int:
-        return int(self(obs).argmax(axis=-1))
+        t = torch.as_tensor(obs, dtype=torch.float32).to(self.device)
+        with torch.no_grad():
+            raw = self.net(t.unsqueeze(0) if t.dim() == 1 else t)
+            scores = policy_scores(
+                raw,
+                t.unsqueeze(0) if t.dim() == 1 else t,
+            )
+        return int(scores.squeeze(0).argmax().item())
 
 
 def load_policy(
@@ -134,6 +158,7 @@ def load_policy(
     """Load just the policy network, for greedy inference."""
     resolved = resolve_device(device)
     checkpoint = torch.load(path, map_location=resolved)
+    _validate_policy(checkpoint)
 
     net = QNetwork(obs_dim=obs_dim, n_actions=n_actions, hidden=hidden)
     net.load_state_dict(_net_state(checkpoint))

@@ -10,7 +10,12 @@ from typing import Any, Mapping
 
 import torch
 
-from curriculum import FULL_COURSE_HORIZON, make_runner
+from curriculum import (
+    FULL_COURSE_HORIZON,
+    REPAIR_BRIDGE_INDEX,
+    REPAIR_BRIDGE_STAGE,
+    make_runner,
+)
 from DQN.DQN_model import ACTIONS, CHANNEL_NAMES, GLOBAL_NAMES, OBS_DIM, OBSERVATION_SCHEMA
 from DQN.DQN_train import Config, pin_auto_device
 from preview_maps import export_manifest_site, load_manifest
@@ -90,6 +95,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "resume one stopped retention-v1 state under retention-v2 rules "
+            "and write recovery to a new file"
+        ),
+    )
+    parser.add_argument(
+        "--resume-repair-upgrade",
+        action="store_true",
+        help=(
+            "resume one stopped state under the route/reward repair "
             "and write recovery to a new file"
         ),
     )
@@ -233,45 +246,38 @@ def _warm_start_metadata(
     }
 
 
-def _retention_upgrade_metadata(
+def _source_upgrade_metadata(
     path: Path,
     payload: dict[str, Any],
+    kind: str,
 ) -> dict[str, Any]:
     status = str(payload.get("status"))
     if status != "stopped":
-        raise ValueError(
-            "retention upgrades require a stopped curriculum state"
-        )
+        raise ValueError("source upgrades require a stopped curriculum state")
     if not isinstance(payload.get("active"), dict):
-        raise ValueError(
-            "retention-upgrade progress must contain an active pool"
-        )
+        raise ValueError("source-upgrade progress must contain an active pool")
     if payload.get("test_results"):
-        raise ValueError(
-            "retention-upgrade progress must not contain final-test results"
-        )
+        raise ValueError("source-upgrade progress must not contain final-test results")
     if payload.get("test_model_sha256") is not None:
-        raise ValueError(
-            "retention-upgrade progress must not contain a final-test model"
-        )
+        raise ValueError("source-upgrade progress must not contain a final-test model")
     contract_sha256 = payload.get("contract_sha256")
     if not isinstance(contract_sha256, str) or not contract_sha256:
-        raise ValueError(
-            "retention-upgrade progress has no source contract hash"
-        )
+        raise ValueError("source-upgrade progress has no source contract hash")
     results = payload.get("results", ())
     if not isinstance(results, (list, tuple)):
-        raise ValueError(
-            "retention-upgrade progress has invalid curriculum results"
-        )
-    return {
-        "kind": "retention_v2",
+        raise ValueError("source-upgrade progress has invalid curriculum results")
+    metadata = {
+        "kind": kind,
         "path": str(path.resolve()),
         "file_sha256": _file_sha256(path),
         "source_contract_sha256": contract_sha256,
         "completed_pool_gates": len(results),
         "original_status": status,
     }
+    if kind == "training_repair_v4":
+        metadata["inserted_stage"] = REPAIR_BRIDGE_STAGE
+        metadata["inserted_stage_index"] = REPAIR_BRIDGE_INDEX
+    return metadata
 
 
 def main() -> None:
@@ -289,21 +295,29 @@ def main() -> None:
         if args.warm_start_progress
         else None
     )
-    if args.resume_retention_upgrade and warm_start_path is not None:
+    if args.resume_retention_upgrade and args.resume_repair_upgrade:
+        raise ValueError("choose only one resume upgrade")
+    upgrade_requested = (
+        args.resume_retention_upgrade or args.resume_repair_upgrade
+    )
+    upgrade_option = (
+        "--resume-repair-upgrade"
+        if args.resume_repair_upgrade
+        else "--resume-retention-upgrade"
+    )
+    if upgrade_requested and warm_start_path is not None:
         raise ValueError(
-            "--resume-retention-upgrade cannot be combined with "
+            f"{upgrade_option} cannot be combined with "
             "--warm-start-progress"
         )
-    if args.resume_retention_upgrade and resume_path is None:
-        raise ValueError(
-            "--resume-retention-upgrade requires --resume-from"
-        )
+    if upgrade_requested and resume_path is None:
+        raise ValueError(f"{upgrade_option} requires --resume-from")
     if (
-        args.resume_retention_upgrade
+        upgrade_requested
         and args.extend_stopped_rounds <= 0
     ):
         raise ValueError(
-            "--resume-retention-upgrade requires "
+            f"{upgrade_option} requires "
             "--extend-stopped-rounds greater than zero"
         )
     if resume_path is not None and warm_start_path is not None:
@@ -323,12 +337,12 @@ def main() -> None:
         )
     )
     if (
-        args.resume_retention_upgrade
+        upgrade_requested
         and resume_path is not None
         and progress_path.resolve() == resume_path.resolve()
     ):
         raise ValueError(
-            "--resume-retention-upgrade requires --progress-output to use "
+            f"{upgrade_option} requires --progress-output to use "
             "a different path from --resume-from"
         )
     if args.map_cell < 4:
@@ -386,7 +400,7 @@ def main() -> None:
         raise FileExistsError(
             f"{progress_path} already exists; choose a new --progress-output"
         )
-    if args.resume_retention_upgrade:
+    if upgrade_requested:
         for label, path in (
             ("checkpoint", checkpoint),
             ("graph", graph_path),
@@ -395,7 +409,7 @@ def main() -> None:
         ):
             if path.exists():
                 raise FileExistsError(
-                    f"{path} already exists; retention upgrade {label} "
+                    f"{path} already exists; source upgrade {label} "
                     "output must use a new path"
                 )
     if checkpoint.exists() and resume_path is None:
@@ -443,13 +457,18 @@ def main() -> None:
             warm_start_info = dict(recovered_warm_start)
     source_upgrade_info: dict[str, Any] | None = None
     if (
-        args.resume_retention_upgrade
+        upgrade_requested
         and resume_path is not None
         and resume_payload is not None
     ):
-        source_upgrade_info = _retention_upgrade_metadata(
+        source_upgrade_info = _source_upgrade_metadata(
             resume_path,
             resume_payload,
+            (
+                "training_repair_v4"
+                if args.resume_repair_upgrade
+                else "retention_v2"
+            ),
         )
     elif resume_payload is not None:
         recovered_source_upgrade = resume_external.get("source_upgrade")
@@ -513,6 +532,7 @@ def main() -> None:
         },
         extend_stopped_rounds=args.extend_stopped_rounds,
         retention_upgrade=args.resume_retention_upgrade,
+        repair_upgrade=args.resume_repair_upgrade,
     )
     if warm_start_payload is not None:
         if warm_start_info is None:
@@ -612,7 +632,10 @@ def main() -> None:
     manifest_file_hash = _file_sha256(manifest_path)
     print(f"Used room manifest saved to {manifest_path}")
 
-    train_limits = {stage.name: 0 for stage in runner.stages}
+    train_limits = {
+        stage.name: len(manifest.stage(stage.name).train)
+        for stage in runner.stages
+    }
     validation_limits = {stage.name: 0 for stage in runner.stages}
     for result in results:
         train_limits[result.stage] = max(

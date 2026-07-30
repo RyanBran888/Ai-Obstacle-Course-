@@ -21,12 +21,64 @@ from DQN.DQN_model import (
     N_ACTIONS,
     OBS_DIM,
     OBSERVATION_SCHEMA,
+    POLICY_CONTRACT,
     QNetwork,
+    action_mask,
+    policy_scores,
+    route_actions,
 )
 
 N_AGENTS = 2
 _AUTO_DEVICE: torch.device | None = None
 _AUTO_CPU_THREADS: int | None = None
+_ROUTE_AUX_WEIGHT = 0.05
+_ROUTE_AUX_MARGIN = 1.0
+
+
+def _valid_actions(observation) -> list[int]:
+    values = torch.as_tensor(observation, dtype=torch.float32)
+    return [int(action) for action in action_mask(values).nonzero().flatten()]
+
+
+def _route_auxiliary_loss(
+    q_values: torch.Tensor,
+    observations: torch.Tensor,
+    action_mask: torch.Tensor,
+) -> torch.Tensor:
+    labels = route_actions(observations)
+    valid = labels >= 0
+    if not bool(valid.any()):
+        return q_values.new_zeros(())
+    rows = valid.nonzero().flatten()
+    route_labels = labels[rows]
+    route_valid = action_mask[rows].gather(
+        1,
+        route_labels.unsqueeze(1),
+    ).squeeze(1)
+    rows = rows[route_valid]
+    route_labels = route_labels[route_valid]
+    if not len(rows):
+        return q_values.new_zeros(())
+    selected = q_values[rows]
+    route_q = selected.gather(
+        1,
+        route_labels.unsqueeze(1),
+    ).squeeze(1)
+    other_q = selected.masked_fill(~action_mask[rows], -torch.inf)
+    other_q = other_q.scatter(
+        1,
+        route_labels.unsqueeze(1),
+        -torch.inf,
+    )
+    competitor = other_q.max(dim=1).values
+    finite = torch.isfinite(competitor)
+    if not bool(finite.any()):
+        return q_values.new_zeros(())
+    return torch.relu(
+        _ROUTE_AUX_MARGIN
+        + competitor[finite]
+        - route_q[finite]
+    ).mean()
 
 
 def _cpu_copy(value):
@@ -696,12 +748,16 @@ class Agent:
         self.target.load_state_dict(self.net.state_dict())
 
     def act(self, obs, eps: float) -> int:
-        return self.net.act(self._tensor(obs), eps)
+        valid = _valid_actions(obs)
+        if eps > 0.0 and random.random() < eps:
+            return random.choice(valid)
+        return self.best_actions([obs])[0]
 
     def best_actions(self, observations) -> list[int]:
         batch = self._tensor(np.asarray(observations, dtype=np.float32))
         with torch.inference_mode():
-            actions = self.net(batch).argmax(dim=1).tolist()
+            q_values = self.net(batch)
+            actions = policy_scores(q_values, batch).argmax(dim=1).tolist()
         return [int(action) for action in actions]
 
     def set_replay_group_weights(
@@ -746,13 +802,24 @@ class Agent:
         terminal_t = torch.as_tensor(terminal, dtype=torch.float32, device=self.device)
         discount_t = torch.as_tensor(discount, dtype=torch.float32, device=self.device)
 
-        q = self.net(obs_t).gather(1, actions_t.unsqueeze(1)).squeeze(1)
+        q_values = self.net(obs_t)
+        q = q_values.gather(1, actions_t.unsqueeze(1)).squeeze(1)
         with torch.no_grad():
-            best = self.net(next_obs_t).argmax(dim=1, keepdim=True)
+            next_online = self.net(next_obs_t)
+            best = policy_scores(
+                next_online,
+                next_obs_t,
+            ).argmax(dim=1, keepdim=True)
             next_q = self.target(next_obs_t).gather(1, best).squeeze(1)
             target = rewards_t + discount_t * next_q * (1.0 - terminal_t)
 
-        loss = self.loss_fn(q, target)
+        current_mask = action_mask(obs_t)
+        route_loss = _route_auxiliary_loss(
+            q_values,
+            obs_t,
+            current_mask,
+        )
+        loss = self.loss_fn(q, target) + _ROUTE_AUX_WEIGHT * route_loss
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(self.net.parameters(), self.clip)
@@ -768,6 +835,7 @@ class Agent:
                 "actions": ACTIONS,
                 "channels": CHANNEL_NAMES,
                 "globals": GLOBAL_NAMES,
+                "policy": dict(POLICY_CONTRACT),
                 "net": self.net.state_dict(),
                 "target": self.target.state_dict(),
                 "opt": self.opt.state_dict(),
@@ -784,6 +852,7 @@ class Agent:
             "actions": ACTIONS,
             "channels": CHANNEL_NAMES,
             "globals": GLOBAL_NAMES,
+            "policy": dict(POLICY_CONTRACT),
             "net": _cpu_copy(self.net.state_dict()),
             "target": _cpu_copy(self.target.state_dict()),
             "opt": _cpu_copy(self.opt.state_dict()),
@@ -798,6 +867,10 @@ class Agent:
             or tuple(checkpoint.get("actions", ())) != ACTIONS
             or tuple(checkpoint.get("channels", ())) != CHANNEL_NAMES
             or tuple(checkpoint.get("globals", ())) != GLOBAL_NAMES
+            or (
+                checkpoint.get("policy") is not None
+                and checkpoint.get("policy") != POLICY_CONTRACT
+            )
         ):
             raise ValueError(
                 "checkpoint network, observation, or action contract does not match"
@@ -817,6 +890,10 @@ class Agent:
             or tuple(checkpoint.get("actions", ())) != ACTIONS
             or tuple(checkpoint.get("channels", ())) != CHANNEL_NAMES
             or tuple(checkpoint.get("globals", ())) != GLOBAL_NAMES
+            or (
+                checkpoint.get("policy") is not None
+                and checkpoint.get("policy") != POLICY_CONTRACT
+            )
         ):
             raise ValueError(
                 "checkpoint network, observation, or action contract does not match"
@@ -845,7 +922,9 @@ def select_actions(
         greedy: list[int] = []
         for index in range(len(agents)):
             if eps > 0.0 and random.random() < eps:
-                actions[index] = random.randrange(agents[0].net.n_actions)
+                actions[index] = random.choice(
+                    _valid_actions(observations[index])
+                )
             else:
                 greedy.append(index)
         if greedy:

@@ -111,6 +111,70 @@ ACTIONS: tuple[str, ...] = (
 N_ACTIONS = len(ACTIONS)
 
 HIDDEN: tuple[int, ...] = (256, 128, 64)
+ROUTE_Q_BIAS = 0.5
+POLICY_CONTRACT = {
+    "version": 1,
+    "route_q_bias": ROUTE_Q_BIAS,
+    "mask_invalid_interact": True,
+}
+
+_GLOBAL_BASE = OBS_DIM - len(GLOBAL_NAMES)
+_ROUTE_DX = _GLOBAL_BASE + GLOBAL_NAMES.index("route_dx")
+_ROUTE_DY = _GLOBAL_BASE + GLOBAL_NAMES.index("route_dy")
+_GOAL_REACHABLE = _GLOBAL_BASE + GLOBAL_NAMES.index("goal_reachable")
+_CAN_INTERACT = _GLOBAL_BASE + GLOBAL_NAMES.index("can_interact")
+_ROUTE_WAIT = _GLOBAL_BASE + GLOBAL_NAMES.index("route_wait")
+
+
+def action_mask(observations: torch.Tensor) -> torch.Tensor:
+    single = observations.ndim == 1
+    batch = observations.unsqueeze(0) if single else observations
+    mask = torch.ones(
+        (batch.shape[0], N_ACTIONS),
+        dtype=torch.bool,
+        device=batch.device,
+    )
+    mask[:, 4] = batch[:, _CAN_INTERACT] > 0.5
+    return mask.squeeze(0) if single else mask
+
+
+def route_actions(observations: torch.Tensor) -> torch.Tensor:
+    single = observations.ndim == 1
+    batch = observations.unsqueeze(0) if single else observations
+    actions = torch.full(
+        (batch.shape[0],),
+        -1,
+        dtype=torch.int64,
+        device=batch.device,
+    )
+    dx = batch[:, _ROUTE_DX]
+    dy = batch[:, _ROUTE_DY]
+    actions[dy < -0.5] = 0
+    actions[dx > 0.5] = 1
+    actions[dy > 0.5] = 2
+    actions[dx < -0.5] = 3
+    eligible = (
+        (batch[:, _GOAL_REACHABLE] > 0.5)
+        & (batch[:, _CAN_INTERACT] < 0.5)
+        & (batch[:, _ROUTE_WAIT] < 0.5)
+    )
+    actions[~eligible] = -1
+    return actions.squeeze(0) if single else actions
+
+
+def policy_scores(
+    q_values: torch.Tensor,
+    observations: torch.Tensor,
+) -> torch.Tensor:
+    single = observations.ndim == 1
+    batch = observations.unsqueeze(0) if single else observations
+    scores = q_values.unsqueeze(0).clone() if single else q_values.clone()
+    routes = route_actions(batch)
+    rows = (routes >= 0).nonzero().flatten()
+    if len(rows):
+        scores[rows, routes[rows]] += ROUTE_Q_BIAS
+    scores = scores.masked_fill(~action_mask(batch), -torch.inf)
+    return scores.squeeze(0) if single else scores
 
 
 class QNetwork(nn.Module):
@@ -153,11 +217,10 @@ class QNetwork(nn.Module):
 
     @torch.no_grad()
     def best(self, obs: torch.Tensor) -> int:
-        return int(self.q_values(obs).argmax().item())
+        return int(policy_scores(self.q_values(obs), obs).argmax().item())
 
     def act(self, obs: torch.Tensor, eps: float) -> int:
-        if eps <= 0.0:
-            return self.best(obs)
         if random.random() < eps:
-            return random.randrange(self.n_actions)
+            valid = action_mask(obs).nonzero().flatten().tolist()
+            return random.choice(valid)
         return self.best(obs)
