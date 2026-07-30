@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import shutil
 import tempfile
 from dataclasses import asdict
 from pathlib import Path
@@ -76,7 +78,14 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="deterministic source for every staged room split",
     )
-    parser.add_argument("--output", default="curriculum_agent.pt")
+    parser.add_argument(
+        "--output",
+        default="curriculum_agent.pt",
+        help=(
+            "canonical shared-policy checkpoint; agent_0.pt, agent_1.pt, and "
+            "curriculum.pt are exported beside it"
+        ),
+    )
     parser.add_argument("--graph-output", default="curriculum_training.png")
     parser.add_argument("--manifest-output", default="curriculum_rooms.json")
     parser.add_argument("--report-output", default="curriculum_report.json")
@@ -240,6 +249,46 @@ def _save_agent(agent, path: Path) -> None:
     temporary.replace(path)
 
 
+def _checkpoint_export_paths(checkpoint: Path) -> dict[str, Path]:
+    return {
+        "agent_0": checkpoint.with_name("agent_0.pt"),
+        "agent_1": checkpoint.with_name("agent_1.pt"),
+        "curriculum": checkpoint.with_name("curriculum.pt"),
+    }
+
+
+def _export_checkpoint_bundle(
+    checkpoint: Path,
+) -> dict[str, dict[str, str]]:
+    """Atomically export the shared policy under all deployment filenames."""
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"frozen checkpoint does not exist: {checkpoint}")
+    checkpoint_hash = _file_sha256(checkpoint)
+    exports: dict[str, dict[str, str]] = {}
+    for name, target in _checkpoint_export_paths(checkpoint).items():
+        if target.resolve() != checkpoint.resolve():
+            if target.exists():
+                if not target.is_file() or _file_sha256(target) != checkpoint_hash:
+                    raise FileExistsError(
+                        f"{target} exists and does not match the frozen checkpoint"
+                    )
+            else:
+                temporary = target.with_name(f".{target.name}.tmp")
+                with checkpoint.open("rb") as source, temporary.open("wb") as output:
+                    shutil.copyfileobj(source, output, length=1024 * 1024)
+                    output.flush()
+                    os.fsync(output.fileno())
+                temporary.replace(target)
+        export_hash = _file_sha256(target)
+        if export_hash != checkpoint_hash:
+            raise RuntimeError(f"checkpoint export changed while writing {target}")
+        exports[name] = {
+            "path": str(target),
+            "sha256": export_hash,
+        }
+    return exports
+
+
 def _load_progress_payload(path: Path) -> dict[str, Any]:
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict) or payload.get("schema_version") != 1:
@@ -323,6 +372,7 @@ def _source_upgrade_metadata(
 def main() -> None:
     args = parse_args()
     checkpoint = Path(args.output).expanduser()
+    checkpoint_export_paths = _checkpoint_export_paths(checkpoint)
     graph_path = Path(args.graph_output).expanduser()
     manifest_path = Path(args.manifest_output).expanduser()
     report_path = Path(args.report_output).expanduser()
@@ -432,6 +482,13 @@ def main() -> None:
         "report": report_path,
         "progress": progress_path,
     }
+    artifacts.update(
+        {
+            f"{name} checkpoint": path
+            for name, path in checkpoint_export_paths.items()
+            if path.resolve() != checkpoint.resolve()
+        }
+    )
     normalized: dict[Path, str] = {}
     for label, path in artifacts.items():
         resolved = path.resolve()
@@ -479,12 +536,18 @@ def main() -> None:
             f"{progress_path} already exists; choose a new --progress-output"
         )
     if upgrade_requested:
-        for label, path in (
+        upgrade_outputs = (
             ("checkpoint", checkpoint),
             ("graph", graph_path),
             ("manifest", manifest_path),
             ("report", report_path),
-        ):
+            *tuple(
+                (f"{name} checkpoint", path)
+                for name, path in checkpoint_export_paths.items()
+                if path.resolve() != checkpoint.resolve()
+            ),
+        )
+        for label, path in upgrade_outputs:
             if path.exists():
                 raise FileExistsError(
                     f"{path} already exists; source upgrade {label} "
@@ -492,6 +555,13 @@ def main() -> None:
                 )
     if checkpoint.exists() and resume_path is None:
         raise FileExistsError(f"{checkpoint} already exists; choose a new --output")
+    if not checkpoint.exists():
+        for name, path in checkpoint_export_paths.items():
+            if path.resolve() != checkpoint.resolve() and path.exists():
+                raise FileExistsError(
+                    f"{path} already exists; choose a new output directory "
+                    f"for the {name} checkpoint"
+                )
     if manifest_path.exists() and resume_path is None:
         raise FileExistsError(
             f"{manifest_path} already exists; choose a new --manifest-output"
@@ -713,10 +783,22 @@ def main() -> None:
             "No final checkpoint, report, manifest, maps, or test data were written."
         )
         raise SystemExit(2)
+    if (
+        len(runner.trainer.learners) != 1
+        or len(runner.trainer.agents) != 2
+        or runner.trainer.agents[0] is not runner.trainer.agents[1]
+    ):
+        raise RuntimeError(
+            "curriculum export requires one policy shared by both agents"
+        )
     if not checkpoint_preexisting:
         _save_agent(runner.trainer.learners[0], checkpoint)
     checkpoint_hash = _file_sha256(checkpoint)
     print(f"Frozen checkpoint ready at {checkpoint}")
+    checkpoint_exports = _export_checkpoint_bundle(checkpoint)
+    print("Shared-policy exports ready:")
+    for name, export in checkpoint_exports.items():
+        print(f"  {name}: {export['path']}")
 
     if runner.completed and (
         args.final_test
@@ -802,6 +884,12 @@ def main() -> None:
         raise RuntimeError("the saved room manifest changed during the run")
     if _file_sha256(checkpoint) != checkpoint_hash:
         raise RuntimeError("the frozen checkpoint changed during the run")
+    if any(
+        export["sha256"] != checkpoint_hash
+        or _file_sha256(export["path"]) != checkpoint_hash
+        for export in checkpoint_exports.values()
+    ):
+        raise RuntimeError("a shared-policy checkpoint export changed during the run")
     if _source_hashes() != source_hashes:
         raise RuntimeError("training source files changed during the run")
     report = {
@@ -854,6 +942,8 @@ def main() -> None:
         "checkpoint": {
             "path": str(checkpoint),
             "sha256": checkpoint_hash,
+            "shared_network": True,
+            "exports": checkpoint_exports,
         },
         "curriculum": [
             {
