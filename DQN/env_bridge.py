@@ -931,9 +931,48 @@ class CoopEnvBridge:
         at_exit = [p == self._exit_pos for p in self.pos]
         return all(at_exit) if self.room.config.exit_requires_both_agents else any(at_exit)
 
+    def _deferred_paired_switches(self) -> set[str]:
+        gates = self.room.metadata.get("gates", ())
+        if not isinstance(gates, (list, tuple)):
+            return set()
+
+        unfinished_depths: set[int] = set()
+        for gate in gates:
+            if not isinstance(gate, dict):
+                continue
+            doors = gate.get("doors", ())
+            if not isinstance(doors, (list, tuple)):
+                continue
+            if any(
+                isinstance(door_id, str)
+                and not self.state.is_door_open(door_id)
+                for door_id in doors
+            ):
+                unfinished_depths.add(int(gate.get("depth", 0)))
+
+        deferred: set[str] = set()
+        for gate in gates:
+            if (
+                not isinstance(gate, dict)
+                or gate.get("kind") != "paired_levers"
+            ):
+                continue
+            depth = int(gate.get("depth", 0))
+            if not any(other < depth for other in unfinished_depths):
+                continue
+            triggers = gate.get("triggers", ())
+            if isinstance(triggers, (list, tuple)):
+                deferred.update(
+                    trigger
+                    for trigger in triggers
+                    if isinstance(trigger, str)
+                )
+        return deferred
+
     def _task_targets(self, i):
         targets = {}
         useful = self._unfinished_requirement_ids()
+        deferred_switches = self._deferred_paired_switches()
         for entity_id in useful:
             entity = self.room.find(entity_id)
             if entity is None:
@@ -943,6 +982,8 @@ class CoopEnvBridge:
                     continue
                 kind = "key"
             elif isinstance(entity, Switch):
+                if entity.id in deferred_switches:
+                    continue
                 planned = self._planned_crate_for_switch(entity.id)
                 if planned is not None and not self._is_done(planned):
                     continue

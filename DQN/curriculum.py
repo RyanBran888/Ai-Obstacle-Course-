@@ -1242,6 +1242,7 @@ class CurriculumRunner:
         retention_upgrade: bool = False,
         repair_upgrade: bool = False,
         policy_upgrade: bool = False,
+        planner_upgrade: bool = False,
     ) -> None:
         if not pool_sizes or any(size < 1 for size in pool_sizes):
             raise ValueError("pool_sizes must contain positive values")
@@ -1304,12 +1305,14 @@ class CurriculumRunner:
                 retention_upgrade,
                 repair_upgrade,
                 policy_upgrade,
+                planner_upgrade,
             )
         ) > 1:
             raise ValueError("only one recovery upgrade may be selected")
         self._retention_upgrade = bool(retention_upgrade)
         self._repair_upgrade = bool(repair_upgrade)
         self._policy_upgrade = bool(policy_upgrade)
+        self._planner_upgrade = bool(planner_upgrade)
         self.results: list[StageResult] = []
         self.test_results: list[StageTestResult] = []
         self._manifest_builder = LazyRoomManifestBuilder(
@@ -1592,7 +1595,11 @@ class CurriculumRunner:
                 else (
                     "policy-v2"
                     if self._policy_upgrade
-                    else "retention-v2"
+                    else (
+                        "planner-v3"
+                        if self._planner_upgrade
+                        else "retention-v2"
+                    )
                 )
             )
             print(
@@ -1651,6 +1658,10 @@ class CurriculumRunner:
         if self._resume_active is not None and not exact_contract:
             self._resume_active["best_rank"] = ()
             self._resume_active["needs_baseline_assessment"] = True
+            if self._planner_upgrade:
+                self.trainer.load_learner_state(
+                    self._resume_active["best_learner_state"]
+                )
         if status == "stopped":
             if self._resume_active is None:
                 raise ValueError("stopped recovery state has no active pool")
@@ -1829,6 +1840,7 @@ class CurriculumRunner:
             self._retention_upgrade
             or self._repair_upgrade
             or self._policy_upgrade
+            or self._planner_upgrade
         ):
             return False
 
@@ -1879,7 +1891,7 @@ class CurriculumRunner:
                 "DQN/load_model.py",
                 "DQN/run_curriculum.py",
             }
-        else:
+        elif self._policy_upgrade:
             if saved.get("retention_size") != current.get("retention_size"):
                 return False
             if saved.get("stages") != current.get("stages"):
@@ -1891,6 +1903,17 @@ class CurriculumRunner:
                 "DQN/curriculum.py",
                 "DQN/env_bridge.py",
                 "DQN/load_model.py",
+                "DQN/run_curriculum.py",
+            }
+        else:
+            if saved.get("retention_size") != current.get("retention_size"):
+                return False
+            if saved.get("stages") != current.get("stages"):
+                return False
+            expected_kind = "planner_v3"
+            allowed_changes = {
+                "DQN/curriculum.py",
+                "DQN/env_bridge.py",
                 "DQN/run_curriculum.py",
             }
         saved_external = dict(saved_copy.get("external", {}))
