@@ -1,0 +1,319 @@
+[gd_scene load_steps=17 format=3 uid="uid://d1w6bjf6vfsj5"]
+
+[ext_resource type="Script" path="res://Node2d.cs" id="1_3hu4q"]
+[ext_resource type="Texture2D" uid="uid://cckawwq6gvj8c" path="res://pixil-frame-0 (13).png" id="1_e6564"]
+[ext_resource type="Texture2D" uid="uid://cxiom4x76auty" path="res://pixil-frame-0 (14).png" id="2_l2d15"]
+[ext_resource type="Texture2D" uid="uid://5q1bkb2pbvby" path="res://pixil-frame-0 (12).png" id="3_qe64x"]
+[ext_resource type="Texture2D" uid="uid://fh6n60r1kt3i" path="res://pixil-frame-0 (11).png" id="4_yaphf"]
+[ext_resource type="Texture2D" uid="uid://djmpgtubs5djg" path="res://pixil-frame-0 (8).png" id="5_oij4p"]
+[ext_resource type="Texture2D" uid="uid://b44wmcx1j1g00" path="res://pixil-frame-0 (15).png" id="6_1kwnq"]
+[ext_resource type="Texture2D" uid="uid://dkf44nxnou6kg" path="res://pixil-frame-0 (7).png" id="6_f4kcl"]
+[ext_resource type="Texture2D" uid="uid://cwc64giwt4aga" path="res://pixil-frame-0 (16).png" id="7_668ug"]
+[ext_resource type="Texture2D" uid="uid://d0ucssltmeug" path="res://pixil-frame-0 (10).png" id="8_a7ktd"]
+[ext_resource type="Texture2D" uid="uid://bp55s1qhtqjpx" path="res://pixil-frame-0 (19).png" id="9_7qukc"]
+[ext_resource type="Texture2D" uid="uid://b7xyfwqof157" path="res://pixil-frame-0 (20).png" id="10_ysr20"]
+[ext_resource type="Texture2D" uid="uid://beoc6qmq5vb0s" path="res://original-14406487-1.jpg" id="11_3mstp"]
+[ext_resource type="Texture2D" uid="uid://timwc37g3b53" path="res://pixil-frame-0 (18).png" id="11_jd60l"]
+[ext_resource type="Texture2D" uid="uid://bcuvybhx08si5" path="res://pixil-frame-0 (17).png" id="12_rwyal"]
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_80hob"]
+size = Vector2(698.172, 696.935)
+
+[node name="Node2D" type="Node2D"]
+script = ExtResource("1_3hu4q")
+
+[node name="Control" type="Control" parent="."]
+layout_mode = 3
+anchors_preset = 0
+offset_right = 40.0
+offset_bottom = 40.0
+
+[node name="MenuButton" type="MenuButton" parent="Control"]
+layout_mode = 0
+offset_top = 1.0
+offset_right = 363.0
+offset_bottom = 173.0
+theme_override_font_sizes/font_size = 50
+text = "Obstacles"
+item_count = 11
+popup/item_0/text = "RedKey"
+popup/item_0/icon = ExtResource("1_e6564")
+popup/item_1/text = "BlueKey"
+popup/item_1/icon = ExtResource("2_l2d15")
+popup/item_1/id = 1
+popup/item_2/text = "RedDoor"
+popup/item_2/icon = ExtResource("3_qe64x")
+popup/item_2/id = 2
+popup/item_3/text = "BlueDoor"
+popup/item_3/icon = ExtResource("4_yaphf")
+popup/item_3/id = 3
+popup/item_4/text = "Ball"
+popup/item_4/icon = ExtResource("5_oij4p")
+popup/item_4/id = 4
+popup/item_5/text = "BigBall"
+popup/item_5/icon = ExtResource("6_f4kcl")
+popup/item_5/id = 5
+popup/item_6/text = "Wall"
+popup/item_6/icon = ExtResource("8_a7ktd")
+popup/item_6/id = 6
+popup/item_7/text = "Lava"
+popup/item_7/icon = ExtResource("9_7qukc")
+popup/item_7/id = 7
+popup/item_8/text = "End"
+popup/item_8/icon = ExtResource("10_ysr20")
+popup/item_8/id = 8
+popup/item_9/text = "Blue Start"
+popup/item_9/icon = ExtResource("11_jd60l")
+popup/item_9/id = 10
+popup/item_10/text = "Red Start"
+popup/item_10/icon = ExtResource("12_rwyal")
+popup/item_10/id = 9
+
+[node name="Button" type="Button" parent="Control"]
+layout_mode = 0
+offset_left = 374.0
+offset_top = 563.0
+offset_right = 437.0
+offset_bottom = 594.0
+text = "Run Ai!"
+
+[node name="Grid" type="Node2D" parent="."]
+visible = false
+z_index = -1
+z_as_relative = false
+position = Vector2(81, -1)
+scale = Vector2(0.93, 0.93)
+
+[node name="Sprite2D" type="Sprite2D" parent="Grid"]
+position = Vector2(628, 175)
+texture = ExtResource("11_3mstp")
+
+[node name="Sprite2D4" type="Sprite2D" parent="Grid"]
+position = Vector2(977, 175)
+texture = ExtResource("11_3mstp")
+
+[node name="Sprite2D3" type="Sprite2D" parent="Grid"]
+position = Vector2(977, 523)
+texture = ExtResource("11_3mstp")
+
+[node name="Sprite2D2" type="Sprite2D" parent="Grid"]
+position = Vector2(628, 523)
+texture = ExtResource("11_3mstp")
+
+[node name="Area2D" type="Area2D" parent="Grid"]
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="Grid/Area2D"]
+position = Vector2(802.527, 349.382)
+shape = SubResource("RectangleShape2D_80hob")
+
+[node name="PlacedObjects" type="Node2D" parent="."]
+
+[node name="Templates" type="Node2D" parent="."]
+visible = false
+
+[node name="BKey" type="Area2D" parent="Templates"]
+
+[node name="CollisionPolygon2D" type="CollisionPolygon2D" parent="Templates/BKey"]
+top_level = true
+light_mask = 2
+visibility_layer = 2
+z_index = 10
+position = Vector2(-1.276, 9.6925)
+scale = Vector2(1.03448, 1.15385)
+polygon = PackedVector2Array(-13, -22, -13, -17.2579, -13, 4, 16, 4, 16, -22)
+
+[node name="Sprite2D" type="Sprite2D" parent="Templates/BKey"]
+position = Vector2(-1.276, 9.6925)
+scale = Vector2(1.03448, 1.15385)
+texture = ExtResource("2_l2d15")
+
+[node name="RKey" type="Area2D" parent="Templates"]
+
+[node name="CollisionPolygon2D" type="CollisionPolygon2D" parent="Templates/RKey"]
+top_level = true
+light_mask = 2
+visibility_layer = 2
+z_index = 10
+position = Vector2(-1.276, 9.69249)
+scale = Vector2(1.03448, 1.15385)
+polygon = PackedVector2Array(-13, -22, -13, -17.2579, -13, 4, 16, 4, 16, -22)
+
+[node name="Sprite2D" type="Sprite2D" parent="Templates/RKey"]
+position = Vector2(-1.276, 9.69249)
+scale = Vector2(1.03448, 1.15385)
+texture = ExtResource("1_e6564")
+
+[node name="BDoor" type="Area2D" parent="Templates"]
+
+[node name="CollisionPolygon2D" type="CollisionPolygon2D" parent="Templates/BDoor"]
+top_level = true
+light_mask = 2
+visibility_layer = 2
+z_index = 10
+position = Vector2(-1.00014, 10.5001)
+scale = Vector2(1.03448, 1.15385)
+polygon = PackedVector2Array(-13, -22, -13, -17.2579, -13, 4, 16, 4, 16, -22)
+
+[node name="Sprite2D" type="Sprite2D" parent="Templates/BDoor"]
+position = Vector2(-2.00014, -1.49989)
+scale = Vector2(0.919997, 0.610002)
+texture = ExtResource("4_yaphf")
+
+[node name="Lava" type="Area2D" parent="Templates"]
+
+[node name="CollisionPolygon2D" type="CollisionPolygon2D" parent="Templates/Lava"]
+top_level = true
+light_mask = 2
+visibility_layer = 2
+z_index = 10
+position = Vector2(-1.00014, 10.5001)
+scale = Vector2(1.03448, 1.15385)
+polygon = PackedVector2Array(-13.5332, -22.9667, -13.5332, -16.9, -13.5332, 4.76655, 17.4002, 4.76655, 17.4002, -22.9667)
+
+[node name="Sprite2D" type="Sprite2D" parent="Templates/Lava"]
+position = Vector2(-3, 2)
+texture = ExtResource("9_7qukc")
+
+[node name="End" type="Area2D" parent="Templates"]
+
+[node name="CollisionPolygon2D" type="CollisionPolygon2D" parent="Templates/End"]
+top_level = true
+light_mask = 2
+visibility_layer = 2
+z_index = 10
+position = Vector2(-1.00014, 10.5001)
+scale = Vector2(1.03448, 1.15385)
+polygon = PackedVector2Array(-13.5332, -22.9667, -13.5332, -16.9, -13.5332, 4.76655, 17.4002, 4.76655, 17.4002, -22.9667)
+
+[node name="Sprite2D" type="Sprite2D" parent="Templates/End"]
+position = Vector2(-3, 2)
+texture = ExtResource("10_ysr20")
+
+[node name="RStart" type="Area2D" parent="Templates"]
+
+[node name="CollisionPolygon2D" type="CollisionPolygon2D" parent="Templates/RStart"]
+top_level = true
+light_mask = 2
+visibility_layer = 2
+z_index = 10
+position = Vector2(-1.00014, 10.5001)
+scale = Vector2(1.03448, 1.15385)
+polygon = PackedVector2Array(-13.5332, -22.9667, -13.5332, -16.9, -13.5332, 4.76655, 17.4002, 4.76655, 17.4002, -22.9667)
+
+[node name="Sprite2D" type="Sprite2D" parent="Templates/RStart"]
+position = Vector2(2, 2)
+texture = ExtResource("12_rwyal")
+
+[node name="BStart" type="Area2D" parent="Templates"]
+
+[node name="CollisionPolygon2D" type="CollisionPolygon2D" parent="Templates/BStart"]
+top_level = true
+light_mask = 2
+visibility_layer = 2
+z_index = 10
+position = Vector2(-1.00014, 10.5001)
+scale = Vector2(1.03448, 1.15385)
+polygon = PackedVector2Array(-13.5332, -22.9667, -13.5332, -16.9, -13.5332, 4.76655, 17.4002, 4.76655, 17.4002, -22.9667)
+
+[node name="Sprite2D" type="Sprite2D" parent="Templates/BStart"]
+position = Vector2(2, 2)
+texture = ExtResource("11_jd60l")
+
+[node name="RDoor" type="Area2D" parent="Templates"]
+
+[node name="CollisionPolygon2D" type="CollisionPolygon2D" parent="Templates/RDoor"]
+top_level = true
+light_mask = 2
+visibility_layer = 2
+z_index = 10
+position = Vector2(-1.00014, 10.5001)
+scale = Vector2(1.03448, 1.15385)
+polygon = PackedVector2Array(-13, -22, -13, -17.2579, -13, 4, 16, 4, 16, -22)
+
+[node name="Sprite2D" type="Sprite2D" parent="Templates/RDoor"]
+position = Vector2(-2.00014, -1.49989)
+scale = Vector2(0.919997, 0.610002)
+texture = ExtResource("3_qe64x")
+
+[node name="Wall" type="Area2D" parent="Templates"]
+
+[node name="CollisionPolygon2D" type="CollisionPolygon2D" parent="Templates/Wall"]
+top_level = true
+light_mask = 2
+visibility_layer = 2
+z_index = 10
+position = Vector2(-1.51731, 10.6927)
+scale = Vector2(1.03448, 1.15385)
+polygon = PackedVector2Array(-13, -22, -13, -17.2579, -13, 4, 16, 4, 16, -22)
+
+[node name="Sprite2D" type="Sprite2D" parent="Templates/Wall"]
+position = Vector2(-0.517311, 22.6927)
+scale = Vector2(0.529654, 2.65385)
+texture = ExtResource("8_a7ktd")
+
+[node name="SBall" type="Area2D" parent="Templates"]
+collision_layer = 256
+
+[node name="CollisionPolygon2D" type="CollisionPolygon2D" parent="Templates/SBall"]
+top_level = true
+light_mask = 2
+visibility_layer = 2
+z_index = 10
+position = Vector2(-33, 6)
+scale = Vector2(1.03448, 1.15385)
+polygon = PackedVector2Array(-44.4668, -21.6666, -44.4668, -15.5999, -44.4668, 4.33332, 108.267, 4.33332, 108.267, -21.6666, -13.5333, -21.6667)
+
+[node name="Ball" type="Area2D" parent="Templates/SBall"]
+
+[node name="CollisionPolygon2D" type="CollisionPolygon2D" parent="Templates/SBall/Ball"]
+top_level = true
+light_mask = 2
+visibility_layer = 2
+z_index = 10
+position = Vector2(-34, 8)
+scale = Vector2(1.03448, 1.15385)
+polygon = PackedVector2Array(17.4, -21.6667, 17.4, 4.33333, 46.4, 4.33333, 46.4, -21.6667)
+
+[node name="SBallBall" type="Sprite2D" parent="Templates/SBall/Ball"]
+position = Vector2(2, 3)
+scale = Vector2(1.2931, 1.44231)
+texture = ExtResource("7_668ug")
+
+[node name="Sprite2D" type="Sprite2D" parent="Templates/SBall"]
+scale = Vector2(1.57999, 0.890003)
+texture = ExtResource("6_1kwnq")
+
+[node name="BBall" type="Area2D" parent="Templates"]
+collision_layer = 256
+
+[node name="CollisionPolygon2D" type="CollisionPolygon2D" parent="Templates/BBall"]
+top_level = true
+light_mask = 2
+visibility_layer = 2
+z_index = 10
+position = Vector2(-33, 7)
+scale = Vector2(1.03448, 1.15385)
+polygon = PackedVector2Array(-45.4333, -21.6667, -140.167, -21.6666, -140.167, -3.46666, -140.167, 4.33332, 203.967, 4.33332, 203.967, -23.3999, -13.5333, -21.6667)
+
+[node name="Ball" type="Area2D" parent="Templates/BBall"]
+
+[node name="CollisionPolygon2D" type="CollisionPolygon2D" parent="Templates/BBall/Ball"]
+top_level = true
+light_mask = 2
+visibility_layer = 2
+z_index = 10
+position = Vector2(-34, 9)
+scale = Vector2(1.03448, 1.15385)
+polygon = PackedVector2Array(17.4, -21.6667, 17.4, 4.33333, 46.4, 4.33333, 46.4, -21.6667)
+
+[node name="BBallBall" type="Sprite2D" parent="Templates/BBall/Ball"]
+position = Vector2(3, 3)
+scale = Vector2(1.2931, 1.44231)
+texture = ExtResource("7_668ug")
+
+[node name="Sprite2D" type="Sprite2D" parent="Templates/BBall"]
+position = Vector2(0, 2)
+scale = Vector2(3.555, 0.89)
+texture = ExtResource("6_1kwnq")
+
+[connection signal="pressed" from="Control/Button" to="." method="PushyPushy"]
