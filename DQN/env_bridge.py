@@ -91,7 +91,7 @@ R_TOWARD_OBJECTIVE = 1.0
 
 R_STEP = -0.01
 R_BLOCKED = -0.02
-R_HAZARD = -0.05
+R_HAZARD = -0.5
 R_RESET_ZONE = -0.5
 R_INVALID_ACTION = -0.1
 R_WRONG_KEY = -0.05
@@ -166,6 +166,7 @@ class CoopEnvBridge:
         max_steps=200,
         micro=None,
         shaping_gamma=0.99,
+        record_metrics=True,
     ):
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1")
@@ -175,6 +176,7 @@ class CoopEnvBridge:
         self.sess = EnvironmentSession(self.cfg, master_seed=seed)
         self.max_steps = max_steps
         self.shaping_gamma = float(shaping_gamma)
+        self.record_metrics = bool(record_metrics)
         self.micro = micro
         self.micro_vary = False
         self._micro_seed = 0
@@ -251,6 +253,14 @@ class CoopEnvBridge:
             raise ValueError("room cache limit must be positive")
         self._room_cache_limit = limit
         while len(self._room_cache) > limit:
+            self._room_cache.popitem(last=False)
+
+    def cache_rooms(self, rooms) -> None:
+        for room in rooms:
+            seed = normalize_seed(room.seed)
+            self._room_cache[seed] = room
+            self._room_cache.move_to_end(seed)
+        while len(self._room_cache) > self._room_cache_limit:
             self._room_cache.popitem(last=False)
 
     def load_room(self, room):
@@ -839,7 +849,8 @@ class CoopEnvBridge:
     def _record_episode_metrics(self) -> None:
         if self._metrics_recorded:
             return
-        self.metrics_history.append(deepcopy(self.episode_metrics))
+        if self.record_metrics:
+            self.metrics_history.append(deepcopy(self.episode_metrics))
         self._metrics_recorded = True
 
     def metrics_summary(self) -> dict[str, float | int]:

@@ -49,7 +49,7 @@ from coop_env.rendering import (  # noqa: E402
 from coop_env.rendering.palette import DARK  # noqa: E402
 
 from curriculum import default_stages  # noqa: E402
-from room_manifest import room_fingerprints  # noqa: E402
+from room_manifest import SELECTION_ALGORITHM, room_fingerprints  # noqa: E402
 
 DEFAULT_OUT = "curriculum_maps.html"
 SPLITS = ("train", "validation", "test")
@@ -89,11 +89,14 @@ def _json_hash(value) -> str:
 
 def load_manifest(path: Path) -> dict:
     data = json.loads(path.read_text(encoding="utf-8"))
-    if data.get("schema_version") != 3:
+    schema = data.get("schema_version")
+    if schema not in (3, 4):
         raise ValueError(
-            f"{path}: expected room manifest schema 3, "
-            f"found {data.get('schema_version')!r}"
+            f"{path}: expected room manifest schema 3 or 4, "
+            f"found {schema!r}"
         )
+    if schema == 4 and data.get("selection_algorithm") != SELECTION_ALGORITHM:
+        raise ValueError(f"{path}: room selection algorithm does not match")
     if data.get("generator_version") != coop_env.__version__:
         raise ValueError(
             f"{path}: generator version {data.get('generator_version')!r} "
@@ -484,6 +487,8 @@ def export_manifest_site(
             limit = _room_limit(split, stage, count, limits)
             rooms = manifest_stage(entry, split, limit)
             shown = len(rooms)
+            if shown == 0:
+                continue
             note = f"{split} split, {shown} of {total} recorded rooms"
 
             asset_dir = split_dir / stage_slug

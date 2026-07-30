@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import sys
+from array import array
 from collections import deque
+from collections.abc import MutableSequence, Sequence
+from math import ceil
 
 
 def _pyplot(interactive: bool):
@@ -20,7 +23,7 @@ def _pyplot(interactive: bool):
     return plt
 
 
-def running_mean(values: list[float], window: int) -> list[float]:
+def running_mean(values: Sequence[float], window: int) -> list[float]:
     out: list[float] = []
     recent: deque[float] = deque(maxlen=window)
     total = 0.0
@@ -111,11 +114,15 @@ class CurriculumPlot:
         every: int = 10,
         reward_window: int = 50,
         metric_window: int = 100,
+        max_points: int = 5_000,
     ) -> None:
+        if every < 1 or max_points < 1:
+            raise ValueError("plot intervals must be positive")
         self.plt = _pyplot(interactive=interactive)
         self.every = every
         self.reward_window = reward_window
         self.metric_window = metric_window
+        self.max_points = max_points
         self.visible = interactive and self.plt.get_backend().lower() != "agg"
 
         self.fig, axes = self.plt.subplots(2, 2, figsize=(12, 8))
@@ -175,6 +182,14 @@ class CurriculumPlot:
         self.train_rates: list[float] = []
         self.validation_rates: list[float] = []
         self.retention_rates: list[float] = []
+        self._reward_rolling = array("f")
+        self._success_rolling = array("f")
+        self._death_rolling = array("f")
+        self._hazard_rolling = array("f")
+        self._bridge_rolling = array("f")
+        self._crate_rolling = array("f")
+        self._reset_rolling = array("f")
+        self._steps_rolling = array("f")
         self._format_axes()
 
         if self.visible:
@@ -263,44 +278,64 @@ class CurriculumPlot:
 
     def update(
         self,
-        returns: list[float],
-        completed: list[float],
-        deaths: list[float],
-        steps: list[float],
-        epsilons: list[float],
+        returns: Sequence[float],
+        completed: Sequence[float],
+        deaths: Sequence[float],
+        steps: Sequence[float],
+        epsilons: Sequence[float],
         *,
-        hazards: list[float] | None = None,
-        bridge_falls: list[float] | None = None,
-        crate_switches: list[float] | None = None,
-        resets: list[float] | None = None,
+        hazards: Sequence[float] | None = None,
+        bridge_falls: Sequence[float] | None = None,
+        crate_switches: Sequence[float] | None = None,
+        resets: Sequence[float] | None = None,
         force: bool = False,
     ) -> None:
         if not returns or (not force and len(returns) % self.every):
             return
-        episodes = list(range(len(returns)))
-        self.reward_raw.set_data(episodes, returns)
-        self.reward_mean.set_data(episodes, running_mean(returns, self.reward_window))
-        self.success_mean.set_data(
-            episodes, running_mean(completed, self.metric_window)
+        zeros = (
+            [0.0] * len(returns)
+            if any(
+                values is None
+                for values in (hazards, bridge_falls, crate_switches, resets)
+            )
+            else []
         )
-        self.death_mean.set_data(
-            episodes, running_mean(deaths, self.metric_window)
+        hazard_values = hazards if hazards is not None else zeros
+        bridge_values = bridge_falls if bridge_falls is not None else zeros
+        crate_values = crate_switches if crate_switches is not None else zeros
+        reset_values = resets if resets is not None else zeros
+        series = (
+            (returns, self._reward_rolling, self.reward_window),
+            (completed, self._success_rolling, self.metric_window),
+            (deaths, self._death_rolling, self.metric_window),
+            (hazard_values, self._hazard_rolling, self.metric_window),
+            (bridge_values, self._bridge_rolling, self.metric_window),
+            (crate_values, self._crate_rolling, self.metric_window),
+            (reset_values, self._reset_rolling, self.metric_window),
+            (steps, self._steps_rolling, self.metric_window),
         )
-        zeros = [0.0] * len(returns)
-        self.hazard_mean.set_data(
-            episodes, running_mean(hazards or zeros, self.metric_window)
-        )
-        self.bridge_fall_mean.set_data(
-            episodes, running_mean(bridge_falls or zeros, self.metric_window)
-        )
-        self.crate_mean.set_data(
-            episodes, running_mean(crate_switches or zeros, self.metric_window)
-        )
-        self.reset_mean.set_data(
-            episodes, running_mean(resets or zeros, self.metric_window)
-        )
-        self.steps_mean.set_data(episodes, running_mean(steps, self.metric_window))
-        self.epsilon_line.set_data(episodes, epsilons)
+        for values, means, window in series:
+            self._extend_running_mean(values, means, window)
+
+        count = len(returns)
+        stride = max(1, ceil(count / self.max_points))
+        episodes = list(range(0, count, stride))
+        if episodes[-1] != count - 1:
+            episodes.append(count - 1)
+
+        def shown(values: Sequence[float]) -> list[float]:
+            return [values[index] for index in episodes]
+
+        self.reward_raw.set_data(episodes, shown(returns))
+        self.reward_mean.set_data(episodes, shown(self._reward_rolling))
+        self.success_mean.set_data(episodes, shown(self._success_rolling))
+        self.death_mean.set_data(episodes, shown(self._death_rolling))
+        self.hazard_mean.set_data(episodes, shown(self._hazard_rolling))
+        self.bridge_fall_mean.set_data(episodes, shown(self._bridge_rolling))
+        self.crate_mean.set_data(episodes, shown(self._crate_rolling))
+        self.reset_mean.set_data(episodes, shown(self._reset_rolling))
+        self.steps_mean.set_data(episodes, shown(self._steps_rolling))
+        self.epsilon_line.set_data(episodes, shown(epsilons))
         self.train_eval.set_data(self.eval_episodes, self.train_rates)
         self.validation_eval.set_data(self.eval_episodes, self.validation_rates)
         self.retention_eval.set_data(self.eval_episodes, self.retention_rates)
@@ -313,6 +348,22 @@ class CurriculumPlot:
         self.epsilon_ax.set_xlim(0, max(1, len(returns) - 1))
         self.fig.canvas.draw_idle()
         self.pump()
+
+    @staticmethod
+    def _extend_running_mean(
+        values: Sequence[float],
+        means: MutableSequence[float],
+        window: int,
+    ) -> None:
+        if len(means) > len(values):
+            means.clear()
+        start = len(means)
+        total = sum(values[max(0, start - window):start])
+        for index in range(start, len(values)):
+            total += values[index]
+            if index >= window:
+                total -= values[index - window]
+            means.append(total / min(window, index + 1))
 
     def save(self, path: str) -> None:
         self.fig.savefig(path, dpi=150)

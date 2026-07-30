@@ -172,6 +172,12 @@ class Agent:
     def act(self, obs, eps: float) -> int:
         return self.net.act(self._tensor(obs), eps)
 
+    def best_actions(self, observations) -> list[int]:
+        batch = self._tensor(np.asarray(observations, dtype=np.float32))
+        with torch.no_grad():
+            actions = self.net(batch).argmax(dim=1).tolist()
+        return [int(action) for action in actions]
+
     def remember(
         self,
         obs,
@@ -254,6 +260,32 @@ class Agent:
         return torch.as_tensor(obs, dtype=torch.float32, device=self.device)
 
 
+def select_actions(
+    agents: Sequence[Agent],
+    observations,
+    eps: float,
+) -> list[int]:
+    if len(agents) > 1 and all(agent is agents[0] for agent in agents[1:]):
+        actions = [0] * len(agents)
+        greedy: list[int] = []
+        for index in range(len(agents)):
+            if eps > 0.0 and random.random() < eps:
+                actions[index] = random.randrange(agents[0].net.n_actions)
+            else:
+                greedy.append(index)
+        if greedy:
+            choices = agents[0].best_actions(
+                [observations[index] for index in greedy]
+            )
+            for index, action in zip(greedy, choices, strict=True):
+                actions[index] = action
+        return actions
+    return [
+        agent.act(observations[index], eps)
+        for index, agent in enumerate(agents)
+    ]
+
+
 def build_agents(n: int = N_AGENTS, **kwargs) -> list[Agent]:
     replay_seed = int(kwargs.pop("replay_seed", 0))
     return [Agent(**kwargs, replay_seed=replay_seed + i) for i in range(n)]
@@ -275,6 +307,7 @@ class Evaluation:
     timeouts: int
     mean_return: float
     mean_steps: float
+    mean_episode_steps: float
     mean_keys: float
     mean_doors: float
     mean_switches: float
@@ -311,6 +344,7 @@ class Evaluation:
             "success_rate": self.success_rate,
             "mean_return": self.mean_return,
             "mean_steps": self.mean_steps,
+            "mean_episode_steps": self.mean_episode_steps,
             "mean_keys": self.mean_keys,
             "mean_doors": self.mean_doors,
             "mean_switches": self.mean_switches,
@@ -557,10 +591,7 @@ class Trainer:
 
         for _ in range(self.cfg.max_steps):
             eps = self.epsilon() if epsilon is None else epsilon
-            actions = [
-                agent.act(obs[index], eps)
-                for index, agent in enumerate(self.agents)
-            ]
+            actions = select_actions(self.agents, obs, eps)
             next_obs, rewards, done, cut, info = active_env.step(actions)
             terminal = done or cut
 
@@ -571,6 +602,7 @@ class Trainer:
                     or any(
                         "wipeout_" in event
                         or "bridge_fall" in event
+                        or event.endswith(":hazard")
                         or event.startswith("timed_door_")
                         for event in info["events"]
                     )
@@ -650,10 +682,7 @@ def evaluate_detailed(
         obs = env.reset(seed=seed)
         episode_return = 0.0
         for _ in range(env.max_steps):
-            actions = [
-                agent.act(obs[index], 0.0)
-                for index, agent in enumerate(agents)
-            ]
+            actions = select_actions(agents, obs, 0.0)
             obs, rewards, done, cut, info = env.step(actions)
             episode_return += (
                 sum(float(reward) for reward in rewards) / len(rewards)
@@ -704,7 +733,9 @@ def evaluate_detailed(
             raise RuntimeError(f"evaluation seed {seed} did not terminate")
 
     count = len(episodes)
-    successful_steps = [episode.steps for episode in episodes if episode.completed]
+    successful_steps = [
+        episode.steps for episode in episodes if episode.completed
+    ]
     evaluation = Evaluation(
         episodes=count,
         completed=sum(episode.completed for episode in episodes),
@@ -715,6 +746,11 @@ def evaluate_detailed(
         mean_steps=(
             sum(successful_steps) / len(successful_steps)
             if successful_steps
+            else 0.0
+        ),
+        mean_episode_steps=(
+            sum(episode.steps for episode in episodes) / count
+            if count
             else 0.0
         ),
         mean_keys=(

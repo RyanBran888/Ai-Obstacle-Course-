@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+from array import array
 from collections.abc import Callable, Sequence
 from collections import Counter
 from dataclasses import dataclass
@@ -17,8 +18,7 @@ from DQN.DQN_train import (
 )
 from room_manifest import (
     CurriculumRoomManifest,
-    build_manifest_suite,
-    verify_manifest,
+    LazyRoomManifestBuilder,
     verify_training_coverage,
 )
 
@@ -1033,8 +1033,10 @@ class CurriculumRunner:
         run_seed: int = 0,
         data_seed: int = 0,
         live: bool = False,
-        plot_every: int = 10,
+        plot_every: int = 100,
+        plot_max_points: int = 5_000,
         graph_path: str | None = "curriculum_training.png",
+        promotion_passes: int = 1,
         require_full_coverage: bool = True,
         retention_size: int = 8,
         retention_margin: float = 0.15,
@@ -1048,8 +1050,10 @@ class CurriculumRunner:
             or max_rounds < 1
         ):
             raise ValueError("curriculum sizes and rounds must be positive")
-        if plot_every < 1:
-            raise ValueError("plot_every must be positive")
+        if plot_every < 1 or plot_max_points < 1:
+            raise ValueError("plot settings must be positive")
+        if promotion_passes < 1:
+            raise ValueError("promotion_passes must be positive")
         if retention_size < 1 or not 0.0 <= retention_margin <= 1.0:
             raise ValueError("retention settings are invalid")
         self.trainer = trainer
@@ -1067,13 +1071,21 @@ class CurriculumRunner:
         self.data_seed = data_seed
         self.live = live
         self.plot_every = plot_every
+        self.plot_max_points = plot_max_points
         self.graph_path = graph_path
+        self.promotion_passes = promotion_passes
         self.require_full_coverage = require_full_coverage
         self.retention_size = retention_size
         self.retention_margin = retention_margin
         self.results: list[StageResult] = []
         self.test_results: list[StageTestResult] = []
-        self.room_manifest: CurriculumRoomManifest | None = None
+        self._manifest_builder = LazyRoomManifestBuilder(
+            self.stages,
+            data_seed=self.data_seed,
+        )
+        self.room_manifest: CurriculumRoomManifest = (
+            self._manifest_builder.snapshot()
+        )
         self.training_features: tuple[str, ...] = ()
         self._test_started = False
         self._plot: CurriculumPlot | None = None
@@ -1089,55 +1101,7 @@ class CurriculumRunner:
         )
 
     def prepare_room_manifest(self) -> CurriculumRoomManifest:
-        if self.room_manifest is None:
-            if self.live and self._plot is None:
-                from DQN.DQN_rewards import CurriculumPlot
-
-                self._plot = CurriculumPlot(
-                    interactive=True,
-                    every=self.plot_every,
-                )
-                status = "opened" if self._plot.visible else "unavailable"
-                print(
-                    f"Live dashboard {status} ({self._plot.backend})",
-                    flush=True,
-                )
-                self._plot.set_status("Staging curriculum rooms")
-            print(
-                "Staging Architecture-generated train, validation, and test rooms...",
-                flush=True,
-            )
-
-            def show_progress(message: str) -> None:
-                print(message, flush=True)
-                if self._plot is not None:
-                    self._plot.set_status(f"Staging rooms: {message}")
-
-            self.room_manifest = build_manifest_suite(
-                self.stages,
-                data_seed=self.data_seed,
-                train_size=max(
-                    max(stage.pool_sizes or self.pool_sizes)
-                    for stage in self.stages
-                ),
-                validation_size=self.validation_size,
-                test_size=self.test_size,
-                progress=show_progress,
-            )
-            self.training_features = verify_training_coverage(
-                self.room_manifest,
-                {
-                    stage.name: max(stage.pool_sizes or self.pool_sizes)
-                    for stage in self.stages
-                },
-                require_all=self.require_full_coverage,
-            )
-            print(
-                f"Room manifest ready: {self.room_manifest.sha256[:12]}",
-                flush=True,
-            )
-            if self._plot is not None:
-                self._plot.set_status("Room manifest ready")
+        self.room_manifest = self._manifest_builder.snapshot()
         return self.room_manifest
 
     def run(self) -> list[StageResult]:
@@ -1145,30 +1109,46 @@ class CurriculumRunner:
 
         if self.results:
             raise RuntimeError("this curriculum runner has already trained")
-        manifest = self.prepare_room_manifest()
-        if self._plot is not None:
-            self._plot.set_status("Verifying training and validation rooms")
-        verify_manifest(manifest, self.stages, splits=("train", "validation"))
+        self.prepare_room_manifest()
         plot = self._plot
         created_plot = False
-        if plot is None and (self.live or self.graph_path):
-            plot = CurriculumPlot(interactive=self.live, every=self.plot_every)
+        if plot is None and self.live:
+            plot = CurriculumPlot(
+                interactive=self.live,
+                every=self.plot_every,
+                max_points=self.plot_max_points,
+            )
             self._plot = plot
             created_plot = True
-        plot_returns: list[float] = []
-        plot_completed: list[float] = []
-        plot_deaths: list[float] = []
-        plot_hazards: list[float] = []
-        plot_bridge_falls: list[float] = []
-        plot_crate_switches: list[float] = []
-        plot_resets: list[float] = []
-        plot_steps: list[float] = []
-        plot_epsilons: list[float] = []
+        plot_returns = array("f")
+        plot_completed = array("f")
+        plot_deaths = array("f")
+        plot_hazards = array("f")
+        plot_bridge_falls = array("f")
+        plot_crate_switches = array("f")
+        plot_resets = array("f")
+        plot_steps = array("f")
+        plot_epsilons = array("f")
+        stage_marks: list[tuple[int, str]] = []
+        evaluation_marks: list[
+            tuple[int, float, float | None, float | None]
+        ] = []
         if plot is not None and self.live and created_plot:
             status = "opened" if plot.visible else "unavailable"
             print(f"Live dashboard {status} ({plot.backend})", flush=True)
 
         def finish_plot() -> None:
+            nonlocal plot
+            if plot is None and self.graph_path:
+                plot = CurriculumPlot(
+                    interactive=False,
+                    every=self.plot_every,
+                    max_points=self.plot_max_points,
+                )
+                for episode, name in stage_marks:
+                    plot.mark_stage(episode, name)
+                for evaluation in evaluation_marks:
+                    plot.add_evaluation(*evaluation)
             if plot is None:
                 return
             plot.update(
@@ -1189,36 +1169,109 @@ class CurriculumRunner:
             plot.close()
             self._plot = None
 
+        def stage_rooms(
+            stage: CurriculumStage,
+            split: str,
+            count: int,
+            feature_target: int,
+        ):
+            def show_progress(message: str) -> None:
+                print(message, flush=True)
+                if plot is not None and plot.visible:
+                    plot.set_status(f"Staging rooms: {message.strip()}")
+
+            records = self._manifest_builder.ensure(
+                stage.name,
+                split,
+                count,
+                feature_target=feature_target,
+                progress=show_progress,
+            )
+            generated = self._manifest_builder.take_rooms(stage.name, split)
+            return (
+                tuple(record.seed for record in records),
+                tuple(room for _, room in generated),
+            )
+
+        def finish_manifest(require_all: bool) -> None:
+            self.room_manifest = self._manifest_builder.snapshot()
+            self.training_features = verify_training_coverage(
+                self.room_manifest,
+                {
+                    stage.name: len(
+                        self.room_manifest.stage(stage.name).train
+                    )
+                    for stage in self.stages
+                },
+                require_all=require_all,
+            )
+
         rehearsal: list[tuple[CoopEnvBridge, tuple[int, ...]]] = []
+        retention_sets: list[
+            tuple[str, CoopEnvBridge, tuple[int, ...]]
+        ] = []
         for stage_index, stage in enumerate(self.stages):
             stage_pool_sizes = tuple(
                 sorted(set(stage.pool_sizes or self.pool_sizes))
             )
             largest_pool = stage_pool_sizes[-1]
+            stage_marks.append((len(plot_returns), stage.name))
             if plot is not None:
                 plot.mark_stage(len(plot_returns), stage.name)
             if stage.lesson:
                 print(f"\n{stage.name}: {stage.lesson}", flush=True)
             if stage.objective:
                 print(f"Promotion objective: {stage.objective}", flush=True)
-            stage_rooms = manifest.stage(stage.name)
-            stage_config = stage_rooms.config
-            train_seeds = stage_rooms.seeds("train")
-            validation_seeds = stage_rooms.seeds("validation")
+            stage_config = stage.config
+            train_seeds: tuple[int, ...] = ()
+            validation_seeds: tuple[int, ...] = ()
 
             train_env = CoopEnvBridge(
                 stage_config,
                 seed=self.data_seed,
                 max_steps=self.trainer.cfg.max_steps,
                 shaping_gamma=self.trainer.cfg.gamma,
+                record_metrics=False,
             )
             train_env.set_room_cache_limit(largest_pool)
+            training_eval_env = CoopEnvBridge(
+                stage_config,
+                seed=self.data_seed,
+                max_steps=self.trainer.cfg.max_steps,
+                shaping_gamma=self.trainer.cfg.gamma,
+                record_metrics=False,
+            )
+            training_eval_env.set_room_cache_limit(largest_pool)
+            validation_eval_env = CoopEnvBridge(
+                stage_config,
+                seed=self.data_seed,
+                max_steps=self.trainer.cfg.max_steps,
+                shaping_gamma=self.trainer.cfg.gamma,
+                record_metrics=False,
+            )
+            validation_eval_env.set_room_cache_limit(self.validation_size)
             self.trainer.set_env(train_env, clear_replay=stage_index > 0)
             if stage_index > 0:
                 self.trainer.reheat_exploration()
 
             for pool_size in stage_pool_sizes:
-                if plot is not None:
+                train_seeds, new_train_rooms = stage_rooms(
+                    stage,
+                    "train",
+                    pool_size,
+                    largest_pool,
+                )
+                train_env.cache_rooms(new_train_rooms)
+                training_eval_env.cache_rooms(new_train_rooms)
+                if pool_size == largest_pool:
+                    validation_seeds, new_validation_rooms = stage_rooms(
+                        stage,
+                        "validation",
+                        self.validation_size,
+                        self.validation_size,
+                    )
+                    validation_eval_env.cache_rooms(new_validation_rooms)
+                if plot is not None and plot.visible:
                     plot.set_context(stage.name, pool_size)
                 pool = train_seeds[:pool_size]
                 rng = random.Random(
@@ -1260,7 +1313,7 @@ class CurriculumRunner:
                         )
                         plot_steps.append(float(outcome.steps))
                         plot_epsilons.append(self.trainer.epsilon())
-                        if plot is not None:
+                        if plot is not None and plot.visible:
                             plot.update(
                                 plot_returns,
                                 plot_completed,
@@ -1275,12 +1328,7 @@ class CurriculumRunner:
 
                     training_eval = evaluate(
                         self.trainer.agents,
-                        CoopEnvBridge(
-                            stage_config,
-                            seed=self.data_seed,
-                            max_steps=self.trainer.cfg.max_steps,
-                            shaping_gamma=self.trainer.cfg.gamma,
-                        ),
+                        training_eval_env,
                         pool,
                     )
                     validation_eval = None
@@ -1296,12 +1344,7 @@ class CurriculumRunner:
                     if pool_size == largest_pool:
                         validation_eval = evaluate(
                             self.trainer.agents,
-                            CoopEnvBridge(
-                                stage_config,
-                                seed=self.data_seed,
-                                max_steps=self.trainer.cfg.max_steps,
-                                shaping_gamma=self.trainer.cfg.gamma,
-                            ),
+                            validation_eval_env,
                             validation_seeds,
                         )
                         passed = (
@@ -1315,10 +1358,7 @@ class CurriculumRunner:
                                 or stage.objective_check(validation_eval)
                             )
                         )
-                        retention_eval = self._evaluate_retention(
-                            manifest,
-                            stage_index,
-                        )
+                        retention_eval = self._evaluate_retention(retention_sets)
                         passed = passed and all(
                             rate
                             >= max(
@@ -1328,35 +1368,38 @@ class CurriculumRunner:
                             )
                             for index, (_, rate) in enumerate(retention_eval)
                         )
+                    evaluation_mark = (
+                        len(plot_returns),
+                        training_eval.success_rate,
+                        (
+                            validation_eval.success_rate
+                            if validation_eval is not None
+                            else None
+                        ),
+                        (
+                            min(rate for _, rate in retention_eval)
+                            if retention_eval
+                            else None
+                        ),
+                    )
+                    evaluation_marks.append(evaluation_mark)
                     if plot is not None:
                         plot.add_evaluation(
-                            len(plot_returns),
-                            training_eval.success_rate,
-                            (
-                                validation_eval.success_rate
-                                if validation_eval is not None
-                                else None
-                            ),
-                            (
-                                min(rate for _, rate in retention_eval)
-                                if retention_eval
-                                else None
-                            ),
+                            *evaluation_mark,
                         )
-                        plot.update(
-                            plot_returns,
-                            plot_completed,
-                            plot_deaths,
-                            plot_steps,
-                            plot_epsilons,
-                            hazards=plot_hazards,
-                            bridge_falls=plot_bridge_falls,
-                            crate_switches=plot_crate_switches,
-                            resets=plot_resets,
-                            force=True,
-                        )
-                        if self.graph_path:
-                            plot.save(self.graph_path)
+                        if plot.visible:
+                            plot.update(
+                                plot_returns,
+                                plot_completed,
+                                plot_deaths,
+                                plot_steps,
+                                plot_epsilons,
+                                hazards=plot_hazards,
+                                bridge_falls=plot_bridge_falls,
+                                crate_switches=plot_crate_switches,
+                                resets=plot_resets,
+                                force=True,
+                            )
 
                     streak = streak + 1 if passed else 0
                     self._print_round(
@@ -1367,11 +1410,11 @@ class CurriculumRunner:
                         validation_eval,
                         retention_eval,
                     )
-                    if streak >= 2:
+                    if streak >= self.promotion_passes:
                         break
 
                 assert training_eval is not None
-                promoted = streak >= 2
+                promoted = streak >= self.promotion_passes
                 result = StageResult(
                     stage=stage.name,
                     pool_size=pool_size,
@@ -1383,11 +1426,20 @@ class CurriculumRunner:
                 )
                 self.results.append(result)
                 if not promoted:
+                    finish_manifest(False)
                     finish_plot()
                     return self.results
             train_env.set_room_cache_limit(min(4, largest_pool))
             rehearsal.append((train_env, train_seeds[:largest_pool]))
+            retention_seeds = validation_seeds[: self.retention_size]
+            for seed in retention_seeds:
+                validation_eval_env.reset(seed=seed)
+            validation_eval_env.set_room_cache_limit(len(retention_seeds))
+            retention_sets.append(
+                (stage.name, validation_eval_env, retention_seeds)
+            )
 
+        finish_manifest(self.require_full_coverage)
         finish_plot()
         return self.results
 
@@ -1398,48 +1450,51 @@ class CurriculumRunner:
             raise RuntimeError("the final test requires a completed curriculum")
 
         self._test_started = True
-        manifest = self.prepare_room_manifest()
-        print("\nVerifying untouched test rooms...", flush=True)
-        verify_manifest(manifest, self.stages, splits=("test",))
         print("\nFinal greedy test on untouched rooms", flush=True)
         for stage in self.stages:
-            stage_rooms = manifest.stage(stage.name)
-            seeds = stage_rooms.seeds("test")
+            records = self._manifest_builder.ensure(
+                stage.name,
+                "test",
+                self.test_size,
+                feature_target=self.test_size,
+                progress=lambda message: print(message, flush=True),
+            )
+            generated = self._manifest_builder.take_rooms(stage.name, "test")
+            seeds = tuple(record.seed for record in records)
+            test_env = CoopEnvBridge(
+                stage.config,
+                seed=self.data_seed,
+                max_steps=self.trainer.cfg.max_steps,
+                shaping_gamma=self.trainer.cfg.gamma,
+                record_metrics=False,
+            )
+            test_env.set_room_cache_limit(self.test_size)
+            test_env.cache_rooms(room for _, room in generated)
             evaluation, episodes = evaluate_detailed(
                 self.trainer.agents,
-                CoopEnvBridge(
-                    stage_rooms.config,
-                    seed=self.data_seed,
-                    max_steps=self.trainer.cfg.max_steps,
-                    shaping_gamma=self.trainer.cfg.gamma,
-                ),
+                test_env,
                 seeds,
             )
             result = StageTestResult(stage.name, evaluation, episodes)
             self.test_results.append(result)
             self._print_test(result)
+        self.room_manifest = self._manifest_builder.snapshot()
         return list(self.test_results)
 
     def _evaluate_retention(
         self,
-        manifest: CurriculumRoomManifest,
-        stage_index: int,
+        retention_sets: Sequence[
+            tuple[str, CoopEnvBridge, tuple[int, ...]]
+        ],
     ) -> tuple[tuple[str, float], ...]:
         results: list[tuple[str, float]] = []
-        for stage in self.stages[:stage_index]:
-            rooms = manifest.stage(stage.name)
-            seeds = rooms.seeds("validation")[: self.retention_size]
+        for stage_name, env, seeds in retention_sets:
             result = evaluate(
                 self.trainer.agents,
-                CoopEnvBridge(
-                    rooms.config,
-                    seed=self.data_seed,
-                    max_steps=self.trainer.cfg.max_steps,
-                    shaping_gamma=self.trainer.cfg.gamma,
-                ),
+                env,
                 seeds,
             )
-            results.append((stage.name, result.success_rate))
+            results.append((stage_name, result.success_rate))
         return tuple(results)
 
     @staticmethod
@@ -1476,7 +1531,8 @@ class CurriculumRunner:
     def _metric_summary(evaluation: Evaluation) -> str:
         return (
             f"reward={evaluation.mean_return:.2f} "
-            f"steps={evaluation.mean_steps:.1f} "
+            f"episode_steps={evaluation.mean_episode_steps:.1f} "
+            f"success_steps={evaluation.mean_steps:.1f} "
             f"keys={evaluation.mean_keys:.2f} "
             f"doors={evaluation.mean_doors:.2f} "
             f"switches={evaluation.mean_switches:.2f} "
@@ -1495,7 +1551,9 @@ class CurriculumRunner:
             f"{result.stage:22} test={evaluation.success_rate:>6.1%} "
             f"success={evaluation.completed}/{evaluation.episodes} "
             f"reward={evaluation.mean_return:.2f} "
-            f"timeouts={evaluation.timeouts} steps={evaluation.mean_steps:.1f}",
+            f"timeouts={evaluation.timeouts} "
+            f"episode_steps={evaluation.mean_episode_steps:.1f} "
+            f"success_steps={evaluation.mean_steps:.1f}",
             flush=True,
         )
 
@@ -1518,6 +1576,7 @@ def make_runner(
         seed=training_config.seed,
         max_steps=training_config.max_steps,
         shaping_gamma=training_config.gamma,
+        record_metrics=False,
     )
     trainer = Trainer(env, training_config)
     kwargs.setdefault("require_full_coverage", stages is None)

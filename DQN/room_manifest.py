@@ -27,6 +27,10 @@ from coop_env.rng import derive_seed
 from coop_env.tiles import HAZARD_TILES, tile_name
 
 
+ROOM_SPLITS = ("train", "validation", "test")
+SELECTION_ALGORITHM = "derive-seed-v2-global-fingerprint-lazy-v2"
+
+
 class RoomStage(Protocol):
     @property
     def name(self) -> str: ...
@@ -44,6 +48,7 @@ class RoomStage(Protocol):
 @dataclass(frozen=True, slots=True)
 class RoomRecord:
     seed: int
+    candidate_index: int
     geometry_sha256: str
     navigation_sha256: str
     task_sha256: str
@@ -57,6 +62,7 @@ class RoomRecord:
     def as_dict(self) -> dict[str, Any]:
         return {
             "seed": self.seed,
+            "candidate_index": self.candidate_index,
             "geometry_sha256": self.geometry_sha256,
             "navigation_sha256": self.navigation_sha256,
             "task_sha256": self.task_sha256,
@@ -77,6 +83,8 @@ class StageRoomManifest:
     train: tuple[RoomRecord, ...]
     validation: tuple[RoomRecord, ...]
     test: tuple[RoomRecord, ...]
+    selection_cursors: tuple[tuple[str, int], ...] = ()
+    feature_targets: tuple[tuple[str, int], ...] = ()
 
     @property
     def config(self) -> GenerationConfig:
@@ -91,6 +99,16 @@ class StageRoomManifest:
             return self.test
         raise KeyError(f"unknown room split {split!r}")
 
+    def selection_cursor(self, split: str) -> int:
+        if split not in ROOM_SPLITS:
+            raise KeyError(f"unknown room split {split!r}")
+        return dict(self.selection_cursors).get(split, 0)
+
+    def feature_target(self, split: str) -> int:
+        if split not in ROOM_SPLITS:
+            raise KeyError(f"unknown room split {split!r}")
+        return dict(self.feature_targets).get(split, 0)
+
     def seeds(self, split: str) -> tuple[int, ...]:
         return tuple(record.seed for record in self.records(split))
 
@@ -101,7 +119,13 @@ class StageRoomManifest:
             "config_sha256": self.config_sha256,
             "splits": {
                 split: [record.as_dict() for record in self.records(split)]
-                for split in ("train", "validation", "test")
+                for split in ROOM_SPLITS
+            },
+            "selection_cursors": {
+                split: self.selection_cursor(split) for split in ROOM_SPLITS
+            },
+            "feature_targets": {
+                split: self.feature_target(split) for split in ROOM_SPLITS
             },
         }
 
@@ -111,7 +135,8 @@ class CurriculumRoomManifest:
     data_seed: int
     stages: tuple[StageRoomManifest, ...]
     generator_version: str = coop_env.__version__
-    schema_version: int = 3
+    schema_version: int = 4
+    selection_algorithm: str = SELECTION_ALGORITHM
 
     def stage(self, name: str) -> StageRoomManifest:
         for stage in self.stages:
@@ -124,6 +149,7 @@ class CurriculumRoomManifest:
             "schema_version": self.schema_version,
             "generator": "Architecture/coop_env/RoomGenerator",
             "generator_version": self.generator_version,
+            "selection_algorithm": self.selection_algorithm,
             "data_seed": self.data_seed,
             "stages": [stage.as_dict() for stage in self.stages],
         }
@@ -189,6 +215,250 @@ def room_fingerprints(room: Room) -> tuple[str, str, str]:
     return _hash_json(geometry), _hash_json(navigation), _hash_json(task)
 
 
+class LazyRoomManifestBuilder:
+    """Materialize deterministic room pools only when they are requested."""
+
+    def __init__(
+        self,
+        stages: Sequence[RoomStage],
+        *,
+        data_seed: int,
+        initial: CurriculumRoomManifest | None = None,
+    ) -> None:
+        if not stages:
+            raise ValueError("at least one curriculum stage is required")
+        if len({stage.name for stage in stages}) != len(stages):
+            raise ValueError("curriculum stage names must be unique")
+
+        self.stages = tuple(stages)
+        self.data_seed = data_seed
+        self._stage_by_name = {stage.name: stage for stage in self.stages}
+        self._config_json = {
+            stage.name: _config_json(stage.config) for stage in self.stages
+        }
+        self._generators = {
+            stage.name: RoomGenerator(stage.config) for stage in self.stages
+        }
+        self._records: dict[str, dict[str, list[RoomRecord]]] = {
+            stage.name: {split: [] for split in ROOM_SPLITS}
+            for stage in self.stages
+        }
+        self._cursors: dict[str, dict[str, int]] = {
+            stage.name: {split: 0 for split in ROOM_SPLITS}
+            for stage in self.stages
+        }
+        self._feature_targets: dict[str, dict[str, int | None]] = {
+            stage.name: {split: None for split in ROOM_SPLITS}
+            for stage in self.stages
+        }
+        self._generated_rooms: dict[
+            str, dict[str, list[tuple[RoomRecord, Room]]]
+        ] = {
+            stage.name: {split: [] for split in ROOM_SPLITS}
+            for stage in self.stages
+        }
+        self._used_seeds: set[int] = set()
+        self._used_navigation: set[str] = set()
+        self._used_tasks: set[str] = set()
+
+        if initial is not None:
+            self._load(initial)
+
+    def ensure(
+        self,
+        stage_name: str,
+        split: str,
+        count: int,
+        *,
+        feature_target: int | None = None,
+        progress: Callable[[str], None] | None = None,
+    ) -> tuple[RoomRecord, ...]:
+        """Return a deterministic prefix, generating only missing records."""
+        stage = self._stage(stage_name)
+        _check_split(split)
+        if count < 0:
+            raise ValueError("room count must be nonnegative")
+        quota_target = count if feature_target is None else feature_target
+        if quota_target < count:
+            raise ValueError("feature_target must be at least count")
+        saved_target = self._feature_targets[stage_name][split]
+        if saved_target is None:
+            self._feature_targets[stage_name][split] = quota_target
+        elif saved_target != quota_target:
+            raise ValueError(
+                f"{stage_name} {split} feature_target changed from "
+                f"{saved_target} to {quota_target}"
+            )
+
+        records = self._records[stage_name][split]
+        required_features = set(stage.required_features)
+        covered = {
+            feature
+            for record in records[:count]
+            for feature in record.features
+        }
+        missing_features = (
+            required_features - covered
+            if quota_target >= len(required_features)
+            else set()
+        )
+        remaining_slots = count - len(records)
+        coverage_due = count >= len(required_features)
+        if len(records) >= count:
+            if coverage_due and missing_features:
+                raise ValueError(
+                    f"{stage_name} {split} lacks required features: "
+                    + ", ".join(sorted(missing_features))
+                )
+            return tuple(records[:count])
+        if coverage_due and len(missing_features) > remaining_slots:
+            raise ValueError(
+                f"{stage_name} {split} cannot cover {len(missing_features)} "
+                f"missing features in {remaining_slots} rooms"
+            )
+
+        start_cursor = self._cursors[stage_name][split]
+        candidate_limit = start_cursor + max(
+            1_000,
+            max(count, quota_target) * 200,
+        )
+        generator = self._generators[stage_name]
+        while len(records) < count:
+            candidate_index = self._cursors[stage_name][split]
+            if candidate_index >= candidate_limit:
+                raise RuntimeError(
+                    f"{stage_name} {split} accepted {len(records)}/{count} "
+                    f"rooms after {candidate_index - start_cursor} candidates"
+                )
+            seed = _candidate_seed(
+                self.data_seed,
+                stage_name,
+                split,
+                candidate_index,
+            )
+            self._cursors[stage_name][split] = candidate_index + 1
+            if seed in self._used_seeds:
+                continue
+
+            outcome = generator.generate_with_report(seed)
+            room = outcome.room
+            if (
+                not outcome.report.ok
+                or outcome.fallback
+                or bool(room.metadata.get("fallback"))
+                or not stage.accepts(room)
+            ):
+                continue
+            geometry, navigation, task = room_fingerprints(room)
+            if (
+                navigation in self._used_navigation
+                or task in self._used_tasks
+            ):
+                continue
+            features = room_features(room)
+            if (
+                missing_features
+                and not missing_features.intersection(features)
+            ):
+                continue
+
+            record = RoomRecord(
+                seed=seed,
+                candidate_index=candidate_index,
+                geometry_sha256=geometry,
+                navigation_sha256=navigation,
+                task_sha256=task,
+                attempts=outcome.attempts,
+                width=room.width,
+                height=room.height,
+                shape=room.shape.value,
+                counts=tuple(room.counts().items()),
+                features=features,
+            )
+            records.append(record)
+            self._generated_rooms[stage_name][split].append((record, room))
+            self._used_seeds.add(seed)
+            self._used_navigation.add(navigation)
+            self._used_tasks.add(task)
+            missing_features.difference_update(features)
+
+        if coverage_due and missing_features:
+            raise RuntimeError(
+                f"{stage_name} {split} lacks required features: "
+                + ", ".join(sorted(missing_features))
+            )
+        if progress is not None:
+            progress(f"  {stage_name}: {split} {len(records)}/{count}")
+        return tuple(records[:count])
+
+    def take_rooms(
+        self,
+        stage_name: str,
+        split: str,
+    ) -> tuple[tuple[RoomRecord, Room], ...]:
+        """Take newly generated rooms without storing them in the manifest."""
+        self._stage(stage_name)
+        _check_split(split)
+        rooms = tuple(self._generated_rooms[stage_name][split])
+        self._generated_rooms[stage_name][split].clear()
+        return rooms
+
+    def snapshot(self) -> CurriculumRoomManifest:
+        """Return an immutable manifest; unmaterialized splits stay empty."""
+        stages = tuple(
+            StageRoomManifest(
+                stage=stage.name,
+                config_json=self._config_json[stage.name],
+                config_sha256=_hash_text(self._config_json[stage.name]),
+                train=tuple(self._records[stage.name]["train"]),
+                validation=tuple(self._records[stage.name]["validation"]),
+                test=tuple(self._records[stage.name]["test"]),
+                selection_cursors=tuple(
+                    (split, self._cursors[stage.name][split])
+                    for split in ROOM_SPLITS
+                ),
+                feature_targets=tuple(
+                    (
+                        split,
+                        self._feature_targets[stage.name][split] or 0,
+                    )
+                    for split in ROOM_SPLITS
+                ),
+            )
+            for stage in self.stages
+        )
+        manifest = CurriculumRoomManifest(
+            data_seed=self.data_seed,
+            stages=stages,
+        )
+        assert_disjoint(manifest)
+        return manifest
+
+    def _stage(self, name: str) -> RoomStage:
+        try:
+            return self._stage_by_name[name]
+        except KeyError as error:
+            raise KeyError(f"unknown curriculum stage {name!r}") from error
+
+    def _load(self, manifest: CurriculumRoomManifest) -> None:
+        if manifest.data_seed != self.data_seed:
+            raise ValueError("initial manifest data seed does not match")
+        verify_manifest_structure(manifest, self.stages)
+        for saved in manifest.stages:
+            for split in ROOM_SPLITS:
+                records = saved.records(split)
+                self._records[saved.stage][split].extend(records)
+                self._cursors[saved.stage][split] = saved.selection_cursor(split)
+                target = saved.feature_target(split)
+                self._feature_targets[saved.stage][split] = (
+                    target if target > 0 else None
+                )
+                for record in records:
+                    self._used_seeds.add(record.seed)
+                    self._used_navigation.add(record.navigation_sha256)
+                    self._used_tasks.add(record.task_sha256)
+
+
 def build_manifest_suite(
     stages: Sequence[RoomStage],
     *,
@@ -198,102 +468,47 @@ def build_manifest_suite(
     test_size: int,
     progress: Callable[[str], None] | None = None,
 ) -> CurriculumRoomManifest:
+    """Build a complete suite using the legacy stage/split order."""
     if min(train_size, validation_size, test_size) < 1:
         raise ValueError("room split sizes must be positive")
-    if not stages:
-        raise ValueError("at least one curriculum stage is required")
-    if len({stage.name for stage in stages}) != len(stages):
-        raise ValueError("curriculum stage names must be unique")
-
-    buckets: dict[str, dict[str, list[RoomRecord]]] = {
-        stage.name: {"train": [], "validation": [], "test": []}
-        for stage in stages
-    }
-    used_seeds: set[int] = set()
-    used_navigation: set[str] = set()
-    used_tasks: set[str] = set()
-
+    builder = LazyRoomManifestBuilder(stages, data_seed=data_seed)
     for stage in stages:
-        generator = RoomGenerator(stage.config)
         for split, count in (
             ("test", test_size),
             ("validation", validation_size),
             ("train", train_size),
         ):
-            required_features = set(stage.required_features)
-            missing_features = (
-                set(required_features)
-                if count >= len(required_features)
-                else set()
+            builder.ensure(
+                stage.name,
+                split,
+                count,
+                feature_target=count,
+                progress=progress,
             )
-            accepted = 0
-            attempt = 0
-            attempt_limit = max(1_000, count * 200)
-            while accepted < count:
-                if attempt >= attempt_limit:
-                    raise RuntimeError(
-                        f"{stage.name} {split} accepted {accepted}/{count} "
-                        f"rooms after {attempt_limit} candidates"
-                    )
-                seed = derive_seed(
-                    data_seed,
-                    f"curriculum-manifest:v2:{stage.name}:{split}:{attempt}",
-                )
-                attempt += 1
-                if seed in used_seeds:
-                    continue
+            builder.take_rooms(stage.name, split)
+    return builder.snapshot()
 
-                outcome = generator.generate_with_report(seed)
-                room = outcome.room
-                if (
-                    not outcome.report.ok
-                    or outcome.fallback
-                    or bool(room.metadata.get("fallback"))
-                    or not stage.accepts(room)
-                ):
-                    continue
-                geometry, navigation, task = room_fingerprints(room)
-                if navigation in used_navigation or task in used_tasks:
-                    continue
-                features = room_features(room)
-                if missing_features and not missing_features.intersection(features):
-                    continue
 
-                record = RoomRecord(
-                    seed=seed,
-                    geometry_sha256=geometry,
-                    navigation_sha256=navigation,
-                    task_sha256=task,
-                    attempts=outcome.attempts,
-                    width=room.width,
-                    height=room.height,
-                    shape=room.shape.value,
-                    counts=tuple(room.counts().items()),
-                    features=features,
-                )
-                buckets[stage.name][split].append(record)
-                used_seeds.add(seed)
-                used_navigation.add(navigation)
-                used_tasks.add(task)
-                missing_features.difference_update(features)
-                accepted += 1
-            if progress is not None:
-                progress(f"  {stage.name}: {split} {accepted}/{count}")
-
-    stage_manifests = tuple(
-        StageRoomManifest(
-            stage=stage.name,
-            config_json=_config_json(stage.config),
-            config_sha256=_hash_text(_config_json(stage.config)),
-            train=tuple(buckets[stage.name]["train"]),
-            validation=tuple(buckets[stage.name]["validation"]),
-            test=tuple(buckets[stage.name]["test"]),
-        )
-        for stage in stages
-    )
-    manifest = CurriculumRoomManifest(data_seed=data_seed, stages=stage_manifests)
+def verify_manifest_structure(
+    manifest: CurriculumRoomManifest,
+    stages: Sequence[RoomStage],
+) -> None:
+    """Verify a complete or partial manifest without regenerating rooms."""
+    if manifest.schema_version != 4:
+        raise ValueError("room manifest schema does not match")
+    if manifest.selection_algorithm != SELECTION_ALGORITHM:
+        raise ValueError("room manifest selection algorithm does not match")
+    if manifest.generator_version != coop_env.__version__:
+        raise ValueError("room manifest generator version does not match")
     assert_disjoint(manifest)
-    return manifest
+    if tuple(stage.name for stage in stages) != tuple(
+        stage.stage for stage in manifest.stages
+    ):
+        raise ValueError("curriculum stages do not match the room manifest")
+    for stage in stages:
+        saved = manifest.stage(stage.name)
+        if _hash_text(_config_json(stage.config)) != saved.config_sha256:
+            raise ValueError(f"{stage.name} config changed after room staging")
 
 
 def assert_disjoint(manifest: CurriculumRoomManifest) -> None:
@@ -306,11 +521,48 @@ def assert_disjoint(manifest: CurriculumRoomManifest) -> None:
     for stage in manifest.stages:
         if _hash_text(stage.config_json) != stage.config_sha256:
             raise ValueError(f"{stage.stage} config hash does not match its snapshot")
-        for split in ("train", "validation", "test"):
+        cursor_names = tuple(name for name, _ in stage.selection_cursors)
+        if (
+            len(cursor_names) != len(ROOM_SPLITS)
+            or set(cursor_names) != set(ROOM_SPLITS)
+        ):
+            raise ValueError(f"{stage.stage} selection cursors are incomplete")
+        if any(cursor < 0 for _, cursor in stage.selection_cursors):
+            raise ValueError(f"{stage.stage} has a negative selection cursor")
+        target_names = tuple(name for name, _ in stage.feature_targets)
+        if (
+            len(target_names) != len(ROOM_SPLITS)
+            or set(target_names) != set(ROOM_SPLITS)
+        ):
+            raise ValueError(f"{stage.stage} feature targets are incomplete")
+        if any(target < 0 for _, target in stage.feature_targets):
+            raise ValueError(f"{stage.stage} has a negative feature target")
+        for split in ROOM_SPLITS:
             records = stage.records(split)
             seeds = tuple(record.seed for record in records)
             if len(seeds) != len(set(seeds)):
                 raise ValueError(f"{stage.stage} {split} contains duplicate seeds")
+            candidate_indexes = tuple(
+                record.candidate_index for record in records
+            )
+            if (
+                any(index < 0 for index in candidate_indexes)
+                or len(candidate_indexes) != len(set(candidate_indexes))
+                or tuple(sorted(candidate_indexes)) != candidate_indexes
+            ):
+                raise ValueError(
+                    f"{stage.stage} {split} has invalid candidate indexes"
+                )
+            cursor = stage.selection_cursor(split)
+            if candidate_indexes and cursor <= max(candidate_indexes):
+                raise ValueError(
+                    f"{stage.stage} {split} selection cursor is stale"
+                )
+            target = stage.feature_target(split)
+            if records and target < len(records):
+                raise ValueError(
+                    f"{stage.stage} {split} feature target is too small"
+                )
             navigations = [record.navigation_sha256 for record in records]
             tasks = [record.task_sha256 for record in records]
             if len(navigations) != len(set(navigations)):
@@ -318,6 +570,16 @@ def assert_disjoint(manifest: CurriculumRoomManifest) -> None:
             if len(tasks) != len(set(tasks)):
                 raise ValueError(f"{stage.stage} {split} contains duplicate tasks")
             for record in records:
+                if record.seed != _candidate_seed(
+                    manifest.data_seed,
+                    stage.stage,
+                    split,
+                    record.candidate_index,
+                ):
+                    raise ValueError(
+                        f"{stage.stage} {split} seed does not match its "
+                        "candidate index"
+                    )
                 owner = f"{stage.stage}:{split}"
                 _claim(seed_owner, record.seed, owner, "seed")
                 _claim(
@@ -334,23 +596,35 @@ def verify_manifest(
     stages: Sequence[RoomStage],
     *,
     splits: Sequence[str] = ("train", "validation", "test"),
+    expected_counts: Mapping[str, Mapping[str, int]] | None = None,
 ) -> None:
-    if manifest.generator_version != coop_env.__version__:
-        raise ValueError("room manifest generator version does not match")
-    assert_disjoint(manifest)
-    if tuple(stage.name for stage in stages) != tuple(
-        stage.stage for stage in manifest.stages
-    ):
-        raise ValueError("curriculum stages do not match the room manifest")
+    verify_manifest_structure(manifest, stages)
     for split in splits:
-        sizes = {len(stage.records(split)) for stage in manifest.stages}
-        if len(sizes) != 1 or not sizes or next(iter(sizes)) < 1:
-            raise ValueError(f"{split} split sizes are incomplete or inconsistent")
+        _check_split(split)
+        if expected_counts is None:
+            sizes = {len(stage.records(split)) for stage in manifest.stages}
+            if len(sizes) != 1 or not sizes or next(iter(sizes)) < 1:
+                raise ValueError(
+                    f"{split} split sizes are incomplete or inconsistent"
+                )
+        else:
+            split_counts = expected_counts.get(split)
+            if split_counts is None:
+                raise ValueError(f"missing expected counts for {split}")
+            for stage in manifest.stages:
+                expected = split_counts.get(stage.stage)
+                if expected is None or expected < 0:
+                    raise ValueError(
+                        f"invalid expected count for {stage.stage} {split}"
+                    )
+                if len(stage.records(split)) != expected:
+                    raise ValueError(
+                        f"{stage.stage} {split} has "
+                        f"{len(stage.records(split))}/{expected} rooms"
+                    )
 
     for stage in stages:
         saved = manifest.stage(stage.name)
-        if _hash_text(_config_json(stage.config)) != saved.config_sha256:
-            raise ValueError(f"{stage.name} config changed after room staging")
         generator = RoomGenerator(saved.config)
         for split in splits:
             covered = {
@@ -452,8 +726,12 @@ def verify_training_coverage(
     features: set[str] = set()
     for stage in manifest.stages:
         limit = train_limits.get(stage.stage)
-        if limit is None or limit < 1:
+        if limit is None:
             raise ValueError(f"missing positive train limit for {stage.stage}")
+        if limit < 1:
+            if require_all:
+                raise ValueError(f"missing positive train limit for {stage.stage}")
+            continue
         for record in stage.train[:limit]:
             features.update(record.features)
 
@@ -496,6 +774,23 @@ def save_manifest(manifest: CurriculumRoomManifest, path: str | Path) -> Path:
     temporary.write_text(text, encoding="utf-8")
     temporary.replace(target)
     return target
+
+
+def _check_split(split: str) -> None:
+    if split not in ROOM_SPLITS:
+        raise KeyError(f"unknown room split {split!r}")
+
+
+def _candidate_seed(
+    data_seed: int,
+    stage: str,
+    split: str,
+    candidate_index: int,
+) -> int:
+    return derive_seed(
+        data_seed,
+        f"curriculum-manifest:v2:{stage}:{split}:{candidate_index}",
+    )
 
 
 def _claim(

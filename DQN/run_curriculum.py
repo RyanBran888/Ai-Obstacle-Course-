@@ -25,6 +25,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--episodes-per-seed", type=int, default=50)
     parser.add_argument("--max-rounds", type=int, default=8)
+    parser.add_argument(
+        "--promotion-passes",
+        type=int,
+        default=1,
+        help="consecutive passing greedy evaluations needed to advance",
+    )
     parser.add_argument("--validation-seeds", type=int, default=64)
     parser.add_argument(
         "--test-seeds",
@@ -51,14 +57,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--maps-output",
         default=None,
-        help="designer map folder (default: <manifest stem>_maps)",
+        help="optional designer map folder",
     )
     parser.add_argument("--map-cell", type=int, default=12)
     parser.add_argument(
+        "--include-test-maps",
+        action="store_true",
+        help="render held-out test maps after final testing",
+    )
+    parser.add_argument(
         "--plot-every",
         type=int,
-        default=10,
+        default=100,
         help="refresh the live dashboard every N training episodes",
+    )
+    parser.add_argument(
+        "--plot-max-points",
+        type=int,
+        default=5_000,
+        help="maximum training points drawn in the live dashboard",
     )
     parser.add_argument(
         "--final-test",
@@ -114,11 +131,7 @@ def main() -> None:
     graph_path = Path(args.graph_output).expanduser()
     manifest_path = Path(args.manifest_output).expanduser()
     report_path = Path(args.report_output).expanduser()
-    maps_path = (
-        Path(args.maps_output).expanduser()
-        if args.maps_output
-        else manifest_path.parent / f"{manifest_path.stem}_maps"
-    )
+    maps_path = Path(args.maps_output).expanduser() if args.maps_output else None
     if args.map_cell < 4:
         raise ValueError("--map-cell must be at least 4")
     artifacts = {
@@ -138,13 +151,20 @@ def main() -> None:
         if path.exists() and not path.is_file():
             raise IsADirectoryError(f"{path} is not a file")
         path.parent.mkdir(parents=True, exist_ok=True)
-    if maps_path.resolve() in normalized:
-        raise ValueError("maps output must differ from file outputs")
-    if maps_path.exists():
-        raise FileExistsError(f"{maps_path} already exists; choose a new --maps-output")
-    maps_path.parent.mkdir(parents=True, exist_ok=True)
+    if maps_path is not None:
+        if maps_path.resolve() in normalized:
+            raise ValueError("maps output must differ from file outputs")
+        if maps_path.exists():
+            raise FileExistsError(
+                f"{maps_path} already exists; choose a new --maps-output"
+            )
+        maps_path.parent.mkdir(parents=True, exist_ok=True)
     if checkpoint.exists():
         raise FileExistsError(f"{checkpoint} already exists; choose a new --output")
+    if manifest_path.exists():
+        raise FileExistsError(
+            f"{manifest_path} already exists; choose a new --manifest-output"
+        )
     if report_path.exists():
         raise FileExistsError(
             f"{report_path} already exists; choose a new --report-output"
@@ -166,15 +186,11 @@ def main() -> None:
         data_seed=args.data_seed,
         live=not args.no_live,
         plot_every=args.plot_every,
+        plot_max_points=args.plot_max_points,
         graph_path=str(graph_path),
+        promotion_passes=args.promotion_passes,
     )
     print(f"Training on {runner.trainer.device}")
-    manifest = runner.prepare_room_manifest()
-    manifest_path = save_manifest(manifest, manifest_path)
-    manifest_file_hash = _file_sha256(manifest_path)
-    print(f"Staged room manifest saved to {manifest_path}")
-    manifest_data = load_manifest(manifest_path)
-
     results = runner.run()
     final = results[-1]
     print(
@@ -184,6 +200,23 @@ def main() -> None:
     runner.trainer.learners[0].save(str(checkpoint))
     checkpoint_hash = _file_sha256(checkpoint)
     print(f"Frozen checkpoint saved to {checkpoint}")
+
+    if runner.completed and args.final_test:
+        if _source_hashes() != source_hashes:
+            raise RuntimeError("training source files changed during training")
+        if len(runner.trainer.learners) != 1:
+            raise RuntimeError("final testing requires the shared-network trainer")
+        runner.trainer.learners[0].load(str(checkpoint))
+        runner.evaluate_final_test()
+    elif runner.completed:
+        print("Final test remains unevaluated; use --final-test only for the chosen run.")
+    else:
+        print("Final test was not opened because the curriculum did not finish.")
+
+    manifest = runner.prepare_room_manifest()
+    manifest_path = save_manifest(manifest, manifest_path)
+    manifest_file_hash = _file_sha256(manifest_path)
+    print(f"Used room manifest saved to {manifest_path}")
 
     train_limits = {stage.name: 0 for stage in runner.stages}
     validation_limits = {stage.name: 0 for stage in runner.stages}
@@ -198,30 +231,14 @@ def main() -> None:
         "train": train_limits,
         "validation": validation_limits,
     }
-    map_splits = ("train", "validation")
-    map_rooms, map_pages = export_manifest_site(
-        manifest_path,
-        manifest_data,
-        maps_path,
-        splits=map_splits,
-        stage_name=None,
-        count=None,
-        cell=args.map_cell,
-        limits=map_limits,
+    map_splits = (
+        ("train", "validation", "test")
+        if runner.test_results and args.include_test_maps
+        else ("train", "validation")
     )
-    print(
-        f"Designer maps saved to {maps_path / 'index.html'} "
-        f"({map_rooms} rooms used, {map_pages} pages)"
-    )
-
-    if runner.completed and args.final_test:
-        if _file_sha256(manifest_path) != manifest_file_hash:
-            raise RuntimeError("the saved room manifest changed during training")
-        if len(runner.trainer.learners) != 1:
-            raise RuntimeError("final testing requires the shared-network trainer")
-        runner.trainer.learners[0].load(str(checkpoint))
-        runner.evaluate_final_test()
-        map_splits = ("train", "validation", "test")
+    designer_maps = None
+    if maps_path is not None:
+        manifest_data = load_manifest(manifest_path)
         map_rooms, map_pages = export_manifest_site(
             manifest_path,
             manifest_data,
@@ -233,13 +250,16 @@ def main() -> None:
             limits=map_limits,
         )
         print(
-            f"Test maps added to {maps_path / 'index.html'} "
+            f"Designer maps saved to {maps_path / 'index.html'} "
             f"({map_rooms} rooms, {map_pages} pages)"
         )
-    elif runner.completed:
-        print("Final test remains unevaluated; use --final-test only for the chosen run.")
-    else:
-        print("Final test was not opened because the curriculum did not finish.")
+        designer_maps = {
+            "path": str(maps_path),
+            "index": str(maps_path / "index.html"),
+            "splits": list(map_splits),
+            "rooms": map_rooms,
+            "pages": map_pages,
+        }
 
     if _file_sha256(manifest_path) != manifest_file_hash:
         raise RuntimeError("the saved room manifest changed during the run")
@@ -248,7 +268,7 @@ def main() -> None:
     if _source_hashes() != source_hashes:
         raise RuntimeError("training source files changed during the run")
     report = {
-        "schema_version": 3,
+        "schema_version": 4,
         "curriculum_completed": runner.completed,
         "final_test_requested": args.final_test,
         "final_test_evaluated": bool(runner.test_results),
@@ -269,19 +289,14 @@ def main() -> None:
             "content_sha256": manifest.sha256,
             "file_sha256": manifest_file_hash,
             "schema": manifest.schema_version,
+            "selection_algorithm": manifest.selection_algorithm,
             "disjoint_by": [
                 "seed",
                 "navigation_sha256",
                 "task_sha256",
             ],
         },
-        "designer_maps": {
-            "path": str(maps_path),
-            "index": str(maps_path / "index.html"),
-            "splits": list(map_splits),
-            "rooms": map_rooms,
-            "pages": map_pages,
-        },
+        "designer_maps": designer_maps,
         "checkpoint": {
             "path": str(checkpoint),
             "sha256": checkpoint_hash,
@@ -320,6 +335,7 @@ def main() -> None:
             "validation_margin": runner.retention_margin,
             "minimum_success_rate": 0.50,
         },
+        "promotion_passes": runner.promotion_passes,
         "final_test": (
             [
                 {
