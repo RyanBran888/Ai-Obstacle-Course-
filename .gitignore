@@ -9,6 +9,23 @@ dist/
 *.egg-info/
 .eggs/
 
+# Godot
+.godot/
+*.import
+
+# exported game build
+/builds/
+*.pck
+
+# PyInstaller output
+AI/infer/
+AI/build/
+AI/infer.spec
+AI/__pycache__/
+
+# runtime-generated
+AI/level.json
+AI/result.json
 # Virtual environments
 .venv/
 venv/
