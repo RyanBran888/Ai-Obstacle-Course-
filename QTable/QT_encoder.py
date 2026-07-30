@@ -1,430 +1,304 @@
-"""Turning a room into a Q-table key.
+"""Turning the bridge's observation into a Q-table key.
 
-This is the piece the neural agents do not need. `QN/env_bridge.py` hands its
-network a 191-float vector; a network happily interpolates over that, a table
-cannot index it. A table needs a small set of discrete states, and choosing that
-set *is* the design of a tabular agent -- get it wrong and no amount of training
-helps.
+The DQN reads 1325 floats: a 7x7x26 local view plus 51 globals. A network
+interpolates over that. A table has to index it, so the continuous parts have to
+be bucketed and the redundant parts dropped.
 
-Two encoders ship here, at opposite ends of the trade-off:
+The good news is that `_extras()` has already done the hard part. Those 51
+globals include `route_dx`/`route_dy`, `goal_distance`, `goal_reachable`,
+`goal_key`/`switch`/`checkpoint`/`exit`/`crate`, `can_interact`, `can_push` and
+`route_wait` -- which is a strictly better version of the hand-rolled feature
+set an earlier version of this package used, and it comes free. This module is
+mostly arithmetic on values the bridge already computed.
 
-`PositionEncoder`
-    Exact: (x, y, which keys are gone, which switches are thrown, which
-    checkpoints are reached, is the exit open). Markov and complete, so tabular
-    Q-learning provably converges to the optimal policy -- but only for the room
-    it was trained on. The table is literally indexed by coordinates, so it
-    transfers to a new seed about as well as a street map of one city transfers
-    to another. Pair it with `room_seeds=[n]` for clean convergence on a fixed
-    layout.
+**The route hint.** `route_dx`/`route_dy` is a BFS-derived next step toward the
+current goal, and it is in the key because the DQN gets it too -- `DQN_model`
+adds `ROUTE_Q_BIAS = 0.5` to the matching action. Worth being clear about what
+that means: with the route in the state, the table is not learning to navigate
+from raw terrain. It is learning *when to follow the route, when to deviate for
+a hazard, and what to do on arrival*. That is a real learning problem and it is
+the same one the DQN faces, which is the point -- but it is not the harder
+"navigate from local terrain alone" problem, and a good score here should not be
+read as solving that.
 
-`FeatureEncoder`
-    Relative and local: what is adjacent, roughly which way the current
-    objective lies, how far, what am I standing on, where is my partner, am I
-    holding a door open. Nothing absolute, so the same key means the same thing
-    in every room and the table transfers. The cost is aliasing -- genuinely
-    different situations collapse onto one key, which makes the problem
-    non-Markov and means the agent can get stuck in a corner it cannot tell
-    apart from another corner.
+Key layout, in index order:
 
-Both are plain `StateEncoder`s: give them the env, get back something hashable.
+    0  route          5   none / N / E / S / W        (from route_dx, route_dy)
+    1  route_tile     3   that tile: free / blocked / hazard
+    2  hazards_adj    3   0 / 1 / 2+ hazardous neighbours
+    3  route_wait     2   bridge says hold position this tick
+    4  goal_kind      6   none / key / switch / checkpoint / exit / crate
+    5  reachable      2   goal_reachable
+    6  dist           5   coarse distance band to goal
+    7  can_interact   2   action 4 is legal here
+    8  can_push       2   a crate can be pushed from here
+    9  switch_mode    4   none / toggle / hold / oneshot
+   10  mech           5   timed door and bridge status, collapsed
+   11  teammate       3   far / near / same tile
+   12  ball           2   a wipeout ball threatens an adjacent tile
+   13  duty           3   nobody holding / I am holding / partner is holding
+
+Nominal product is about 2.6M, but the reachable set is far smaller since most
+combinations are geometrically or logically impossible. Sparse storage means
+only visited keys cost anything.
+
+Note the local terrain is summarised in two fields (`route_tile`,
+`hazards_adj`) rather than the full 3^4 = 81 neighbourhood the earlier version
+used. With the route direction supplied, the remaining job of the terrain
+features is hazard avoidance, and two fields cover that at a thirteenth of the
+size.
 """
 
 from __future__ import annotations
 
-from collections import deque
-from typing import Any, Protocol
+from typing import Any
 
-import QT_paths  # noqa: F401  -- puts Architecture/ on sys.path
+import QT_paths  # noqa: F401  -- puts the repo root and Architecture on sys.path
 
-from coop_env import Vec2
-from coop_env.entities import Checkpoint, Key, LockedDoor, Switch, SwitchMode
-from coop_env.tiles import Tile, is_hazard
+from coop_env import Vec2  # noqa: E402
+from coop_env.entities import Switch, SwitchMode  # noqa: E402
+from coop_env.tiles import Tile, is_hazard  # noqa: E402
 
-SOLID = (Tile.VOID, Tile.WALL, Tile.OBSTACLE)
+from DQN.DQN_model import GLOBAL_NAMES, N_ACTIONS, ROUTE_Q_BIAS  # noqa: E402
+
 DIRS = (Vec2(0, -1), Vec2(1, 0), Vec2(0, 1), Vec2(-1, 0))  # N E S W
+SOLID = (Tile.VOID, Tile.WALL, Tile.OBSTACLE)
 
+#: Name -> position within the 51 globals, so the code reads by name rather
+#: than by magic index. If the schema changes, this breaks loudly at import
+#: instead of quietly reading the wrong feature.
+G = {name: i for i, name in enumerate(GLOBAL_NAMES)}
 
-class StateEncoder(Protocol):
-    """Anything that can turn the live environment into a hashable key."""
+#: Field positions inside the key. `act()` needs route and can_interact to
+#: reproduce the DQN's masking and route bias, so they are named here rather
+#: than counted by hand at the call site.
+K_ROUTE = 0
+K_ROUTE_WAIT = 3
+K_REACHABLE = 5
+K_CAN_INTERACT = 7
 
-    def encode(self, env: Any, agent: int) -> Any: ...
+NO_ROUTE = 4
+INTERACT = 4
+WAIT = 5
 
-    def on_reset(self, env: Any) -> None: ...
+GOAL_FLAGS = ("goal_key", "goal_switch", "goal_checkpoint", "goal_exit", "goal_crate")
+SWITCH_FLAGS = ("switch_toggle", "switch_hold", "switch_oneshot")
 
-    def potential(self, env: Any, agent: int) -> float: ...
+#: Coarse distance bands, applied to the bridge's already-normalised
+#: `goal_distance`. Fine detail near the goal, none far away.
+DIST_EDGES = (0.02, 0.06, 0.15, 0.35)
 
 
-# ---------------------------------------------------------------------------
-# reachability
-# ---------------------------------------------------------------------------
+class StateEncoder:
+    """Buckets the bridge's globals into a hashable tuple."""
 
+    def encode(self, bridge: Any, agent: int) -> tuple:
+        g = bridge._extras(agent)
 
-class Reachability:
-    """Connected components of the currently-walkable, hazard-free floor.
+        route = _route_index(g)
+        me = bridge.pos[agent]
 
-    Needed because "where should I go" is meaningless without "can I get
-    there". Without this the agent walks at an objective sitting behind a
-    locked door and never works out that the key is the thing to fetch. Adding
-    it took a scripted best-case policy on the tutorial preset from 22/60 to
-    60/60 -- the difference between an unsolvable task and a solved one.
-
-    Recomputed only when the world changes shape (a door opens, a crate moves)
-    rather than every step: a handful of floods per episode instead of four
-    hundred.
-    """
-
-    __slots__ = ("_signature", "_component")
-
-    def __init__(self) -> None:
-        self._signature: Any = None
-        self._component: dict[Vec2, int] = {}
-
-    def reset(self) -> None:
-        self._signature = None
-        self._component = {}
-
-    def component(self, env: Any) -> dict[Vec2, int]:
-        signature = (
-            tuple(sorted(env.state.doors_open.items())),
-            tuple(sorted(env.state.block_positions.items())),
-        )
-        if signature != self._signature:
-            self._component = self._flood(env)
-            self._signature = signature
-        return self._component
-
-    def same_region(self, env: Any, a: Vec2, b: Vec2) -> bool:
-        component = self.component(env)
-        here = component.get(a)
-        return here is not None and component.get(b) == here
-
-    @staticmethod
-    def _flood(env: Any) -> dict[Vec2, int]:
-        room = env.room
-        component: dict[Vec2, int] = {}
-        next_id = 0
-
-        def open_tile(p: Vec2) -> bool:
-            return env._walkable(p) and not is_hazard(room.terrain_at(p))
-
-        for start in room.terrain.positions():
-            if start in component or not open_tile(start):
-                continue
-            component[start] = next_id
-            queue = deque([start])
-            while queue:
-                cur = queue.popleft()
-                for d in DIRS:
-                    nxt = cur + d
-                    if nxt in component or not open_tile(nxt):
-                        continue
-                    component[nxt] = next_id
-                    queue.append(nxt)
-            next_id += 1
-
-        return component
-
-
-# ---------------------------------------------------------------------------
-# what should this agent be heading for?
-# ---------------------------------------------------------------------------
-
-#: Priority order used by `current_target`, and the vocabulary of goal kinds.
-GOAL_KINDS = ("key", "switch", "checkpoint", "exit", "hold", "other")
-
-
-def current_target(env: Any, agent: int, reach: "Reachability | None" = None):
-    """Where this agent should be heading, and what kind of thing it is.
-
-    A *pointer*, not a policy. It says "the nearest useful thing you can
-    actually walk to is over there"; the agent still has to learn how to get
-    there, what to do on arrival, and whether going there first is the right
-    call at all. Without something like it the state carries no sense of task
-    phase, and a table cannot tell "walking to the key" from "walking to the
-    exit" -- the two look identical from four adjacent tiles.
-
-    Order of preference:
-
-    1.  Already holding a door open -- stay put. This is the two-agent lock:
-        one bot stands on a HOLD switch while the other walks through. Stepping
-        off re-locks the door, so "stay" has to be a target the state can
-        express, or the pair oscillates forever.
-    2.  A reachable exit prerequisite.
-    3.  If none is reachable, whatever unlocks the way: an uncollected key, an
-        unthrown switch, an unreached checkpoint in this component.
-    4.  Failing all that, the primary objective anyway, reachable or not.
-    """
-    room, state = env.room, env.state
-    me = env.pos[agent]
-
-    if _holding_open_door(env, me) is not None:
-        return me, "hold"
-
-    reach = reach or Reachability()
-    component = reach.component(env)
-    mine = component.get(me)
-
-    primary: list[tuple[Vec2, str]] = []
-    if state.exit_open:
-        primary.append((room.exit.pos, "exit"))
-    else:
-        for entity_id in state.objectives_remaining():
-            entity = room.find(entity_id)
-            if entity is not None:
-                primary.append((entity.pos, _kind_name(entity)))
-
-    usable = [c for c in primary if mine is not None and component.get(c[0]) == mine]
-    if usable:
-        return min(usable, key=lambda c: me.manhattan(c[0]))
-
-    unlocks: list[tuple[Vec2, str]] = []
-    for key in room.keys:
-        if not state.is_key_collected(key.id):
-            unlocks.append((key.pos, "key"))
-    for switch in room.switches:
-        if not state.is_switch_active(switch.id):
-            unlocks.append((switch.pos, "switch"))
-    for check in room.checkpoints:
-        if not state.is_checkpoint_reached(check.id):
-            unlocks.append((check.pos, "checkpoint"))
-
-    usable = [c for c in unlocks if mine is not None and component.get(c[0]) == mine]
-    if usable:
-        return min(usable, key=lambda c: me.manhattan(c[0]))
-
-    if primary:
-        return min(primary, key=lambda c: me.manhattan(c[0]))
-    return room.exit.pos, "exit"
-
-
-def _holding_open_door(env: Any, pos: Vec2) -> str | None:
-    """Id of a HOLD switch under `pos` that is currently keeping a door open."""
-    state = env.state
-    for entity in env.room.entities_at(pos):
-        if not isinstance(entity, Switch) or entity.mode is not SwitchMode.HOLD:
-            continue
-        if any(state.is_door_open(door_id) for door_id in entity.controls):
-            return entity.id
-    return None
-
-
-def _kind_name(entity: Any) -> str:
-    if isinstance(entity, Key):
-        return "key"
-    if isinstance(entity, Switch):
-        return "switch"
-    if isinstance(entity, Checkpoint):
-        return "checkpoint"
-    return "other"
-
-
-def _mask(flags: list[bool]) -> int:
-    out = 0
-    for i, flag in enumerate(flags):
-        if flag:
-            out |= 1 << i
-    return out
-
-
-# ---------------------------------------------------------------------------
-# exact encoder -- one room at a time
-# ---------------------------------------------------------------------------
-
-
-class PositionEncoder:
-    """(position, progress) -- complete for a fixed room, useless across rooms.
-
-    State count is roughly width * height * 2^keys * 2^switches * 2^checkpoints
-    * 2, of which only the reachable few thousand ever get stored.
-    """
-
-    def __init__(self) -> None:
-        self.reach = Reachability()
-        self._key_ids: tuple[str, ...] = ()
-        self._switch_ids: tuple[str, ...] = ()
-        self._check_ids: tuple[str, ...] = ()
-
-    def on_reset(self, env: Any) -> None:
-        room = env.room
-        self.reach.reset()
-        self._key_ids = tuple(sorted(k.id for k in room.keys))
-        self._switch_ids = tuple(sorted(s.id for s in room.switches))
-        self._check_ids = tuple(sorted(c.id for c in room.checkpoints))
-
-    def encode(self, env: Any, agent: int) -> Any:
-        state = env.state
-        x, y = env.pos[agent]
-        return (
-            x,
-            y,
-            _mask([state.is_key_collected(k) for k in self._key_ids]),
-            _mask([state.is_switch_active(s) for s in self._switch_ids]),
-            _mask([state.is_checkpoint_reached(c) for c in self._check_ids]),
-            state.exit_open,
-        )
-
-    def potential(self, env: Any, agent: int) -> float:
-        return _distance_potential(env, agent, self.reach)
-
-
-# ---------------------------------------------------------------------------
-# relative encoder -- transfers between rooms
-# ---------------------------------------------------------------------------
-
-#: Coarse distance bands. Fine detail near the target, none far away, because
-#: "the key is 14 tiles north" and "17 tiles north" call for the same move.
-DIST_BANDS = (0, 1, 3, 6, 12)
-
-#: What the agent is standing on.
-UNDERFOOT = ("nothing", "key", "switch", "checkpoint", "door", "exit", "hazard")
-
-
-class FeatureEncoder:
-    """Local, relative, and small enough to actually fill in.
-
-    The key is a tuple of:
-
-        neighbours    3^4 = 81   each of N/E/S/W as free / blocked / hazard
-        goal_sector   8          compass direction of the current target
-        goal_band     5          how far away it is, in coarse bands
-        underfoot     7          what is on this tile
-        goal_kind     6          key / switch / checkpoint / exit / hold / other
-        mate          3          partner far / near / on the same tile
-        duty          3          nobody holding / I am holding / partner is
-        last_move     5          direction of the previous step, or none
-
-    Nominally ~1.2M combinations; the reachable set is far smaller, since most
-    are geometrically impossible. Expect low tens of thousands after a long run.
-
-    Deliberate omission: the two-tile "long" actions (4-7) reach past what the
-    neighbour feature can see, so the agent is partly blind about them. A second
-    ring would multiply the table by 81 for a marginal gain. It learns them
-    anyway, from outcome rather than from sight.
-    """
-
-    def __init__(self) -> None:
-        self.reach = Reachability()
-
-    def on_reset(self, env: Any) -> None:
-        self.reach.reset()
-
-    def encode(self, env: Any, agent: int) -> Any:
-        room, state = env.room, env.state
-        me = env.pos[agent]
-
-        neighbours = 0
-        for i, d in enumerate(DIRS):
-            neighbours += _tile_class(env, me + d) * (3**i)
-
-        target, kind = current_target(env, agent, self.reach)
-        if target is None:
-            sector, band = 0, 0
+        if route == NO_ROUTE:
+            route_tile = 0
         else:
-            delta = target - me
-            sector = _sector(delta)
-            band = _band(abs(delta.x) + abs(delta.y))
+            route_tile = _tile_class(bridge, me + DIRS[route])
 
-        mate = env.pos[1 - agent]
+        hazards = sum(
+            1 for d in DIRS if _tile_class(bridge, me + d) == 2
+        )
+        hazards_adj = 2 if hazards >= 2 else hazards
+
+        mate = bridge.pos[1 - agent]
         gap = me.manhattan(mate)
-        mate_code = 2 if gap == 0 else (1 if gap <= 3 else 0)
-
-        if _holding_open_door(env, me) is not None:
-            duty = 1
-        elif _holding_open_door(env, mate) is not None:
-            duty = 2
-        else:
-            duty = 0
-
-        previous = env.last_action[agent]
-        last_move = 4 if previous is None or previous >= 8 else previous % 4
+        teammate = 2 if gap == 0 else (1 if gap <= 3 else 0)
 
         return (
-            neighbours,
-            sector,
-            band,
-            _underfoot(room, state, me),
-            GOAL_KINDS.index(kind) if kind in GOAL_KINDS else 5,
-            mate_code,
-            duty,
-            last_move,
+            route,
+            route_tile,
+            hazards_adj,
+            _bit(g[G["route_wait"]]),
+            _goal_kind(g),
+            _bit(g[G["goal_reachable"]]),
+            _band(g[G["goal_distance"]]),
+            _bit(g[G["can_interact"]]),
+            _bit(g[G["can_push"]]),
+            _switch_mode(g),
+            _mechanism(g),
+            teammate,
+            _ball_threat(bridge, agent),
+            _hold_duty(bridge, agent),
         )
 
-    def potential(self, env: Any, agent: int) -> float:
-        return _distance_potential(env, agent, self.reach)
+
+# ---------------------------------------------------------------------------
+# policy helpers -- these mirror DQN_model exactly
+# ---------------------------------------------------------------------------
 
 
-def _tile_class(env: Any, p: Vec2) -> int:
-    """0 free, 1 blocked, 2 hazard."""
-    room, state = env.room, env.state
+def valid_actions(key: tuple) -> list[int]:
+    """Legal actions in this state.
+
+    `DQN_model.action_mask` masks action 4 whenever `can_interact` is false, and
+    `POLICY_CONTRACT` records that as part of the policy. The table honours the
+    same contract, or the two agents would be choosing from different sets and
+    any comparison between them would be measuring that instead of the learning
+    rule.
+    """
+    actions = list(range(N_ACTIONS))
+    if not key[K_CAN_INTERACT]:
+        actions.remove(INTERACT)
+    return actions
+
+
+def route_action(key: tuple) -> int:
+    """The action the BFS route recommends, or -1 if there is no usable route.
+
+    Eligibility matches `DQN_model.route_actions`: a route exists, interaction
+    is not available, and the bridge is not asking us to wait.
+    """
+    if key[K_ROUTE] == NO_ROUTE:
+        return -1
+    if not key[K_REACHABLE] or key[K_CAN_INTERACT] or key[K_ROUTE_WAIT]:
+        return -1
+    return key[K_ROUTE]
+
+
+def policy_scores(values: list[float], key: tuple) -> list[float]:
+    """Q-values plus the DQN's route bias, with illegal actions removed.
+
+    `ROUTE_Q_BIAS` is imported rather than redefined so the two agent families
+    cannot drift apart on it.
+    """
+    scores = list(values)
+    route = route_action(key)
+    if route >= 0:
+        scores[route] += ROUTE_Q_BIAS
+
+    legal = set(valid_actions(key))
+    return [s if a in legal else -float("inf") for a, s in enumerate(scores)]
+
+
+# ---------------------------------------------------------------------------
+# field helpers
+# ---------------------------------------------------------------------------
+
+
+def _bit(value: float) -> int:
+    return 1 if value > 0.5 else 0
+
+
+def _route_index(g: list[float]) -> int:
+    """Same thresholds and precedence as `DQN_model.route_actions`."""
+    dx, dy = g[G["route_dx"]], g[G["route_dy"]]
+    route = NO_ROUTE
+    if dy < -0.5:
+        route = 0
+    if dx > 0.5:
+        route = 1
+    if dy > 0.5:
+        route = 2
+    if dx < -0.5:
+        route = 3
+    return route
+
+
+def _goal_kind(g: list[float]) -> int:
+    for i, flag in enumerate(GOAL_FLAGS):
+        if g[G[flag]] > 0.5:
+            return i + 1
+    return 0
+
+
+def _switch_mode(g: list[float]) -> int:
+    for i, flag in enumerate(SWITCH_FLAGS):
+        if g[G[flag]] > 0.5:
+            return i + 1
+    return 0
+
+
+def _mechanism(g: list[float]) -> int:
+    """Timed door and bridge status, collapsed into one field.
+
+    Both are time-dependent obstacles the agent has to wait on, and they never
+    co-occur as the *relevant* mechanism for a given agent, so one field of five
+    values covers them at a fifth of the cost of two separate fields.
+    """
+    if g[G["timed_door_present"]] > 0.5:
+        return 1 if g[G["timed_door_open"]] > 0.5 else 2
+    if g[G["bridge_present"]] > 0.5:
+        return 3 if g[G["bridge_solid"]] > 0.5 else 4
+    return 0
+
+
+def _band(distance: float) -> int:
+    band = 0
+    for edge in DIST_EDGES:
+        if distance > edge:
+            band += 1
+    return band
+
+
+def _tile_class(bridge: Any, p: Vec2) -> int:
+    """0 free, 1 blocked, 2 hazard.
+
+    Reset zones count as hazards. They do not kill, but they undo progress,
+    which from a policy's point of view is the same instruction: do not step
+    there.
+    """
+    room = bridge.room
     if not room.terrain.in_bounds(p):
         return 1
-    tile = room.terrain_at(p)
-    if tile in SOLID:
+    if not bridge._walkable(p):
         return 1
-    if state.blocking_entity_at(p) is not None:
-        return 1
-    if is_hazard(tile):
+    if is_hazard(room.terrain_at(p)):
+        return 2
+    if bridge._reset_zone_at(p) is not None:
         return 2
     return 0
 
 
-def _sector(delta: Vec2) -> int:
-    """Eight compass sectors. 0 = due north, going clockwise."""
-    dx, dy = delta
-    if dx == 0 and dy == 0:
-        return 0
-    ax, ay = abs(dx), abs(dy)
-    diagonal = ax > 0 and ay > 0 and 0.4 <= ax / (ax + ay) <= 0.6
-    if diagonal:
-        return {(1, -1): 1, (1, 1): 3, (-1, 1): 5, (-1, -1): 7}[
-            (1 if dx > 0 else -1, 1 if dy > 0 else -1)
-        ]
-    if ax >= ay:
-        return 2 if dx > 0 else 6
-    return 4 if dy > 0 else 0
+def _hold_duty(bridge: Any, agent: int) -> int:
+    """0 nobody, 1 I am holding a door open, 2 my partner is.
 
+    Added after the `hold_switch_door` curriculum stage scored 15% against an
+    84% threshold while every neighbouring stage passed. That stage is the
+    two-agent lock: one bot stands on a HOLD switch, the door it controls opens,
+    the other bot walks through, and stepping off re-locks it.
 
-def _band(distance: int) -> int:
-    band = 0
-    for i, edge in enumerate(DIST_BANDS):
-        if distance >= edge:
-            band = i
-    return band
-
-
-def _underfoot(room: Any, state: Any, p: Vec2) -> int:
-    if p == room.exit.pos:
-        return UNDERFOOT.index("exit")
-    if is_hazard(room.terrain_at(p)):
-        return UNDERFOOT.index("hazard")
-    for e in room.entities_at(p):
-        if isinstance(e, Key) and not state.is_key_collected(e.id):
-            return UNDERFOOT.index("key")
-        if isinstance(e, Switch):
-            return UNDERFOOT.index("switch")
-        if isinstance(e, Checkpoint) and not state.is_checkpoint_reached(e.id):
-            return UNDERFOOT.index("checkpoint")
-        if isinstance(e, LockedDoor):
-            return UNDERFOOT.index("door")
+    Nothing in the bridge's 51 globals expresses "you are currently holding a
+    door open for someone else". `switch_hold` says the *goal* is a hold switch
+    and `route_wait` says hold position this tick, but neither distinguishes
+    standing usefully on a switch from standing pointlessly on one -- so both
+    situations collapsed onto the same key and the table could not learn that
+    the first is worth staying in. Note `crate_hold_switch` passed at 95%
+    without this, because a crate can weigh the switch down and no coordination
+    is needed; the failure was specific to cases where a *bot* has to wait.
+    """
+    state = bridge.state
+    for index in (agent, 1 - agent):
+        for entity in bridge.room.entities_at(bridge.pos[index]):
+            if not isinstance(entity, Switch) or entity.mode is not SwitchMode.HOLD:
+                continue
+            if any(state.is_door_open(door) for door in entity.controls):
+                return 1 if index == agent else 2
     return 0
 
 
-def _distance_potential(env: Any, agent: int, reach: "Reachability | None" = None) -> float:
-    """Shaping potential: closer to the target and fewer objectives left is better.
+def _ball_threat(bridge: Any, agent: int) -> int:
+    """1 if a wipeout ball occupies or is about to occupy an adjacent tile.
 
-    Used as F = gamma * phi(s') - phi(s). Ng et al. showed that form leaves the
-    optimal policy unchanged *for a fixed potential function*. Ours is not quite
-    fixed -- it re-points when an objective completes -- so the guarantee is not
-    airtight. The objective-count term keeps those switches from producing a
-    misleading spike: the step down in remaining objectives more than pays for
-    the jump in distance when the target moves to something further away. Set
-    `Config.shaping = 0.0` for the unshaped, strictly comparable run.
+    Worth its own field because a ball is the only thing in the environment that
+    ends an episode outright, at -10.0 -- an order of magnitude worse than any
+    other penalty. A table that cannot see one coming cannot learn to dodge.
     """
-    room, state = env.room, env.state
-    me = env.pos[agent]
-    target, _ = current_target(env, agent, reach)
-    span = float(max(1, max(room.width, room.height)))
+    if not bridge._wipeout_balls:
+        return 0
 
-    remaining = len(state.objectives_remaining()) + (0 if state.exit_open else 1)
-    distance = me.manhattan(target) / span if target is not None else 1.0
-    return -(distance + remaining)
+    tick = bridge.state.tick
+    me = bridge.pos[agent]
+    for offset in (Vec2(0, 0), *DIRS):
+        p = me + offset
+        for when in (tick, tick + 1):
+            if bridge._wipeout_at(p, when) is not None:
+                return 1
+    return 0
