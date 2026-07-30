@@ -131,6 +131,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--resume-dynamic-door-upgrade",
+        action="store_true",
+        help=(
+            "resume an untested wipeout-safety state with projected HOLD-door "
+            "simulation and write recovery to a new file"
+        ),
+    )
+    parser.add_argument(
         "--warm-start-progress",
         default=None,
         help=(
@@ -276,11 +284,12 @@ def _source_upgrade_metadata(
     kind: str,
 ) -> dict[str, Any]:
     status = str(payload.get("status"))
-    allowed_statuses = (
-        {"training", "stopped"}
-        if kind in {"policy_v2", "planner_v3", "wipeout_safety_v1"}
-        else {"stopped"}
-    )
+    if kind == "dynamic_door_safety_v1":
+        allowed_statuses = {"training"}
+    elif kind in {"policy_v2", "planner_v3", "wipeout_safety_v1"}:
+        allowed_statuses = {"training", "stopped"}
+    else:
+        allowed_statuses = {"stopped"}
     if status not in allowed_statuses:
         raise ValueError(
             f"{kind} cannot upgrade a {status!r} curriculum state"
@@ -334,6 +343,7 @@ def main() -> None:
             args.resume_policy_upgrade,
             args.resume_planner_upgrade,
             args.resume_safety_upgrade,
+            args.resume_dynamic_door_upgrade,
         )
     )
     if upgrade_count > 1:
@@ -344,20 +354,25 @@ def main() -> None:
         or args.resume_policy_upgrade
         or args.resume_planner_upgrade
         or args.resume_safety_upgrade
+        or args.resume_dynamic_door_upgrade
     )
     upgrade_option = (
-        "--resume-safety-upgrade"
-        if args.resume_safety_upgrade
+        "--resume-dynamic-door-upgrade"
+        if args.resume_dynamic_door_upgrade
         else (
-            "--resume-planner-upgrade"
-            if args.resume_planner_upgrade
+            "--resume-safety-upgrade"
+            if args.resume_safety_upgrade
             else (
-                "--resume-policy-upgrade"
-                if args.resume_policy_upgrade
+                "--resume-planner-upgrade"
+                if args.resume_planner_upgrade
                 else (
-                    "--resume-repair-upgrade"
-                    if args.resume_repair_upgrade
-                    else "--resume-retention-upgrade"
+                    "--resume-policy-upgrade"
+                    if args.resume_policy_upgrade
+                    else (
+                        "--resume-repair-upgrade"
+                        if args.resume_repair_upgrade
+                        else "--resume-retention-upgrade"
+                    )
                 )
             )
         )
@@ -376,6 +391,7 @@ def main() -> None:
             args.resume_policy_upgrade
             or args.resume_planner_upgrade
             or args.resume_safety_upgrade
+            or args.resume_dynamic_door_upgrade
         )
     ):
         raise ValueError(
@@ -500,6 +516,7 @@ def main() -> None:
             args.resume_policy_upgrade
             or args.resume_planner_upgrade
             or args.resume_safety_upgrade
+            or args.resume_dynamic_door_upgrade
         )
         and resume_payload is not None
         and resume_payload.get("status") == "stopped"
@@ -541,18 +558,22 @@ def main() -> None:
             resume_path,
             resume_payload,
             (
-                "wipeout_safety_v1"
-                if args.resume_safety_upgrade
+                "dynamic_door_safety_v1"
+                if args.resume_dynamic_door_upgrade
                 else (
-                    "planner_v3"
-                    if args.resume_planner_upgrade
+                    "wipeout_safety_v1"
+                    if args.resume_safety_upgrade
                     else (
-                        "policy_v2"
-                        if args.resume_policy_upgrade
+                        "planner_v3"
+                        if args.resume_planner_upgrade
                         else (
-                            "training_repair_v4"
-                            if args.resume_repair_upgrade
-                            else "retention_v2"
+                            "policy_v2"
+                            if args.resume_policy_upgrade
+                            else (
+                                "training_repair_v4"
+                                if args.resume_repair_upgrade
+                                else "retention_v2"
+                            )
                         )
                     )
                 )
@@ -624,6 +645,7 @@ def main() -> None:
         policy_upgrade=args.resume_policy_upgrade,
         planner_upgrade=args.resume_planner_upgrade,
         safety_upgrade=args.resume_safety_upgrade,
+        dynamic_door_upgrade=args.resume_dynamic_door_upgrade,
     )
     if warm_start_payload is not None:
         if warm_start_info is None:

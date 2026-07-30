@@ -110,6 +110,39 @@ SOLID = (Tile.VOID, Tile.WALL, Tile.OBSTACLE)
 TIME_SCALE = 64.0
 
 
+class _ProjectedWipeoutState:
+    """Requirement view for one branch of the wipeout survival search."""
+
+    __slots__ = ("live", "room", "agents", "block_positions")
+
+    def __init__(
+        self,
+        live: EpisodeState,
+        room: Room,
+        agents: tuple[Vec2, Vec2],
+        blocks: tuple[tuple[str, Vec2], ...],
+    ) -> None:
+        self.live = live
+        self.room = room
+        self.agents = agents
+        self.block_positions = frozenset(pos for _, pos in blocks)
+
+    def is_key_collected(self, key_id: str) -> bool:
+        return self.live.is_key_collected(key_id)
+
+    def is_switch_active(self, switch_id: str) -> bool:
+        switch = self.room.find(switch_id)
+        if isinstance(switch, Switch) and switch.mode is SwitchMode.HOLD:
+            return (
+                switch.pos in self.agents
+                or switch.pos in self.block_positions
+            )
+        return self.live.is_switch_active(switch_id)
+
+    def is_checkpoint_reached(self, checkpoint_id: str) -> bool:
+        return self.live.is_checkpoint_reached(checkpoint_id)
+
+
 def micro_room(size: int = 2, seed: int = 0) -> Room:
     """Build a small open room with two spawns and an open exit."""
     dim = size + 2                      # one tile of wall on every side
@@ -862,7 +895,12 @@ class CoopEnvBridge:
                 blocks,
                 tick,
             )
-            if self._wipeout_walkable_at(entered, tick, next_blocks):
+            if self._wipeout_walkable_at(
+                entered,
+                tick,
+                next_blocks,
+                (pos, other),
+            ):
                 destination = entered
                 moved = True
 
@@ -876,7 +914,12 @@ class CoopEnvBridge:
         next_tick = tick + 1
         if destination in self._wipeout_danger_at(next_tick):
             return None
-        if not self._wipeout_walkable_at(destination, next_tick, next_blocks):
+        if not self._wipeout_walkable_at(
+            destination,
+            next_tick,
+            next_blocks,
+            (destination, other),
+        ):
             return None
         return destination, next_blocks
 
@@ -899,7 +942,12 @@ class CoopEnvBridge:
         if (
             past in (pos, other)
             or is_hazard(self.room.terrain_at(past))
-            or not self._wipeout_walkable_at(past, tick, blocks)
+            or not self._wipeout_walkable_at(
+                past,
+                tick,
+                blocks,
+                (pos, other),
+            )
         ):
             return blocks
         return tuple(
@@ -916,6 +964,7 @@ class CoopEnvBridge:
         pos: Vec2,
         tick: int,
         blocks: tuple[tuple[str, Vec2], ...],
+        agents: tuple[Vec2, Vec2],
     ) -> bool:
         if not self.room.terrain.in_bounds(pos):
             return False
@@ -928,15 +977,32 @@ class CoopEnvBridge:
         if any(block_pos == pos for _, block_pos in blocks):
             return False
         for door in self._doors:
-            if door.pos == pos and not self._wipeout_door_open_at(door, tick):
+            if door.pos == pos and not self._wipeout_door_open_at(
+                door,
+                tick,
+                blocks,
+                agents,
+            ):
                 return False
         return True
 
-    def _wipeout_door_open_at(self, door: LockedDoor, tick: int) -> bool:
+    def _wipeout_door_open_at(
+        self,
+        door: LockedDoor,
+        tick: int,
+        blocks: tuple[tuple[str, Vec2], ...],
+        agents: tuple[Vec2, Vec2],
+    ) -> bool:
+        if not door.latching:
+            projected = _ProjectedWipeoutState(
+                self.state,
+                self.room,
+                agents,
+                blocks,
+            )
+            return door.requirement.is_satisfied(projected)
         if not self.state.is_door_open(door.id):
             return False
-        if not door.latching:
-            return tick == self.state.tick
         if not door.timer:
             return True
         elapsed = max(0, tick - self.state.tick)

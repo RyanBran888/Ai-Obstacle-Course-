@@ -1248,6 +1248,7 @@ class CurriculumRunner:
         policy_upgrade: bool = False,
         planner_upgrade: bool = False,
         safety_upgrade: bool = False,
+        dynamic_door_upgrade: bool = False,
     ) -> None:
         if not pool_sizes or any(size < 1 for size in pool_sizes):
             raise ValueError("pool_sizes must contain positive values")
@@ -1312,6 +1313,7 @@ class CurriculumRunner:
                 policy_upgrade,
                 planner_upgrade,
                 safety_upgrade,
+                dynamic_door_upgrade,
             )
         ) > 1:
             raise ValueError("only one recovery upgrade may be selected")
@@ -1320,6 +1322,7 @@ class CurriculumRunner:
         self._policy_upgrade = bool(policy_upgrade)
         self._planner_upgrade = bool(planner_upgrade)
         self._safety_upgrade = bool(safety_upgrade)
+        self._dynamic_door_upgrade = bool(dynamic_door_upgrade)
         self.results: list[StageResult] = []
         self.test_results: list[StageTestResult] = []
         self._manifest_builder = LazyRoomManifestBuilder(
@@ -1595,6 +1598,8 @@ class CurriculumRunner:
             raise ValueError(
                 "recovery state does not match this code, seed, or training config"
             )
+        if self._dynamic_door_upgrade and not exact_contract:
+            self._validate_dynamic_door_cursor(payload)
         if not exact_contract:
             label = (
                 "training-repair-v4"
@@ -1606,9 +1611,13 @@ class CurriculumRunner:
                         "planner-v3"
                         if self._planner_upgrade
                         else (
-                            "wipeout-safety-v1"
-                            if self._safety_upgrade
-                            else "retention-v2"
+                            "dynamic-door-safety-v1"
+                            if self._dynamic_door_upgrade
+                            else (
+                                "wipeout-safety-v1"
+                                if self._safety_upgrade
+                                else "retention-v2"
+                            )
                         )
                     )
                 )
@@ -1671,7 +1680,11 @@ class CurriculumRunner:
         if self._resume_active is not None and not exact_contract:
             self._resume_active["best_rank"] = ()
             self._resume_active["needs_baseline_assessment"] = True
-            if self._planner_upgrade or self._safety_upgrade:
+            if (
+                self._planner_upgrade
+                or self._safety_upgrade
+                or self._dynamic_door_upgrade
+            ):
                 self.trainer.load_learner_state(
                     self._resume_active["best_learner_state"]
                 )
@@ -1812,6 +1825,86 @@ class CurriculumRunner:
             ):
                 raise ValueError("training repair results are not the expected prefix")
 
+    def _validate_dynamic_door_cursor(
+        self,
+        payload: Mapping[str, Any],
+    ) -> None:
+        """Accept only the untested full_7 safety checkpoint this fix targets."""
+        if (
+            payload.get("status") != "training"
+            or payload.get("test_results")
+            or payload.get("test_model_sha256") is not None
+        ):
+            raise ValueError(
+                "dynamic-door upgrade requires the untested full_7 training state"
+            )
+        active = payload.get("active")
+        if not isinstance(active, Mapping):
+            raise ValueError("dynamic-door upgrade requires an active pool")
+        final_index = len(self.stages) - 1
+        if (
+            int(active.get("stage_index", -1)) != final_index
+            or int(active.get("pool_index", -1)) != 0
+            or int(active.get("scheduled_pool_size", -1)) != 1
+            or int(active.get("active_pool_size", -1)) != 1
+            or int(active.get("total_rounds", -1)) != 28
+            or int(active.get("normal_rounds", -1)) != 28
+            or int(active.get("recovery_rounds", -1)) != 0
+            or active.get("phase") != "normal"
+            or int(active.get("phase_rounds", -1)) != 28
+        ):
+            raise ValueError(
+                "dynamic-door upgrade source is not the supported full_7 cursor"
+            )
+
+        expected = [
+            (stage.name, pool)
+            for stage in self.stages[:final_index]
+            for pool in tuple(sorted(set(stage.pool_sizes or self.pool_sizes)))
+        ]
+        results = payload.get("results", ())
+        if not isinstance(results, (list, tuple)) or len(results) != len(expected):
+            raise ValueError(
+                "dynamic-door upgrade results are not the full_7 curriculum prefix"
+            )
+        for result, (stage_name, pool_size) in zip(
+            results,
+            expected,
+            strict=True,
+        ):
+            if not isinstance(result, Mapping):
+                raise ValueError("dynamic-door upgrade result is invalid")
+            scheduled = result.get("scheduled_pool_size")
+            if scheduled is None:
+                scheduled = result.get("pool_size")
+            if (
+                result.get("stage") != stage_name
+                or int(scheduled) != pool_size
+                or not bool(result.get("promoted"))
+            ):
+                raise ValueError(
+                    "dynamic-door upgrade results are not the full_7 curriculum prefix"
+                )
+
+        contract = payload.get("contract")
+        external = (
+            contract.get("external")
+            if isinstance(contract, Mapping)
+            else None
+        )
+        prior_upgrade = (
+            external.get("source_upgrade")
+            if isinstance(external, Mapping)
+            else None
+        )
+        if (
+            not isinstance(prior_upgrade, Mapping)
+            or prior_upgrade.get("kind") != "wipeout_safety_v1"
+        ):
+            raise ValueError(
+                "dynamic-door upgrade requires the full_7 wipeout-safety source"
+            )
+
     def _repair_manifest(
         self,
         payload: Mapping[str, Any],
@@ -1880,6 +1973,7 @@ class CurriculumRunner:
             or self._policy_upgrade
             or self._planner_upgrade
             or self._safety_upgrade
+            or self._dynamic_door_upgrade
         ):
             return False
 
@@ -1955,7 +2049,7 @@ class CurriculumRunner:
                 "DQN/env_bridge.py",
                 "DQN/run_curriculum.py",
             }
-        else:
+        elif self._safety_upgrade:
             if saved.get("retention_size") != current.get("retention_size"):
                 return False
             if saved.get("stages") != current.get("stages"):
@@ -1967,6 +2061,17 @@ class CurriculumRunner:
                 "DQN/curriculum.py",
                 "DQN/env_bridge.py",
                 "DQN/load_model.py",
+                "DQN/run_curriculum.py",
+            }
+        else:
+            if saved.get("retention_size") != current.get("retention_size"):
+                return False
+            if saved.get("stages") != current.get("stages"):
+                return False
+            expected_kind = "dynamic_door_safety_v1"
+            allowed_changes = {
+                "DQN/curriculum.py",
+                "DQN/env_bridge.py",
                 "DQN/run_curriculum.py",
             }
         saved_external = dict(saved_copy.get("external", {}))
