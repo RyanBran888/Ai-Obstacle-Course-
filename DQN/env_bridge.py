@@ -5,6 +5,7 @@ import random as _random
 import sys
 from collections import OrderedDict, deque
 from copy import deepcopy
+from math import lcm
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +36,14 @@ from coop_env.rng import normalize_seed
 from coop_env.state import EpisodeState
 from coop_env.tiles import Tile, is_hazard
 
-from DQN.DQN_model import CHANNELS, GLOBALS, N_ACTIONS, OBS_DIM, VIEW
+from DQN.DQN_model import (
+    CHANNELS,
+    GLOBALS,
+    N_ACTIONS,
+    OBS_DIM,
+    VIEW,
+    WIPEOUT_ACTION_MASK_HORIZON,
+)
 
 N_AGENTS = 2
 RADIUS = VIEW // 2
@@ -206,6 +214,7 @@ class CoopEnvBridge:
         self._reset_zones: tuple[ResetZone, ...] = ()
         self._bridges: tuple[TemporaryBridge, ...] = ()
         self._wipeout_balls: tuple[WipeoutBall, ...] = ()
+        self._wipeout_danger_phases: tuple[frozenset[Vec2], ...] = ()
         self._static_blocked: dict = {}
         self._static_hazard: dict = {}
         self._static_entities: dict = {}
@@ -296,6 +305,7 @@ class CoopEnvBridge:
         self._reset_zones = self.room.reset_zones
         self._bridges = self.room.bridges
         self._wipeout_balls = self.room.wipeout_balls
+        self._cache_wipeout_danger()
         self._exit_pos = self._exit.pos
         self._span = float(max(self.room.width, self.room.height))
         self._totals = (
@@ -645,6 +655,292 @@ class CoopEnvBridge:
             ),
             None,
         )
+
+    def _cache_wipeout_danger(self) -> None:
+        if not self._wipeout_balls:
+            self._wipeout_danger_phases = ()
+            return
+        period = 1
+        for ball in self._wipeout_balls:
+            track_length = len(ball.track or (ball.pos,))
+            period = lcm(period, max(1, 2 * (track_length - 1)))
+        self._wipeout_danger_phases = tuple(
+            frozenset(
+                tile
+                for ball in self._wipeout_balls
+                for tile in ball.collision_tiles_at(tick)
+            )
+            for tick in range(period)
+        )
+
+    def _wipeout_danger_at(self, tick: int) -> frozenset[Vec2]:
+        phases = self._wipeout_danger_phases
+        return phases[tick % len(phases)] if phases else frozenset()
+
+    def wipeout_action_masks(
+        self,
+        horizon: int = WIPEOUT_ACTION_MASK_HORIZON,
+    ) -> tuple[tuple[bool, ...], ...]:
+        if not self._ready:
+            raise RuntimeError("call reset() before requesting action masks")
+        if horizon < 1:
+            raise ValueError("wipeout action-mask horizon must be positive")
+        if not self._wipeout_danger_phases:
+            safe = (True,) * N_ACTIONS
+            return (safe,) * N_AGENTS
+
+        blocks = tuple(sorted(self.state.block_positions.items()))
+        masks: list[tuple[bool, ...]] = []
+        for agent_index in range(N_AGENTS):
+            pos = self.pos[agent_index]
+            other = self.pos[1 - agent_index]
+            memo: dict[
+                tuple[Vec2, tuple[tuple[str, Vec2], ...], int, int],
+                bool,
+            ] = {}
+            mask = tuple(
+                self._wipeout_action_survives(
+                    agent_index,
+                    pos,
+                    other,
+                    blocks,
+                    self.state.tick,
+                    action,
+                    horizon,
+                    memo,
+                )
+                for action in range(N_ACTIONS)
+            )
+            if not any(mask):
+                for shorter in range(horizon - 1, 0, -1):
+                    mask = tuple(
+                        self._wipeout_action_survives(
+                            agent_index,
+                            pos,
+                            other,
+                            blocks,
+                            self.state.tick,
+                            action,
+                            shorter,
+                            memo,
+                        )
+                        for action in range(N_ACTIONS)
+                    )
+                    if any(mask):
+                        break
+
+            mutable = list(mask)
+            mutable[INTERACT] = self._wipeout_action_survives(
+                agent_index,
+                pos,
+                other,
+                blocks,
+                self.state.tick,
+                INTERACT,
+                1,
+                memo,
+            )
+            for action, direction in enumerate(DIRS):
+                block_id = self.state.blocking_entity_at(pos + direction)
+                if not isinstance(self.room.find(block_id or ""), PushableBlock):
+                    continue
+                mutable[action] = (
+                    self._wipeout_action_survives(
+                        agent_index,
+                        pos,
+                        other,
+                        blocks,
+                        self.state.tick,
+                        action,
+                        1,
+                        memo,
+                    )
+                )
+            masks.append(tuple(mutable))
+        return tuple(masks)
+
+    def _wipeout_action_survives(
+        self,
+        agent_index: int,
+        pos: Vec2,
+        other: Vec2,
+        blocks: tuple[tuple[str, Vec2], ...],
+        tick: int,
+        action: int,
+        horizon: int,
+        memo: dict[
+            tuple[Vec2, tuple[tuple[str, Vec2], ...], int, int],
+            bool,
+        ],
+    ) -> bool:
+        transition = self._wipeout_survival_step(
+            agent_index,
+            pos,
+            other,
+            blocks,
+            tick,
+            action,
+        )
+        if transition is None:
+            return False
+        next_pos, next_blocks = transition
+        return self._wipeout_survival_exists(
+            agent_index,
+            next_pos,
+            other,
+            next_blocks,
+            tick + 1,
+            horizon - 1,
+            memo,
+        )
+
+    def _wipeout_survival_exists(
+        self,
+        agent_index: int,
+        pos: Vec2,
+        other: Vec2,
+        blocks: tuple[tuple[str, Vec2], ...],
+        tick: int,
+        remaining: int,
+        memo: dict[
+            tuple[Vec2, tuple[tuple[str, Vec2], ...], int, int],
+            bool,
+        ],
+    ) -> bool:
+        if remaining == 0:
+            return True
+        key = (pos, blocks, tick, remaining)
+        cached = memo.get(key)
+        if cached is not None:
+            return cached
+        for action in (*range(4), WAIT):
+            transition = self._wipeout_survival_step(
+                agent_index,
+                pos,
+                other,
+                blocks,
+                tick,
+                action,
+            )
+            if transition is None:
+                continue
+            next_pos, next_blocks = transition
+            if self._wipeout_survival_exists(
+                agent_index,
+                next_pos,
+                other,
+                next_blocks,
+                tick + 1,
+                remaining - 1,
+                memo,
+            ):
+                memo[key] = True
+                return True
+        memo[key] = False
+        return False
+
+    def _wipeout_survival_step(
+        self,
+        agent_index: int,
+        pos: Vec2,
+        other: Vec2,
+        blocks: tuple[tuple[str, Vec2], ...],
+        tick: int,
+        action: int,
+    ) -> tuple[Vec2, tuple[tuple[str, Vec2], ...]] | None:
+        destination = pos
+        next_blocks = blocks
+        moved = False
+        if action < len(DIRS):
+            direction = DIRS[action]
+            entered = pos + direction
+            next_blocks = self._wipeout_push(
+                entered,
+                direction,
+                pos,
+                other,
+                blocks,
+                tick,
+            )
+            if self._wipeout_walkable_at(entered, tick, next_blocks):
+                destination = entered
+                moved = True
+
+        if moved and destination in self._wipeout_danger_at(tick):
+            return None
+        if moved:
+            zone = self._reset_zone_at(destination)
+            if zone is not None:
+                destination = self._reset_destination(zone, destination)
+
+        next_tick = tick + 1
+        if destination in self._wipeout_danger_at(next_tick):
+            return None
+        if not self._wipeout_walkable_at(destination, next_tick, next_blocks):
+            return None
+        return destination, next_blocks
+
+    def _wipeout_push(
+        self,
+        destination: Vec2,
+        direction: Vec2,
+        pos: Vec2,
+        other: Vec2,
+        blocks: tuple[tuple[str, Vec2], ...],
+        tick: int,
+    ) -> tuple[tuple[str, Vec2], ...]:
+        block_id = next(
+            (key for key, block_pos in blocks if block_pos == destination),
+            None,
+        )
+        if block_id is None:
+            return blocks
+        past = destination + direction
+        if (
+            past in (pos, other)
+            or is_hazard(self.room.terrain_at(past))
+            or not self._wipeout_walkable_at(past, tick, blocks)
+        ):
+            return blocks
+        return tuple(
+            sorted(
+                (
+                    (key, past if key == block_id else block_pos)
+                    for key, block_pos in blocks
+                ),
+            )
+        )
+
+    def _wipeout_walkable_at(
+        self,
+        pos: Vec2,
+        tick: int,
+        blocks: tuple[tuple[str, Vec2], ...],
+    ) -> bool:
+        if not self.room.terrain.in_bounds(pos):
+            return False
+        tile = self.room.terrain_at(pos)
+        if tile in SOLID:
+            return False
+        if is_hazard(tile):
+            bridge = self._bridges_by_tile.get(pos)
+            return bridge is not None and bridge.is_solid_at(tick)
+        if any(block_pos == pos for _, block_pos in blocks):
+            return False
+        for door in self._doors:
+            if door.pos == pos and not self._wipeout_door_open_at(door, tick):
+                return False
+        return True
+
+    def _wipeout_door_open_at(self, door: LockedDoor, tick: int) -> bool:
+        if not self.state.is_door_open(door.id):
+            return False
+        if not door.latching:
+            return tick == self.state.tick
+        if not door.timer:
+            return True
+        elapsed = max(0, tick - self.state.tick)
+        return elapsed < self.state.door_timer_remaining(door.id)
 
     def _wipeout_hits(self, excluded: set[int] | None = None):
         excluded = excluded or set()

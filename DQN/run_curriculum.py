@@ -123,6 +123,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--resume-safety-upgrade",
+        action="store_true",
+        help=(
+            "resume an untested state with wipeout action safety "
+            "and write recovery to a new file"
+        ),
+    )
+    parser.add_argument(
         "--warm-start-progress",
         default=None,
         help=(
@@ -270,7 +278,7 @@ def _source_upgrade_metadata(
     status = str(payload.get("status"))
     allowed_statuses = (
         {"training", "stopped"}
-        if kind in {"policy_v2", "planner_v3"}
+        if kind in {"policy_v2", "planner_v3", "wipeout_safety_v1"}
         else {"stopped"}
     )
     if status not in allowed_statuses:
@@ -325,6 +333,7 @@ def main() -> None:
             args.resume_repair_upgrade,
             args.resume_policy_upgrade,
             args.resume_planner_upgrade,
+            args.resume_safety_upgrade,
         )
     )
     if upgrade_count > 1:
@@ -334,17 +343,22 @@ def main() -> None:
         or args.resume_repair_upgrade
         or args.resume_policy_upgrade
         or args.resume_planner_upgrade
+        or args.resume_safety_upgrade
     )
     upgrade_option = (
-        "--resume-planner-upgrade"
-        if args.resume_planner_upgrade
+        "--resume-safety-upgrade"
+        if args.resume_safety_upgrade
         else (
-            "--resume-policy-upgrade"
-            if args.resume_policy_upgrade
+            "--resume-planner-upgrade"
+            if args.resume_planner_upgrade
             else (
-                "--resume-repair-upgrade"
-                if args.resume_repair_upgrade
-                else "--resume-retention-upgrade"
+                "--resume-policy-upgrade"
+                if args.resume_policy_upgrade
+                else (
+                    "--resume-repair-upgrade"
+                    if args.resume_repair_upgrade
+                    else "--resume-retention-upgrade"
+                )
             )
         )
     )
@@ -361,6 +375,7 @@ def main() -> None:
         and not (
             args.resume_policy_upgrade
             or args.resume_planner_upgrade
+            or args.resume_safety_upgrade
         )
     ):
         raise ValueError(
@@ -484,6 +499,7 @@ def main() -> None:
         (
             args.resume_policy_upgrade
             or args.resume_planner_upgrade
+            or args.resume_safety_upgrade
         )
         and resume_payload is not None
         and resume_payload.get("status") == "stopped"
@@ -525,15 +541,19 @@ def main() -> None:
             resume_path,
             resume_payload,
             (
-                "planner_v3"
-                if args.resume_planner_upgrade
+                "wipeout_safety_v1"
+                if args.resume_safety_upgrade
                 else (
-                    "policy_v2"
-                    if args.resume_policy_upgrade
+                    "planner_v3"
+                    if args.resume_planner_upgrade
                     else (
-                        "training_repair_v4"
-                        if args.resume_repair_upgrade
-                        else "retention_v2"
+                        "policy_v2"
+                        if args.resume_policy_upgrade
+                        else (
+                            "training_repair_v4"
+                            if args.resume_repair_upgrade
+                            else "retention_v2"
+                        )
                     )
                 )
             ),
@@ -603,6 +623,7 @@ def main() -> None:
         repair_upgrade=args.resume_repair_upgrade,
         policy_upgrade=args.resume_policy_upgrade,
         planner_upgrade=args.resume_planner_upgrade,
+        safety_upgrade=args.resume_safety_upgrade,
     )
     if warm_start_payload is not None:
         if warm_start_info is None:

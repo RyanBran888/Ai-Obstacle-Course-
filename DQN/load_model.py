@@ -39,6 +39,7 @@ for _path in (str(_HERE.parent), str(_HERE)):
         sys.path.insert(0, _path)
 
 from DQN.DQN_model import (
+    ACTION_SAFETY_CONTRACT,
     HIDDEN,
     LEGACY_POLICY_CONTRACT,
     N_ACTIONS,
@@ -83,6 +84,15 @@ def _validate_policy(checkpoint: Any) -> None:
         raise ValueError("checkpoint action policy does not match")
 
 
+def _validate_action_safety(checkpoint: Any) -> None:
+    if (
+        isinstance(checkpoint, dict)
+        and checkpoint.get("action_safety") is not None
+        and checkpoint.get("action_safety") != ACTION_SAFETY_CONTRACT
+    ):
+        raise ValueError("checkpoint action safety does not match")
+
+
 def load_agent(
     path: str | Path,
     device: str | torch.device = "auto",
@@ -100,6 +110,7 @@ def load_agent(
     resolved = resolve_device(device)
     checkpoint = torch.load(path, map_location=resolved)
     _validate_policy(checkpoint)
+    _validate_action_safety(checkpoint)
 
     agent = Agent(device=resolved, **agent_kwargs)
     agent.net.load_state_dict(_net_state(checkpoint))
@@ -117,6 +128,10 @@ def load_agent(
             for group in agent.opt.param_groups:
                 group["lr"] = agent_kwargs["lr"]
 
+    agent.require_action_mask = (
+        isinstance(checkpoint, dict)
+        and checkpoint.get("action_safety") is not None
+    )
     agent.net.train(train)
     agent.target.train(train)
     return agent
@@ -125,9 +140,15 @@ def load_agent(
 class Policy:
     """Callable inference wrapper: observations in, Q-values out as numpy."""
 
-    def __init__(self, net: QNetwork, device: torch.device) -> None:
+    def __init__(
+        self,
+        net: QNetwork,
+        device: torch.device,
+        action_safety: dict[str, Any] | None = None,
+    ) -> None:
         self.net = net
         self.device = device
+        self.action_safety = action_safety
 
     @torch.no_grad()
     def __call__(self, obs: ArrayLike) -> np.ndarray:
@@ -139,7 +160,15 @@ class Policy:
     def q_values(self, obs: ArrayLike) -> np.ndarray:
         return self(obs)
 
-    def act(self, obs: ArrayLike) -> int:
+    def act(
+        self,
+        obs: ArrayLike,
+        action_mask: ArrayLike | None = None,
+    ) -> int:
+        if self.action_safety is not None and action_mask is None:
+            raise ValueError(
+                "this checkpoint requires an environment action mask"
+            )
         t = torch.as_tensor(obs, dtype=torch.float32).to(self.device)
         with torch.no_grad():
             raw = self.net(t.unsqueeze(0) if t.dim() == 1 else t)
@@ -147,7 +176,22 @@ class Policy:
                 raw,
                 t.unsqueeze(0) if t.dim() == 1 else t,
             )
-        return int(scores.squeeze(0).argmax().item())
+        scores = scores.squeeze(0)
+        if action_mask is not None:
+            mask = torch.as_tensor(
+                action_mask,
+                dtype=torch.bool,
+                device=self.device,
+            )
+            if mask.shape != scores.shape:
+                raise ValueError(
+                    f"expected action mask shape {tuple(scores.shape)}, "
+                    f"got {tuple(mask.shape)}"
+                )
+            safe_scores = scores.masked_fill(~mask, -torch.inf)
+            if torch.isfinite(safe_scores).any():
+                scores = safe_scores
+        return int(scores.argmax().item())
 
 
 def load_policy(
@@ -161,11 +205,18 @@ def load_policy(
     resolved = resolve_device(device)
     checkpoint = torch.load(path, map_location=resolved)
     _validate_policy(checkpoint)
+    _validate_action_safety(checkpoint)
 
     net = QNetwork(obs_dim=obs_dim, n_actions=n_actions, hidden=hidden)
     net.load_state_dict(_net_state(checkpoint))
     net.to(resolved).eval()
-    return Policy(net, resolved)
+    action_safety = (
+        dict(checkpoint["action_safety"])
+        if isinstance(checkpoint, dict)
+        and isinstance(checkpoint.get("action_safety"), dict)
+        else None
+    )
+    return Policy(net, resolved, action_safety)
 
 
 def _main(argv: list[str]) -> int:
@@ -179,9 +230,17 @@ def _main(argv: list[str]) -> int:
 
     policy = load_policy(args.checkpoint, device=args.device)
     obs = np.zeros(policy.net.obs_dim, dtype=np.float32)
+    action_mask = (
+        np.ones(policy.net.n_actions, dtype=np.bool_)
+        if policy.action_safety is not None
+        else None
+    )
     print(f"loaded {args.checkpoint} on {policy.device}")
     print(f"  obs_dim={policy.net.obs_dim} n_actions={policy.net.n_actions}")
-    print(f"  q(zeros)={np.round(policy.q_values(obs), 4)} -> act={policy.act(obs)}")
+    print(
+        f"  q(zeros)={np.round(policy.q_values(obs), 4)} "
+        f"-> act={policy.act(obs, action_mask)}"
+    )
     return 0
 
 

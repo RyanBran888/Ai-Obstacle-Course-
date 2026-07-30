@@ -113,6 +113,12 @@ N_ACTIONS = len(ACTIONS)
 HIDDEN: tuple[int, ...] = (256, 128, 64)
 ROUTE_Q_BIAS = 0.5
 HOLD_WAIT_Q_BIAS = 0.02
+WIPEOUT_ACTION_MASK_HORIZON = 10
+ACTION_SAFETY_CONTRACT = {
+    "version": 1,
+    "wipeout_action_mask_horizon": WIPEOUT_ACTION_MASK_HORIZON,
+    "mask_source": "authoritative_environment_state",
+}
 LEGACY_POLICY_CONTRACT = {
     "version": 1,
     "route_q_bias": ROUTE_Q_BIAS,

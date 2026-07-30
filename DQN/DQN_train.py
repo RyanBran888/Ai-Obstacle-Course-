@@ -15,6 +15,7 @@ import torch.nn as nn
 from env_bridge import CoopEnvBridge, GenerationConfig
 from DQN.DQN_model import (
     ACTIONS,
+    ACTION_SAFETY_CONTRACT,
     CHANNEL_NAMES,
     GLOBAL_NAMES,
     HIDDEN,
@@ -34,17 +35,95 @@ _AUTO_DEVICE: torch.device | None = None
 _AUTO_CPU_THREADS: int | None = None
 _ROUTE_AUX_WEIGHT = 0.05
 _ROUTE_AUX_MARGIN = 1.0
+_WAIT_ACTION = ACTIONS.index("wait")
 
 
-def _valid_actions(observation) -> list[int]:
+def _combined_action_mask(
+    observation,
+    safety_mask=None,
+) -> np.ndarray:
     values = torch.as_tensor(observation, dtype=torch.float32)
-    return [int(action) for action in action_mask(values).nonzero().flatten()]
+    semantic = np.asarray(
+        action_mask(values).detach().cpu(),
+        dtype=np.bool_,
+    )
+    if semantic.shape != (N_ACTIONS,):
+        raise ValueError("observation action mask has the wrong shape")
+
+    combined = semantic.copy()
+    if safety_mask is not None:
+        safety = np.asarray(safety_mask, dtype=np.bool_)
+        if safety.shape != (N_ACTIONS,):
+            raise ValueError("environment action mask has the wrong shape")
+        combined &= safety
+        if not bool(combined.any()):
+            combined = semantic.copy()
+    if not bool(combined.any()):
+        combined[_WAIT_ACTION] = True
+    return combined
+
+
+def _action_masks(
+    observations,
+    safety_masks=None,
+) -> np.ndarray:
+    if safety_masks is None:
+        safety_masks = [None] * len(observations)
+    elif len(safety_masks) != len(observations):
+        raise ValueError("action mask count does not match observations")
+    return np.stack(
+        [
+            _combined_action_mask(observation, safety_mask)
+            for observation, safety_mask in zip(
+                observations,
+                safety_masks,
+                strict=True,
+            )
+        ]
+    )
+
+
+def _environment_action_masks(env, observations) -> np.ndarray:
+    provider = getattr(env, "wipeout_action_masks", None)
+    safety_masks = provider() if callable(provider) else None
+    return _action_masks(observations, safety_masks)
+
+
+def _masked_policy_scores(
+    q_values: torch.Tensor,
+    observations: torch.Tensor,
+    valid_masks=None,
+) -> torch.Tensor:
+    scores = policy_scores(q_values, observations)
+    if valid_masks is None:
+        return scores
+    masks = torch.as_tensor(
+        valid_masks,
+        dtype=torch.bool,
+        device=q_values.device,
+    )
+    if masks.shape != q_values.shape:
+        raise ValueError("action masks do not match Q-value shape")
+    semantic = action_mask(observations)
+    combined = masks & semantic
+    empty = ~combined.any(dim=1)
+    if bool(empty.any()):
+        combined[empty] = semantic[empty]
+    empty = ~combined.any(dim=1)
+    if bool(empty.any()):
+        combined[empty, _WAIT_ACTION] = True
+    return scores.masked_fill(~combined, -torch.inf)
+
+
+def _valid_actions(observation, safety_mask=None) -> list[int]:
+    mask = _combined_action_mask(observation, safety_mask)
+    return [int(index) for index in np.flatnonzero(mask)]
 
 
 def _route_auxiliary_loss(
     q_values: torch.Tensor,
     observations: torch.Tensor,
-    action_mask: torch.Tensor,
+    valid_mask: torch.Tensor,
 ) -> torch.Tensor:
     labels = route_actions(observations)
     valid = labels >= 0
@@ -52,7 +131,7 @@ def _route_auxiliary_loss(
         return q_values.new_zeros(())
     rows = valid.nonzero().flatten()
     route_labels = labels[rows]
-    route_valid = action_mask[rows].gather(
+    route_valid = valid_mask[rows].gather(
         1,
         route_labels.unsqueeze(1),
     ).squeeze(1)
@@ -65,7 +144,7 @@ def _route_auxiliary_loss(
         1,
         route_labels.unsqueeze(1),
     ).squeeze(1)
-    other_q = selected.masked_fill(~action_mask[rows], -torch.inf)
+    other_q = selected.masked_fill(~valid_mask[rows], -torch.inf)
     other_q = other_q.scatter(
         1,
         route_labels.unsqueeze(1),
@@ -414,6 +493,14 @@ class ReplayBuffer:
         self.next_obs = np.empty((capacity, obs_dim), dtype=np.float32)
         self.terminal = np.empty(capacity, dtype=np.float32)
         self.discount = np.empty(capacity, dtype=np.float32)
+        self.action_masks = np.empty(
+            (capacity, N_ACTIONS),
+            dtype=np.bool_,
+        )
+        self.next_action_masks = np.empty(
+            (capacity, N_ACTIONS),
+            dtype=np.bool_,
+        )
         self.important = np.empty(capacity, dtype=np.bool_)
         self.replay_groups = np.empty(capacity, dtype=np.int64)
         self._important_indices = np.empty(capacity, dtype=np.int64)
@@ -485,6 +572,8 @@ class ReplayBuffer:
         discount: float,
         important: bool,
         replay_group: int = 0,
+        current_mask=None,
+        next_mask=None,
     ) -> None:
         group = _replay_group(replay_group)
         slot = self.index
@@ -510,6 +599,11 @@ class ReplayBuffer:
         self.next_obs[slot] = next_obs
         self.terminal[slot] = float(terminal)
         self.discount[slot] = discount
+        self.action_masks[slot] = _combined_action_mask(obs, current_mask)
+        self.next_action_masks[slot] = _combined_action_mask(
+            next_obs,
+            next_mask,
+        )
         self.important[slot] = important
         self.replay_groups[slot] = group
         self.index = (self.index + 1) % self.capacity
@@ -714,6 +808,8 @@ class ReplayBuffer:
             self.next_obs[indices],
             self.terminal[indices],
             self.discount[indices],
+            self.action_masks[indices],
+            self.next_action_masks[indices],
         )
 
 
@@ -735,6 +831,7 @@ class Agent:
         self.gamma = gamma
         self.clip = clip
         self.important_fraction = important_fraction
+        self.require_action_mask = False
         self.replay_group_weights: dict[int, float] | None = None
         self.replay = ReplayBuffer(replay_capacity, obs_dim, replay_seed)
 
@@ -748,17 +845,30 @@ class Agent:
     def sync(self) -> None:
         self.target.load_state_dict(self.net.state_dict())
 
-    def act(self, obs, eps: float) -> int:
-        valid = _valid_actions(obs)
+    def act(self, obs, eps: float, action_mask=None) -> int:
+        if self.require_action_mask and action_mask is None:
+            raise ValueError(
+                "this checkpoint requires an environment action mask"
+            )
+        valid = _valid_actions(obs, action_mask)
         if eps > 0.0 and random.random() < eps:
             return random.choice(valid)
-        return self.best_actions([obs])[0]
+        return self.best_actions([obs], [action_mask])[0]
 
-    def best_actions(self, observations) -> list[int]:
+    def best_actions(self, observations, action_masks=None) -> list[int]:
+        if self.require_action_mask and action_masks is None:
+            raise ValueError(
+                "this checkpoint requires environment action masks"
+            )
         batch = self._tensor(np.asarray(observations, dtype=np.float32))
+        masks = _action_masks(observations, action_masks)
         with torch.inference_mode():
             q_values = self.net(batch)
-            actions = policy_scores(q_values, batch).argmax(dim=1).tolist()
+            actions = _masked_policy_scores(
+                q_values,
+                batch,
+                masks,
+            ).argmax(dim=1).tolist()
         return [int(action) for action in actions]
 
     def set_replay_group_weights(
@@ -777,6 +887,8 @@ class Agent:
         discount: float,
         important: bool,
         replay_group: int = 0,
+        current_mask=None,
+        next_mask=None,
     ) -> None:
         self.replay.add(
             obs,
@@ -787,6 +899,8 @@ class Agent:
             discount,
             important,
             replay_group,
+            current_mask,
+            next_mask,
         )
 
     def learn_batch(self, batch_size: int) -> None:
@@ -795,30 +909,49 @@ class Agent:
             self.important_fraction,
             self.replay_group_weights,
         )
-        obs, actions, rewards, next_obs, terminal, discount = batch
+        (
+            obs,
+            actions,
+            rewards,
+            next_obs,
+            terminal,
+            discount,
+            current_masks,
+            next_masks,
+        ) = batch
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
         actions_t = torch.as_tensor(actions, dtype=torch.int64, device=self.device)
         rewards_t = torch.as_tensor(rewards, dtype=torch.float32, device=self.device)
         next_obs_t = torch.as_tensor(next_obs, dtype=torch.float32, device=self.device)
         terminal_t = torch.as_tensor(terminal, dtype=torch.float32, device=self.device)
         discount_t = torch.as_tensor(discount, dtype=torch.float32, device=self.device)
+        current_masks_t = torch.as_tensor(
+            current_masks,
+            dtype=torch.bool,
+            device=self.device,
+        )
+        next_masks_t = torch.as_tensor(
+            next_masks,
+            dtype=torch.bool,
+            device=self.device,
+        )
 
         q_values = self.net(obs_t)
         q = q_values.gather(1, actions_t.unsqueeze(1)).squeeze(1)
         with torch.no_grad():
             next_online = self.net(next_obs_t)
-            best = policy_scores(
+            best = _masked_policy_scores(
                 next_online,
                 next_obs_t,
+                next_masks_t,
             ).argmax(dim=1, keepdim=True)
             next_q = self.target(next_obs_t).gather(1, best).squeeze(1)
             target = rewards_t + discount_t * next_q * (1.0 - terminal_t)
 
-        current_mask = action_mask(obs_t)
         route_loss = _route_auxiliary_loss(
             q_values,
             obs_t,
-            current_mask,
+            current_masks_t,
         )
         loss = self.loss_fn(q, target) + _ROUTE_AUX_WEIGHT * route_loss
         self.opt.zero_grad(set_to_none=True)
@@ -837,6 +970,7 @@ class Agent:
                 "channels": CHANNEL_NAMES,
                 "globals": GLOBAL_NAMES,
                 "policy": dict(POLICY_CONTRACT),
+                "action_safety": dict(ACTION_SAFETY_CONTRACT),
                 "net": self.net.state_dict(),
                 "target": self.target.state_dict(),
                 "opt": self.opt.state_dict(),
@@ -854,6 +988,7 @@ class Agent:
             "channels": CHANNEL_NAMES,
             "globals": GLOBAL_NAMES,
             "policy": dict(POLICY_CONTRACT),
+            "action_safety": dict(ACTION_SAFETY_CONTRACT),
             "net": _cpu_copy(self.net.state_dict()),
             "target": _cpu_copy(self.target.state_dict()),
             "opt": _cpu_copy(self.opt.state_dict()),
@@ -868,6 +1003,7 @@ class Agent:
             or tuple(checkpoint.get("actions", ())) != ACTIONS
             or tuple(checkpoint.get("channels", ())) != CHANNEL_NAMES
             or tuple(checkpoint.get("globals", ())) != GLOBAL_NAMES
+            or checkpoint.get("action_safety") != ACTION_SAFETY_CONTRACT
             or (
                 checkpoint.get("policy") is not None
                 and checkpoint.get("policy") != POLICY_CONTRACT
@@ -880,6 +1016,7 @@ class Agent:
         self.target.load_state_dict(checkpoint["target"])
         self.opt.load_state_dict(checkpoint["opt"])
         _optimizer_to(self.opt, self.device)
+        self.require_action_mask = True
 
     def load(self, path: str) -> None:
         checkpoint = torch.load(path, map_location=self.device)
@@ -891,6 +1028,8 @@ class Agent:
             or tuple(checkpoint.get("actions", ())) != ACTIONS
             or tuple(checkpoint.get("channels", ())) != CHANNEL_NAMES
             or tuple(checkpoint.get("globals", ())) != GLOBAL_NAMES
+            or checkpoint.get("action_safety")
+            not in (None, ACTION_SAFETY_CONTRACT)
             or (
                 checkpoint.get("policy") is not None
                 and checkpoint.get("policy")
@@ -907,6 +1046,7 @@ class Agent:
             self.sync()
         if "opt" in checkpoint:
             self.opt.load_state_dict(checkpoint["opt"])
+        self.require_action_mask = checkpoint.get("action_safety") is not None
 
     def _tensor(self, obs) -> torch.Tensor:
         if isinstance(obs, torch.Tensor):
@@ -918,26 +1058,35 @@ def select_actions(
     agents: Sequence[Agent],
     observations,
     eps: float,
+    valid_masks=None,
 ) -> list[int]:
+    if valid_masks is None and any(
+        agent.require_action_mask for agent in agents
+    ):
+        raise ValueError(
+            "these agents require environment action masks"
+        )
+    masks = _action_masks(observations, valid_masks)
     if len(agents) > 1 and all(agent is agents[0] for agent in agents[1:]):
         actions = [0] * len(agents)
         greedy: list[int] = []
         for index in range(len(agents)):
             if eps > 0.0 and random.random() < eps:
                 actions[index] = random.choice(
-                    _valid_actions(observations[index])
+                    _valid_actions(observations[index], masks[index])
                 )
             else:
                 greedy.append(index)
         if greedy:
             choices = agents[0].best_actions(
-                [observations[index] for index in greedy]
+                [observations[index] for index in greedy],
+                [masks[index] for index in greedy],
             )
             for index, action in zip(greedy, choices, strict=True):
                 actions[index] = action
         return actions
     return [
-        agent.act(observations[index], eps)
+        agent.act(observations[index], eps, masks[index])
         for index, agent in enumerate(agents)
     ]
 
@@ -1080,7 +1229,7 @@ class EvaluationEpisode:
         }
 
 
-Transition = tuple[Any, int, float, Any, bool, bool, int]
+Transition = tuple[Any, int, float, Any, bool, bool, int, Any, Any]
 EVALUATION_BATCH_SIZE = 64
 
 
@@ -1279,6 +1428,8 @@ class Trainer:
         terminal = False
         important = False
         last_next_obs = pending[0][3]
+        first_mask = pending[0][7]
+        last_next_mask = pending[0][8]
         replay_group = pending[0][6]
         used = 0
         for used, transition in enumerate(list(pending)[:count], start=1):
@@ -1290,11 +1441,14 @@ class Trainer:
                 step_terminal,
                 step_important,
                 step_group,
+                _,
+                next_mask,
             ) = transition
             if step_group != replay_group:
                 raise RuntimeError("n-step transition crossed replay groups")
             reward += (self.cfg.gamma ** (used - 1)) * step_reward
             last_next_obs = next_obs
+            last_next_mask = next_mask
             terminal = terminal or step_terminal
             important = important or step_important
             if step_terminal:
@@ -1310,6 +1464,8 @@ class Trainer:
             self.cfg.gamma ** used,
             important,
             replay_group,
+            first_mask,
+            last_next_mask,
         )
         pending.popleft()
 
@@ -1319,6 +1475,8 @@ class Trainer:
         actions,
         rewards,
         next_obs,
+        current_masks,
+        next_masks,
         terminal: bool,
         important: bool,
         replay_group: int = 0,
@@ -1334,6 +1492,8 @@ class Trainer:
                     terminal,
                     important,
                     group,
+                    current_masks[index],
+                    next_masks[index],
                 )
             )
             if len(self._pending[index]) >= self.cfg.n_step:
@@ -1356,14 +1516,25 @@ class Trainer:
         active_env = env or self.env
         self._configure_env(active_env)
         obs = active_env.reset(seed=seed) if seed is not None else active_env.reset()
+        current_masks = _environment_action_masks(active_env, obs)
         total = 0.0
         final_info: dict[str, Any] = {}
 
         for _ in range(self.cfg.max_steps):
             eps = self.epsilon() if epsilon is None else epsilon
-            actions = select_actions(self.agents, obs, eps)
+            actions = select_actions(
+                self.agents,
+                obs,
+                eps,
+                current_masks,
+            )
             next_obs, rewards, done, cut, info = active_env.step(actions)
             terminal = done or cut
+            next_masks = (
+                _action_masks(next_obs)
+                if terminal
+                else _environment_action_masks(active_env, next_obs)
+            )
 
             if learn:
                 important = (
@@ -1382,6 +1553,8 @@ class Trainer:
                     actions,
                     rewards,
                     next_obs,
+                    current_masks,
+                    next_masks,
                     terminal,
                     important,
                     group,
@@ -1401,6 +1574,7 @@ class Trainer:
                             learner.sync()
 
             obs = next_obs
+            current_masks = next_masks
             total += sum(float(reward) for reward in rewards) / len(rewards)
             final_info = info
             if terminal:
@@ -1484,16 +1658,34 @@ def _evaluation_envs(env, count: int) -> list[Any]:
 def _batched_greedy_actions(
     agents: Sequence[Agent],
     observations: Sequence[Sequence[Any]],
+    mask_batches: Sequence[Any] | None = None,
 ) -> list[list[int]]:
     if not observations:
         return []
+    if mask_batches is None and any(
+        agent.require_action_mask for agent in agents
+    ):
+        raise ValueError(
+            "these agents require environment action masks"
+        )
+    if mask_batches is not None and len(mask_batches) != len(observations):
+        raise ValueError("action mask batch count does not match observations")
     if len(agents) > 1 and all(agent is agents[0] for agent in agents[1:]):
         flat = [
             observation[agent_index]
             for observation in observations
             for agent_index in range(len(agents))
         ]
-        actions = agents[0].best_actions(flat)
+        flat_masks = (
+            [
+                masks[agent_index]
+                for masks in mask_batches
+                for agent_index in range(len(agents))
+            ]
+            if mask_batches is not None
+            else None
+        )
+        actions = agents[0].best_actions(flat, flat_masks)
         width = len(agents)
         return [
             actions[index : index + width]
@@ -1502,7 +1694,12 @@ def _batched_greedy_actions(
 
     by_agent = [
         agent.best_actions(
-            [observation[index] for observation in observations]
+            [observation[index] for observation in observations],
+            (
+                [masks[index] for masks in mask_batches]
+                if mask_batches is not None
+                else None
+            ),
         )
         for index, agent in enumerate(agents)
     ]
@@ -1562,13 +1759,22 @@ def _evaluate_episodes(
             lanes[index].reset(seed=seed)
             for index, seed in enumerate(group)
         ]
+        action_masks_by_lane = [
+            _environment_action_masks(lanes[index], observation)
+            for index, observation in enumerate(observations)
+        ]
         returns = [0.0] * len(group)
         active = list(range(len(group)))
 
         for _ in range(env.max_steps):
             active_observations = [observations[index] for index in active]
+            active_masks = [
+                action_masks_by_lane[index] for index in active
+            ]
             action_batches = _batched_greedy_actions(
-                agents, active_observations
+                agents,
+                active_observations,
+                active_masks,
             )
             next_active: list[int] = []
             for active_index, actions in zip(
@@ -1588,6 +1794,12 @@ def _evaluate_episodes(
                         )
                     )
                 else:
+                    action_masks_by_lane[active_index] = (
+                        _environment_action_masks(
+                            lanes[active_index],
+                            obs,
+                        )
+                    )
                     next_active.append(active_index)
             active = next_active
             if not active:

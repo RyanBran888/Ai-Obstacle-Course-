@@ -15,7 +15,11 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from env_bridge import CoopEnvBridge, GenerationConfig
-from DQN.DQN_model import LEGACY_POLICY_CONTRACT, POLICY_CONTRACT
+from DQN.DQN_model import (
+    ACTION_SAFETY_CONTRACT,
+    LEGACY_POLICY_CONTRACT,
+    POLICY_CONTRACT,
+)
 from DQN.DQN_train import (
     Config,
     Evaluation,
@@ -1243,6 +1247,7 @@ class CurriculumRunner:
         repair_upgrade: bool = False,
         policy_upgrade: bool = False,
         planner_upgrade: bool = False,
+        safety_upgrade: bool = False,
     ) -> None:
         if not pool_sizes or any(size < 1 for size in pool_sizes):
             raise ValueError("pool_sizes must contain positive values")
@@ -1306,6 +1311,7 @@ class CurriculumRunner:
                 repair_upgrade,
                 policy_upgrade,
                 planner_upgrade,
+                safety_upgrade,
             )
         ) > 1:
             raise ValueError("only one recovery upgrade may be selected")
@@ -1313,6 +1319,7 @@ class CurriculumRunner:
         self._repair_upgrade = bool(repair_upgrade)
         self._policy_upgrade = bool(policy_upgrade)
         self._planner_upgrade = bool(planner_upgrade)
+        self._safety_upgrade = bool(safety_upgrade)
         self.results: list[StageResult] = []
         self.test_results: list[StageTestResult] = []
         self._manifest_builder = LazyRoomManifestBuilder(
@@ -1598,7 +1605,11 @@ class CurriculumRunner:
                     else (
                         "planner-v3"
                         if self._planner_upgrade
-                        else "retention-v2"
+                        else (
+                            "wipeout-safety-v1"
+                            if self._safety_upgrade
+                            else "retention-v2"
+                        )
                     )
                 )
             )
@@ -1642,6 +1653,8 @@ class CurriculumRunner:
         ]
         if self._policy_upgrade and not exact_contract:
             self._upgrade_policy_states(payload)
+        if self._safety_upgrade and not exact_contract:
+            self._upgrade_safety_states(payload)
         self.trainer.load_recovery_state(payload["trainer"])
         self._test_model_sha256 = payload.get("test_model_sha256")
         if (
@@ -1658,7 +1671,7 @@ class CurriculumRunner:
         if self._resume_active is not None and not exact_contract:
             self._resume_active["best_rank"] = ()
             self._resume_active["needs_baseline_assessment"] = True
-            if self._planner_upgrade:
+            if self._planner_upgrade or self._safety_upgrade:
                 self.trainer.load_learner_state(
                     self._resume_active["best_learner_state"]
                 )
@@ -1722,6 +1735,31 @@ class CurriculumRunner:
         trainer = payload.get("trainer")
         if not isinstance(trainer, Mapping):
             raise ValueError("policy upgrade trainer state is missing")
+        upgrade(trainer.get("learners"), "trainer")
+
+        active = payload.get("active")
+        if isinstance(active, Mapping):
+            best = active.get("best_learner_state")
+            if best is not None:
+                upgrade(best, "best checkpoint")
+
+    @staticmethod
+    def _upgrade_safety_states(payload: Mapping[str, Any]) -> None:
+        def upgrade(states: Any, label: str) -> None:
+            if not isinstance(states, (list, tuple)) or not states:
+                raise ValueError(f"{label} learner state is missing")
+            for state in states:
+                if not isinstance(state, dict):
+                    raise ValueError(f"{label} learner state is invalid")
+                if state.get("action_safety") is not None:
+                    raise ValueError(
+                        f"{label} already has an action-safety contract"
+                    )
+                state["action_safety"] = dict(ACTION_SAFETY_CONTRACT)
+
+        trainer = payload.get("trainer")
+        if not isinstance(trainer, Mapping):
+            raise ValueError("safety upgrade trainer state is missing")
         upgrade(trainer.get("learners"), "trainer")
 
         active = payload.get("active")
@@ -1841,6 +1879,7 @@ class CurriculumRunner:
             or self._repair_upgrade
             or self._policy_upgrade
             or self._planner_upgrade
+            or self._safety_upgrade
         ):
             return False
 
@@ -1905,7 +1944,7 @@ class CurriculumRunner:
                 "DQN/load_model.py",
                 "DQN/run_curriculum.py",
             }
-        else:
+        elif self._planner_upgrade:
             if saved.get("retention_size") != current.get("retention_size"):
                 return False
             if saved.get("stages") != current.get("stages"):
@@ -1914,6 +1953,20 @@ class CurriculumRunner:
             allowed_changes = {
                 "DQN/curriculum.py",
                 "DQN/env_bridge.py",
+                "DQN/run_curriculum.py",
+            }
+        else:
+            if saved.get("retention_size") != current.get("retention_size"):
+                return False
+            if saved.get("stages") != current.get("stages"):
+                return False
+            expected_kind = "wipeout_safety_v1"
+            allowed_changes = {
+                "DQN/DQN_model.py",
+                "DQN/DQN_train.py",
+                "DQN/curriculum.py",
+                "DQN/env_bridge.py",
+                "DQN/load_model.py",
                 "DQN/run_curriculum.py",
             }
         saved_external = dict(saved_copy.get("external", {}))
