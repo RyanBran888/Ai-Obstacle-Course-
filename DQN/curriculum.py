@@ -1332,6 +1332,10 @@ class CurriculumRunner:
                 list(item) for item in active["best_retention"]
             ],
             "best_failures": list(active["best_failures"]),
+            "latest_retention": [
+                list(item) for item in active["latest_retention"]
+            ],
+            "latest_failures": list(active["latest_failures"]),
             "best_learner_state": active["best_learner_state"],
             "phase_limit": (
                 int(active["phase_limit"])
@@ -1375,6 +1379,13 @@ class CurriculumRunner:
             ),
             "best_failures": tuple(
                 str(reason) for reason in payload.get("best_failures", ())
+            ),
+            "latest_retention": tuple(
+                (str(name), float(rate))
+                for name, rate in payload.get("latest_retention", ())
+            ),
+            "latest_failures": tuple(
+                str(reason) for reason in payload.get("latest_failures", ())
             ),
             "best_learner_state": payload["best_learner_state"],
             "phase_limit": (
@@ -1495,6 +1506,12 @@ class CurriculumRunner:
             self.trainer.load_learner_state(
                 self._resume_active["best_learner_state"]
             )
+            self._resume_active["latest_retention"] = (
+                self._resume_active["best_retention"]
+            )
+            self._resume_active["latest_failures"] = (
+                self._resume_active["best_failures"]
+            )
         if status in {"test_started", "tested"}:
             self._test_started = True
             if self._resume_active is not None:
@@ -1583,6 +1600,24 @@ class CurriculumRunner:
                     f"retention {name} {rate:.1%} < {threshold:.1%}"
                 )
         return tuple(failures)
+
+    def _weak_retention_stages(
+        self,
+        retention: Sequence[tuple[str, float]],
+    ) -> tuple[str, ...]:
+        stage_index = {
+            stage.name: index for index, stage in enumerate(self.stages)
+        }
+        return tuple(
+            name
+            for name, rate in retention
+            if rate
+            < max(
+                0.50,
+                self.stages[stage_index[name]].validation_threshold
+                - self.retention_margin,
+            )
+        )
 
     def _assessment(
         self,
@@ -1803,7 +1838,9 @@ class CurriculumRunner:
                     resets=plot_resets,
                 )
 
-        rehearsal: list[tuple[CoopEnvBridge, tuple[int, ...]]] = []
+        rehearsal: list[
+            tuple[str, CoopEnvBridge, tuple[int, ...]]
+        ] = []
         retention_sets: list[
             tuple[str, CoopEnvBridge, tuple[int, ...]]
         ] = []
@@ -1976,6 +2013,8 @@ class CurriculumRunner:
                             "best_validation": None,
                             "best_retention": (),
                             "best_failures": (),
+                            "latest_retention": (),
+                            "latest_failures": (),
                             "best_learner_state": None,
                             "needs_replay_refill": self._force_replay_refill,
                         }
@@ -1991,14 +2030,41 @@ class CurriculumRunner:
                             * int(active["active_pool_size"]),
                         )
                         rehearse_rate = 0.20
-                        if (
-                            phase == "recovery"
-                            and any(
+                        rehearsal_choices = rehearsal
+                        weak_stages = self._weak_retention_stages(
+                            active["latest_retention"]
+                        )
+                        if weak_stages:
+                            targeted = [
+                                item
+                                for item in rehearsal
+                                if item[0] in weak_stages
+                            ]
+                            if len(targeted) != len(weak_stages):
+                                missing = sorted(
+                                    set(weak_stages)
+                                    - {item[0] for item in targeted}
+                                )
+                                raise RuntimeError(
+                                    "retention rehearsal is missing stage "
+                                    + ", ".join(missing)
+                                )
+                            rehearsal_choices = targeted
+                            retention_only = all(
                                 reason.startswith("retention ")
-                                for reason in active["best_failures"]
+                                for reason in active["latest_failures"]
                             )
-                        ):
-                            rehearse_rate = 0.35
+                            if (
+                                phase in {"recovery", "extension"}
+                                and retention_only
+                            ):
+                                rehearse_rate = 0.35
+                            print(
+                                "  rehearsal target: "
+                                + ", ".join(weak_stages)
+                                + f" ({rehearse_rate:.0%} of training episodes).",
+                                flush=True,
+                            )
                         if active["needs_replay_refill"]:
                             ready = max(
                                 self.trainer.cfg.batch_size,
@@ -2011,8 +2077,13 @@ class CurriculumRunner:
                                 flush=True,
                             )
                             while len(self.trainer.learners[0].replay) < ready:
-                                if rehearsal and rng.random() < rehearse_rate:
-                                    old_env, old_seeds = rng.choice(rehearsal)
+                                if (
+                                    rehearsal_choices
+                                    and rng.random() < rehearse_rate
+                                ):
+                                    _, old_env, old_seeds = rng.choice(
+                                        rehearsal_choices
+                                    )
                                     outcome = self.trainer.run_episode(
                                         seed=rng.choice(old_seeds),
                                         env=old_env,
@@ -2033,8 +2104,13 @@ class CurriculumRunner:
                                 flush=True,
                             )
                         for _ in range(episodes):
-                            if rehearsal and rng.random() < rehearse_rate:
-                                old_env, old_seeds = rng.choice(rehearsal)
+                            if (
+                                rehearsal_choices
+                                and rng.random() < rehearse_rate
+                            ):
+                                _, old_env, old_seeds = rng.choice(
+                                    rehearsal_choices
+                                )
                                 outcome = self.trainer.run_episode(
                                     seed=rng.choice(old_seeds),
                                     env=old_env,
@@ -2067,6 +2143,8 @@ class CurriculumRunner:
                             validation_eval,
                             retention_eval,
                         )
+                        active["latest_retention"] = retention_eval
+                        active["latest_failures"] = failures
                         passed = not failures
                         active["total_rounds"] += 1
                         active["phase_rounds"] += 1
@@ -2181,6 +2259,8 @@ class CurriculumRunner:
                         self.trainer.load_learner_state(
                             active["best_learner_state"]
                         )
+                        active["latest_retention"] = best_retention
+                        active["latest_failures"] = active["best_failures"]
                         self.trainer.clear_replay()
                         self.trainer.reheat_exploration()
                         active["needs_replay_refill"] = True
@@ -2279,7 +2359,7 @@ class CurriculumRunner:
                 train_seeds = saved_stage.seeds("train")[:effective_pool]
                 validation_seeds = saved_stage.seeds("validation")
                 train_env.set_room_cache_limit(min(4, effective_pool))
-                rehearsal.append((train_env, train_seeds))
+                rehearsal.append((stage.name, train_env, train_seeds))
                 retention_seeds = validation_seeds[: self.retention_size]
                 for seed in retention_seeds:
                     validation_eval_env.reset(seed=seed)
