@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import random
+import time
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -24,6 +25,8 @@ from DQN.DQN_model import (
 )
 
 N_AGENTS = 2
+_AUTO_DEVICE: torch.device | None = None
+_AUTO_CPU_THREADS: int | None = None
 
 
 def _cpu_copy(value):
@@ -77,10 +80,211 @@ def eps_at(step: int, cfg: Config) -> float:
     return cfg.eps_start + t * (cfg.eps_min - cfg.eps_start)
 
 
+def _device_benchmark(
+    device: torch.device,
+    cpu_threads: int,
+    net_template: QNetwork,
+    target_template: QNetwork,
+    action_obs_cpu: torch.Tensor,
+    obs_cpu: torch.Tensor,
+    next_obs_cpu: torch.Tensor,
+    actions_cpu: torch.Tensor,
+    rewards_cpu: torch.Tensor,
+    terminal_cpu: torch.Tensor,
+    discount_cpu: torch.Tensor,
+) -> float:
+    if device.type == "cpu":
+        torch.set_num_threads(cpu_threads)
+
+    net = copy.deepcopy(net_template).to(device)
+    target = copy.deepcopy(target_template).to(device)
+    opt = torch.optim.Adam(net.parameters(), lr=5e-4)
+    loss_fn = nn.SmoothL1Loss()
+
+    def synchronize() -> None:
+        if device.type == "mps":
+            torch.mps.synchronize()
+
+    def cycle() -> None:
+        for _ in range(8):
+            action_obs = action_obs_cpu.to(device)
+            with torch.inference_mode():
+                net(action_obs).argmax(dim=1).tolist()
+
+        obs = obs_cpu.to(device)
+        next_obs = next_obs_cpu.to(device)
+        actions = actions_cpu.to(device)
+        rewards = rewards_cpu.to(device)
+        terminal = terminal_cpu.to(device)
+        discount = discount_cpu.to(device)
+        q = net(obs).gather(1, actions.unsqueeze(1)).squeeze(1)
+        with torch.no_grad():
+            best = net(next_obs).argmax(dim=1, keepdim=True)
+            next_q = target(next_obs).gather(1, best).squeeze(1)
+            expected = rewards + discount * next_q * (1.0 - terminal)
+        loss = loss_fn(q, expected)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        nn.utils.clip_grad_norm_(net.parameters(), 10.0)
+        opt.step()
+
+    for _ in range(3):
+        cycle()
+    synchronize()
+
+    samples: list[float] = []
+    for _ in range(7):
+        start = time.perf_counter()
+        cycle()
+        synchronize()
+        samples.append(time.perf_counter() - start)
+    return float(np.median(samples))
+
+
+def _resolve_auto_device() -> torch.device:
+    global _AUTO_DEVICE, _AUTO_CPU_THREADS
+    if _AUTO_DEVICE is not None:
+        if _AUTO_DEVICE.type == "cpu" and _AUTO_CPU_THREADS is not None:
+            torch.set_num_threads(_AUTO_CPU_THREADS)
+        return _AUTO_DEVICE
+
+    if not torch.backends.mps.is_available():
+        _AUTO_DEVICE = torch.device("cpu")
+        return _AUTO_DEVICE
+
+    original_threads = torch.get_num_threads()
+    cpu_rng = torch.get_rng_state()
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(2_907)
+
+    try:
+        torch.set_rng_state(generator.get_state())
+        net_template = QNetwork(OBS_DIM, N_ACTIONS, HIDDEN)
+        target_template = copy.deepcopy(net_template)
+        action_obs = torch.randn((2, OBS_DIM), generator=generator)
+        obs = torch.randn((128, OBS_DIM), generator=generator)
+        next_obs = torch.randn((128, OBS_DIM), generator=generator)
+        actions = torch.randint(
+            N_ACTIONS, (128,), generator=generator, dtype=torch.int64
+        )
+        rewards = torch.randn(128, generator=generator)
+        terminal = torch.randint(
+            2, (128,), generator=generator, dtype=torch.int64
+        ).to(torch.float32)
+        discount = torch.full((128,), 0.99, dtype=torch.float32)
+
+        cpu_timings: list[tuple[float, int]] = [
+            (
+                _device_benchmark(
+                    torch.device("cpu"),
+                    original_threads,
+                    net_template,
+                    target_template,
+                    action_obs,
+                    obs,
+                    next_obs,
+                    actions,
+                    rewards,
+                    terminal,
+                    discount,
+                ),
+                original_threads,
+            )
+        ]
+        if original_threads != 1:
+            cpu_timings.append(
+                (
+                    _device_benchmark(
+                        torch.device("cpu"),
+                        1,
+                        net_template,
+                        target_template,
+                        action_obs,
+                        obs,
+                        next_obs,
+                        actions,
+                        rewards,
+                        terminal,
+                        discount,
+                    ),
+                    1,
+                )
+            )
+        cpu_time, cpu_threads = min(cpu_timings)
+        torch.set_num_threads(original_threads)
+
+        try:
+            mps_time = _device_benchmark(
+                torch.device("mps"),
+                original_threads,
+                net_template,
+                target_template,
+                action_obs,
+                obs,
+                next_obs,
+                actions,
+                rewards,
+                terminal,
+                discount,
+            )
+        except Exception as exc:
+            mps_time = float("inf")
+            print(
+                "Auto device benchmark: Metal failed "
+                f"({type(exc).__name__}); using CPU.",
+                flush=True,
+            )
+
+        if cpu_time < mps_time * 0.95:
+            _AUTO_DEVICE = torch.device("cpu")
+            _AUTO_CPU_THREADS = cpu_threads
+            torch.set_num_threads(cpu_threads)
+        else:
+            _AUTO_DEVICE = torch.device("mps")
+            _AUTO_CPU_THREADS = None
+            torch.set_num_threads(original_threads)
+
+        mps_label = (
+            f"{mps_time * 1_000:.2f} ms"
+            if np.isfinite(mps_time)
+            else "failed"
+        )
+        print(
+            "Auto device benchmark: "
+            f"CPU {cpu_time * 1_000:.2f} ms "
+            f"({cpu_threads} thread{'s' if cpu_threads != 1 else ''}), "
+            f"Metal {mps_label}; selected {_AUTO_DEVICE.type}.",
+            flush=True,
+        )
+        return _AUTO_DEVICE
+    finally:
+        torch.set_rng_state(cpu_rng)
+        if _AUTO_DEVICE is None or _AUTO_DEVICE.type != "cpu":
+            torch.set_num_threads(original_threads)
+
+
+def pin_auto_device(name: str, cpu_threads: int | None = None) -> None:
+    global _AUTO_DEVICE, _AUTO_CPU_THREADS
+    device = torch.device(name)
+    if device.type not in {"cpu", "mps"}:
+        raise ValueError(f"unsupported saved device {name!r}")
+    if device.type == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("the saved run requires MPS, but MPS is unavailable")
+    if device.type == "cpu":
+        threads = torch.get_num_threads() if cpu_threads is None else cpu_threads
+        if threads < 1:
+            raise ValueError("saved CPU thread count must be positive")
+        _AUTO_CPU_THREADS = threads
+        torch.set_num_threads(threads)
+    else:
+        _AUTO_CPU_THREADS = None
+    _AUTO_DEVICE = device
+
+
 def resolve_device(requested: str = "auto") -> torch.device:
     name = requested.strip().lower()
     if name == "auto":
-        name = "mps" if torch.backends.mps.is_available() else "cpu"
+        return _resolve_auto_device()
     if name == "mps" and not torch.backends.mps.is_available():
         raise RuntimeError("MPS was requested but is not available")
     if name not in {"cpu", "mps"}:
@@ -100,6 +304,9 @@ class ReplayBuffer:
         self.terminal = np.empty(capacity, dtype=np.float32)
         self.discount = np.empty(capacity, dtype=np.float32)
         self.important = np.empty(capacity, dtype=np.bool_)
+        self._important_indices = np.empty(capacity, dtype=np.int64)
+        self._important_positions = np.full(capacity, -1, dtype=np.int64)
+        self._important_count = 0
         self.index = 0
         self.size = 0
         self.rng = np.random.default_rng(seed)
@@ -108,6 +315,9 @@ class ReplayBuffer:
         return self.size
 
     def clear(self) -> None:
+        active = self._important_indices[: self._important_count]
+        self._important_positions[active] = -1
+        self._important_count = 0
         self.index = 0
         self.size = 0
 
@@ -121,13 +331,28 @@ class ReplayBuffer:
         discount: float,
         important: bool,
     ) -> None:
-        self.obs[self.index] = obs
-        self.actions[self.index] = action
-        self.rewards[self.index] = reward
-        self.next_obs[self.index] = next_obs
-        self.terminal[self.index] = float(terminal)
-        self.discount[self.index] = discount
-        self.important[self.index] = important
+        slot = self.index
+        position = int(self._important_positions[slot])
+        if position >= 0:
+            self._important_count -= 1
+            replacement = int(
+                self._important_indices[self._important_count]
+            )
+            self._important_indices[position] = replacement
+            self._important_positions[replacement] = position
+            self._important_positions[slot] = -1
+        if important:
+            self._important_indices[self._important_count] = slot
+            self._important_positions[slot] = self._important_count
+            self._important_count += 1
+
+        self.obs[slot] = obs
+        self.actions[slot] = action
+        self.rewards[slot] = reward
+        self.next_obs[slot] = next_obs
+        self.terminal[slot] = float(terminal)
+        self.discount[slot] = discount
+        self.important[slot] = important
         self.index = (self.index + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
@@ -136,8 +361,8 @@ class ReplayBuffer:
             raise ValueError("batch size must be between 1 and the buffer size")
 
         wanted = int(round(batch_size * important_fraction))
-        important_indices = np.flatnonzero(self.important[: self.size])
-        n_important = min(wanted, len(important_indices))
+        important_indices = self._important_indices[: self._important_count]
+        n_important = min(wanted, self._important_count)
         selected = (
             self.rng.choice(important_indices, size=n_important, replace=False)
             if n_important
@@ -194,7 +419,7 @@ class Agent:
 
     def best_actions(self, observations) -> list[int]:
         batch = self._tensor(np.asarray(observations, dtype=np.float32))
-        with torch.no_grad():
+        with torch.inference_mode():
             actions = self.net(batch).argmax(dim=1).tolist()
         return [int(action) for action in actions]
 
@@ -212,7 +437,7 @@ class Agent:
             obs, action, reward, next_obs, terminal, discount, important
         )
 
-    def learn_batch(self, batch_size: int) -> float:
+    def learn_batch(self, batch_size: int) -> None:
         batch = self.replay.sample(batch_size, self.important_fraction)
         obs, actions, rewards, next_obs, terminal, discount = batch
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
@@ -233,7 +458,6 @@ class Agent:
         loss.backward()
         nn.utils.clip_grad_norm_(self.net.parameters(), self.clip)
         self.opt.step()
-        return float(loss.item())
 
     def save(self, path: str) -> None:
         torch.save(
@@ -477,6 +701,7 @@ class EvaluationEpisode:
 
 
 Transition = tuple[Any, int, float, Any, bool, bool]
+EVALUATION_BATCH_SIZE = 64
 
 
 class Trainer:
@@ -558,6 +783,10 @@ class Trainer:
         for pending in self._pending:
             pending.clear()
 
+    def synchronize(self) -> None:
+        if self.device.type == "mps":
+            torch.mps.synchronize()
+
     def learner_state(self) -> list[dict[str, Any]]:
         return [learner.learning_state() for learner in self.learners]
 
@@ -570,8 +799,7 @@ class Trainer:
     def recovery_state(self) -> dict[str, Any]:
         if any(self._pending):
             raise RuntimeError("recovery checkpoints require an episode boundary")
-        if self.device.type == "mps":
-            torch.mps.synchronize()
+        self.synchronize()
         mps_rng = None
         if self.device.type == "mps" and hasattr(torch.mps, "get_rng_state"):
             mps_rng = torch.mps.get_rng_state().cpu()
@@ -789,68 +1017,172 @@ class Trainer:
         return self.history
 
 
+def _clone_evaluation_env(env: CoopEnvBridge) -> CoopEnvBridge:
+    clone = CoopEnvBridge(
+        env.cfg,
+        seed=env.sess.master_seed,
+        max_steps=env.max_steps,
+        micro=env.micro,
+        shaping_gamma=env.shaping_gamma,
+        record_metrics=env.record_metrics,
+    )
+    clone.micro_vary = env.micro_vary
+    clone._micro_seed = env._micro_seed
+    clone.set_room_cache_limit(env._room_cache_limit)
+    clone.cache_rooms(env._room_cache.values())
+    return clone
+
+
+def _evaluation_envs(env, count: int) -> list[Any]:
+    if count < 1:
+        return []
+    if type(env) is not CoopEnvBridge:
+        return [env]
+    if env.record_metrics:
+        return [env]
+    if env.micro is not None and env.micro_vary:
+        return [env]
+
+    lanes = [env]
+    for _ in range(1, count):
+        try:
+            lanes.append(_clone_evaluation_env(env))
+        except Exception:
+            return [env]
+    return lanes
+
+
+def _batched_greedy_actions(
+    agents: Sequence[Agent],
+    observations: Sequence[Sequence[Any]],
+) -> list[list[int]]:
+    if not observations:
+        return []
+    if len(agents) > 1 and all(agent is agents[0] for agent in agents[1:]):
+        flat = [
+            observation[agent_index]
+            for observation in observations
+            for agent_index in range(len(agents))
+        ]
+        actions = agents[0].best_actions(flat)
+        width = len(agents)
+        return [
+            actions[index : index + width]
+            for index in range(0, len(actions), width)
+        ]
+
+    by_agent = [
+        agent.best_actions(
+            [observation[index] for observation in observations]
+        )
+        for index, agent in enumerate(agents)
+    ]
+    return [
+        [by_agent[agent_index][episode_index] for agent_index in range(len(agents))]
+        for episode_index in range(len(observations))
+    ]
+
+
+def _evaluation_episode(
+    seed: int,
+    episode_return: float,
+    metrics: dict[str, Any],
+) -> EvaluationEpisode:
+    return EvaluationEpisode(
+        seed=int(seed),
+        completed=bool(metrics["completed"]),
+        timed_out=bool(metrics["timed_out"]),
+        reward=episode_return,
+        steps=int(metrics["steps"]),
+        keys=int(metrics["keys_collected"]),
+        doors=int(metrics["doors_opened"]),
+        switches=int(metrics["switches_activated"]),
+        checkpoints=int(metrics["checkpoints_reached"]),
+        exit_open=bool(metrics["exit_opened"]),
+        wipeout_deaths=int(metrics["wipeout_deaths"]),
+        hazard_entries=int(metrics.get("hazards", 0)),
+        normal_ball_deaths=int(metrics.get("normal_ball_deaths", 0)),
+        big_ball_deaths=int(metrics.get("big_ball_deaths", 0)),
+        bridge_falls=int(metrics.get("bridge_falls", 0)),
+        timed_doors_opened=int(metrics.get("timed_doors_opened", 0)),
+        timed_doors_expired=int(metrics.get("timed_doors_expired", 0)),
+        timed_doors_rearmed=int(metrics.get("timed_doors_rearmed", 0)),
+        crate_switches=int(metrics.get("crate_switches_solved", 0)),
+        reset_entries=int(metrics.get("reset_zones", 0)),
+        wrong_key_interactions=int(metrics["wrong_key_interactions"]),
+    )
+
+
+def _evaluate_episodes(
+    agents: Sequence[Agent],
+    env,
+    seeds: Sequence[int],
+    batch_size: int,
+) -> list[EvaluationEpisode]:
+    if batch_size < 1:
+        raise ValueError("evaluation batch size must be at least 1")
+    if not seeds:
+        return []
+
+    lanes = _evaluation_envs(env, min(batch_size, len(seeds)))
+    lane_count = len(lanes)
+    episodes: list[EvaluationEpisode] = []
+    for start in range(0, len(seeds), lane_count):
+        group = seeds[start : start + lane_count]
+        observations = [
+            lanes[index].reset(seed=seed)
+            for index, seed in enumerate(group)
+        ]
+        returns = [0.0] * len(group)
+        active = list(range(len(group)))
+
+        for _ in range(env.max_steps):
+            active_observations = [observations[index] for index in active]
+            action_batches = _batched_greedy_actions(
+                agents, active_observations
+            )
+            next_active: list[int] = []
+            for active_index, actions in zip(
+                active, action_batches, strict=True
+            ):
+                obs, rewards, done, cut, info = lanes[active_index].step(actions)
+                observations[active_index] = obs
+                returns[active_index] += (
+                    sum(float(reward) for reward in rewards) / len(rewards)
+                )
+                if done or cut:
+                    episodes.append(
+                        _evaluation_episode(
+                            int(group[active_index]),
+                            returns[active_index],
+                            info["episode"],
+                        )
+                    )
+                else:
+                    next_active.append(active_index)
+            active = next_active
+            if not active:
+                break
+        else:
+            seed = group[active[0]]
+            raise RuntimeError(f"evaluation seed {seed} did not terminate")
+
+    order = {int(seed): index for index, seed in enumerate(seeds)}
+    episodes.sort(key=lambda episode: order[episode.seed])
+    return episodes
+
+
 def evaluate_detailed(
     agents: Sequence[Agent],
     env,
     seeds: Sequence[int],
+    *,
+    batch_size: int = EVALUATION_BATCH_SIZE,
 ) -> tuple[Evaluation, tuple[EvaluationEpisode, ...]]:
     if len(seeds) != len(set(seeds)):
         raise ValueError("evaluation seeds must be unique")
 
-    episodes: list[EvaluationEpisode] = []
-    for seed in seeds:
-        obs = env.reset(seed=seed)
-        episode_return = 0.0
-        for _ in range(env.max_steps):
-            actions = select_actions(agents, obs, 0.0)
-            obs, rewards, done, cut, info = env.step(actions)
-            episode_return += (
-                sum(float(reward) for reward in rewards) / len(rewards)
-            )
-            if done or cut:
-                metrics = info["episode"]
-                episodes.append(
-                    EvaluationEpisode(
-                        seed=int(seed),
-                        completed=bool(metrics["completed"]),
-                        timed_out=bool(metrics["timed_out"]),
-                        reward=episode_return,
-                        steps=int(metrics["steps"]),
-                        keys=int(metrics["keys_collected"]),
-                        doors=int(metrics["doors_opened"]),
-                        switches=int(metrics["switches_activated"]),
-                        checkpoints=int(metrics["checkpoints_reached"]),
-                        exit_open=bool(metrics["exit_opened"]),
-                        wipeout_deaths=int(metrics["wipeout_deaths"]),
-                        hazard_entries=int(metrics.get("hazards", 0)),
-                        normal_ball_deaths=int(
-                            metrics.get("normal_ball_deaths", 0)
-                        ),
-                        big_ball_deaths=int(
-                            metrics.get("big_ball_deaths", 0)
-                        ),
-                        bridge_falls=int(metrics.get("bridge_falls", 0)),
-                        timed_doors_opened=int(
-                            metrics.get("timed_doors_opened", 0)
-                        ),
-                        timed_doors_expired=int(
-                            metrics.get("timed_doors_expired", 0)
-                        ),
-                        timed_doors_rearmed=int(
-                            metrics.get("timed_doors_rearmed", 0)
-                        ),
-                        crate_switches=int(
-                            metrics.get("crate_switches_solved", 0)
-                        ),
-                        reset_entries=int(metrics.get("reset_zones", 0)),
-                        wrong_key_interactions=int(
-                            metrics["wrong_key_interactions"]
-                        ),
-                    )
-                )
-                break
-        else:
-            raise RuntimeError(f"evaluation seed {seed} did not terminate")
+    episodes = _evaluate_episodes(agents, env, seeds, batch_size)
 
     count = len(episodes)
     successful_steps = [
@@ -996,8 +1328,16 @@ def evaluate_detailed(
     return evaluation, tuple(episodes)
 
 
-def evaluate(agents: Sequence[Agent], env, seeds: Sequence[int]) -> Evaluation:
-    evaluation, _ = evaluate_detailed(agents, env, seeds)
+def evaluate(
+    agents: Sequence[Agent],
+    env,
+    seeds: Sequence[int],
+    *,
+    batch_size: int = EVALUATION_BATCH_SIZE,
+) -> Evaluation:
+    evaluation, _ = evaluate_detailed(
+        agents, env, seeds, batch_size=batch_size
+    )
     return evaluation
 
 

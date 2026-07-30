@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import random
+import time
 from array import array
 from collections.abc import Callable, Mapping, Sequence
 from collections import Counter
@@ -1266,6 +1267,11 @@ class CurriculumRunner:
             "schema_version": 1,
             "trainer": asdict(self.trainer.cfg),
             "device": self.trainer.device.type,
+            "cpu_threads": (
+                torch.get_num_threads()
+                if self.trainer.device.type == "cpu"
+                else None
+            ),
             "run_seed": self.run_seed,
             "data_seed": self.data_seed,
             "pool_sizes": list(self.pool_sizes),
@@ -1402,9 +1408,10 @@ class CurriculumRunner:
         self,
         status: str,
         active: Mapping[str, Any] | None,
-    ) -> None:
+    ) -> float:
         if self.progress_path is None:
-            return
+            return 0.0
+        started = time.perf_counter()
         contract = self._progress_contract()
         payload = {
             "schema_version": 1,
@@ -1430,11 +1437,12 @@ class CurriculumRunner:
         try:
             directory = os.open(target.parent, os.O_RDONLY)
         except OSError:
-            return
+            return time.perf_counter() - started
         try:
             os.fsync(directory)
         finally:
             os.close(directory)
+        return time.perf_counter() - started
 
     def _load_progress(self, path: Path) -> None:
         if not path.is_file():
@@ -1776,6 +1784,8 @@ class CurriculumRunner:
             count: int,
             feature_target: int,
         ):
+            started = time.perf_counter()
+
             def show_progress(message: str) -> None:
                 print(message, flush=True)
                 if plot is not None and plot.visible:
@@ -1789,6 +1799,12 @@ class CurriculumRunner:
                 progress=show_progress,
             )
             generated = self._manifest_builder.take_rooms(stage.name, split)
+            elapsed = time.perf_counter() - started
+            if elapsed >= 0.05:
+                print(
+                    f"  staged {stage.name} {split} in {elapsed:.2f}s",
+                    flush=True,
+                )
             return (
                 tuple(record.seed for record in records),
                 tuple(room for _, room in generated),
@@ -1837,6 +1853,26 @@ class CurriculumRunner:
                     crate_switches=plot_crate_switches,
                     resets=plot_resets,
                 )
+                pump_every = min(50, self.plot_every)
+                if (
+                    len(plot_returns) % pump_every == 0
+                    and len(plot_returns) % self.plot_every != 0
+                ):
+                    plot.pump()
+
+        def print_round_timing(
+            timing: Mapping[str, float],
+            checkpoint_seconds: float,
+        ) -> None:
+            print(
+                "  timing: "
+                + " ".join(
+                    f"{name}={seconds:.2f}s"
+                    for name, seconds in timing.items()
+                )
+                + f" checkpoint={checkpoint_seconds:.2f}s",
+                flush=True,
+            )
 
         rehearsal: list[
             tuple[str, CoopEnvBridge, tuple[int, ...]]
@@ -2065,6 +2101,7 @@ class CurriculumRunner:
                                 + f" ({rehearse_rate:.0%} of training episodes).",
                                 flush=True,
                             )
+                        training_started = time.perf_counter()
                         if active["needs_replay_refill"]:
                             ready = max(
                                 self.trainer.cfg.batch_size,
@@ -2121,21 +2158,39 @@ class CurriculumRunner:
                                 )
                             record_outcome(outcome)
 
+                        self.trainer.synchronize()
+                        training_seconds = (
+                            time.perf_counter() - training_started
+                        )
+                        train_eval_started = time.perf_counter()
                         training_eval = evaluate(
                             self.trainer.agents,
                             training_eval_env,
                             pool,
                         )
+                        train_eval_seconds = (
+                            time.perf_counter() - train_eval_started
+                        )
                         validation_eval = None
                         retention_eval: tuple[tuple[str, float], ...] = ()
+                        validation_seconds = 0.0
+                        retention_seconds = 0.0
                         if scheduled_pool_size == largest_pool:
+                            validation_started = time.perf_counter()
                             validation_eval = evaluate(
                                 self.trainer.agents,
                                 validation_eval_env,
                                 validation_seeds,
                             )
+                            validation_seconds = (
+                                time.perf_counter() - validation_started
+                            )
+                            retention_started = time.perf_counter()
                             retention_eval = self._evaluate_retention(
                                 retention_sets
+                            )
+                            retention_seconds = (
+                                time.perf_counter() - retention_started
                             )
                         failures, rank = self._assessment(
                             stage,
@@ -2185,6 +2240,7 @@ class CurriculumRunner:
                             ),
                         )
                         evaluation_marks.append(evaluation_mark)
+                        plot_started = time.perf_counter()
                         if plot is not None:
                             plot.add_evaluation(*evaluation_mark)
                             if plot.visible:
@@ -2200,6 +2256,14 @@ class CurriculumRunner:
                                     resets=plot_resets,
                                     force=True,
                                 )
+                        plot_seconds = time.perf_counter() - plot_started
+                        round_timing = {
+                            "train": training_seconds,
+                            "train_eval": train_eval_seconds,
+                            "validation": validation_seconds,
+                            "retention": retention_seconds,
+                            "plot": plot_seconds,
+                        }
                         self._print_round(
                             stage,
                             int(active["active_pool_size"]),
@@ -2242,7 +2306,14 @@ class CurriculumRunner:
                             self.results.append(result)
                             result_ordinal += 1
                             self._resume_active = None
-                            self._save_progress("training", None)
+                            checkpoint_seconds = self._save_progress(
+                                "training",
+                                None,
+                            )
+                            print_round_timing(
+                                round_timing,
+                                checkpoint_seconds,
+                            )
                             break
 
                         phase_limit = active.get("phase_limit")
@@ -2253,7 +2324,14 @@ class CurriculumRunner:
                                 else self.recovery_rounds
                             )
                         if int(active["phase_rounds"]) < phase_limit:
-                            self._save_progress("training", active)
+                            checkpoint_seconds = self._save_progress(
+                                "training",
+                                active,
+                            )
+                            print_round_timing(
+                                round_timing,
+                                checkpoint_seconds,
+                            )
                             continue
 
                         self.trainer.load_learner_state(
@@ -2317,11 +2395,25 @@ class CurriculumRunner:
                             active["phase_rounds"] = 0
                             active["streak"] = 0
                             active["rng_state"] = rng.getstate()
-                            self._save_progress("training", active)
+                            checkpoint_seconds = self._save_progress(
+                                "training",
+                                active,
+                            )
+                            print_round_timing(
+                                round_timing,
+                                checkpoint_seconds,
+                            )
                             continue
 
                         active["rng_state"] = rng.getstate()
-                        self._save_progress("stopped", active)
+                        checkpoint_seconds = self._save_progress(
+                            "stopped",
+                            active,
+                        )
+                        print_round_timing(
+                            round_timing,
+                            checkpoint_seconds,
+                        )
                         result = StageResult(
                             stage=stage.name,
                             pool_size=int(active["active_pool_size"]),
@@ -2358,7 +2450,7 @@ class CurriculumRunner:
                 saved_stage = self._manifest_builder.snapshot().stage(stage.name)
                 train_seeds = saved_stage.seeds("train")[:effective_pool]
                 validation_seeds = saved_stage.seeds("validation")
-                train_env.set_room_cache_limit(min(4, effective_pool))
+                train_env.set_room_cache_limit(effective_pool)
                 rehearsal.append((stage.name, train_env, train_seeds))
                 retention_seeds = validation_seeds[: self.retention_size]
                 for seed in retention_seeds:
@@ -2417,6 +2509,7 @@ class CurriculumRunner:
             flush=True,
         )
         for stage in self.stages[len(self.test_results) :]:
+            staging_started = time.perf_counter()
             records = self._manifest_builder.ensure(
                 stage.name,
                 "test",
@@ -2435,14 +2528,22 @@ class CurriculumRunner:
             )
             test_env.set_room_cache_limit(self.test_size)
             test_env.cache_rooms(room for _, room in generated)
+            staging_seconds = time.perf_counter() - staging_started
+            evaluation_started = time.perf_counter()
             evaluation, episodes = evaluate_detailed(
                 self.trainer.agents,
                 test_env,
                 seeds,
             )
+            evaluation_seconds = time.perf_counter() - evaluation_started
             result = StageTestResult(stage.name, evaluation, episodes)
             self.test_results.append(result)
             self._print_test(result)
+            print(
+                f"  timing: staging={staging_seconds:.2f}s "
+                f"evaluation={evaluation_seconds:.2f}s",
+                flush=True,
+            )
             self.room_manifest = self._manifest_builder.snapshot()
             if self._test_model_sha256 != self._model_sha256():
                 raise RuntimeError("final testing changed the frozen model")

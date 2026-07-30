@@ -8,9 +8,11 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+import torch
+
 from curriculum import FULL_COURSE_HORIZON, make_runner
 from DQN.DQN_model import ACTIONS, CHANNEL_NAMES, GLOBAL_NAMES, OBS_DIM, OBSERVATION_SCHEMA
-from DQN.DQN_train import Config
+from DQN.DQN_train import Config, pin_auto_device
 from preview_maps import export_manifest_site, load_manifest
 from room_manifest import save_manifest
 
@@ -84,6 +86,14 @@ def parse_args() -> argparse.Namespace:
         help="continue a compatible recovery state",
     )
     parser.add_argument(
+        "--warm-start-progress",
+        default=None,
+        help=(
+            "initialize weights, optimizer, and exploration from an earlier "
+            "untested progress state, then revalidate from stage one"
+        ),
+    )
+    parser.add_argument(
         "--extend-stopped-rounds",
         type=int,
         default=0,
@@ -103,13 +113,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--plot-every",
         type=int,
-        default=100,
+        default=500,
         help="refresh the live dashboard every N training episodes",
     )
     parser.add_argument(
         "--plot-max-points",
         type=int,
-        default=5_000,
+        default=2_000,
         help="maximum training points drawn in the live dashboard",
     )
     parser.add_argument(
@@ -136,10 +146,12 @@ def _file_sha256(path: str | Path) -> str:
 def _source_hashes() -> dict[str, str]:
     root = Path(__file__).resolve().parent.parent
     paths = sorted(
-        (
+        path
+        for path in (
             *list((root / "DQN").glob("*.py")),
             *list((root / "Architecture" / "coop_env").rglob("*.py")),
         )
+        if not path.name.startswith("._")
     )
     return {
         str(path.relative_to(root)): _file_sha256(path)
@@ -166,6 +178,39 @@ def _save_agent(agent, path: Path) -> None:
     temporary.replace(path)
 
 
+def _load_progress_payload(path: Path) -> dict[str, Any]:
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise ValueError(f"{path} is not a compatible curriculum progress state")
+    return payload
+
+
+def _warm_start_metadata(
+    path: Path,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    status = str(payload.get("status"))
+    if status not in {"training", "stopped", "completed"}:
+        raise ValueError(
+            "warm starts require a training state that has not opened final testing"
+        )
+    if payload.get("test_results") or payload.get("test_model_sha256"):
+        raise ValueError("warm-start progress must not contain final-test data")
+    trainer = payload.get("trainer")
+    if not isinstance(trainer, dict):
+        raise ValueError("warm-start progress has no trainer state")
+    return {
+        "path": str(path.resolve()),
+        "file_sha256": _file_sha256(path),
+        "source_contract_sha256": payload.get("contract_sha256"),
+        "status": status,
+        "completed_pool_gates": len(payload.get("results", ())),
+        "trainer_episodes": int(trainer.get("episodes", 0)),
+        "trainer_env_steps": int(trainer.get("env_steps", 0)),
+        "trainer_updates": int(trainer.get("updates", 0)),
+    }
+
+
 def main() -> None:
     args = parse_args()
     checkpoint = Path(args.output).expanduser()
@@ -176,6 +221,16 @@ def main() -> None:
     resume_path = (
         Path(args.resume_from).expanduser() if args.resume_from else None
     )
+    warm_start_path = (
+        Path(args.warm_start_progress).expanduser()
+        if args.warm_start_progress
+        else None
+    )
+    if resume_path is not None and warm_start_path is not None:
+        raise ValueError(
+            "--warm-start-progress starts a new run and cannot be combined "
+            "with --resume-from"
+        )
     if args.extend_stopped_rounds and resume_path is None:
         raise ValueError("--extend-stopped-rounds requires --resume-from")
     progress_path = (
@@ -223,6 +278,15 @@ def main() -> None:
         maps_path.parent.mkdir(parents=True, exist_ok=True)
     if resume_path is not None and not resume_path.is_file():
         raise FileNotFoundError(f"recovery state does not exist: {resume_path}")
+    if warm_start_path is not None and not warm_start_path.is_file():
+        raise FileNotFoundError(
+            f"warm-start progress does not exist: {warm_start_path}"
+        )
+    if (
+        warm_start_path is not None
+        and warm_start_path.resolve() in normalized
+    ):
+        raise ValueError("warm-start progress cannot also be an output")
     if (
         progress_path.exists()
         and (
@@ -244,6 +308,51 @@ def main() -> None:
             f"{report_path} already exists; choose a new --report-output"
         )
     source_hashes = _source_hashes()
+    warm_start_payload = (
+        _load_progress_payload(warm_start_path)
+        if warm_start_path is not None
+        else None
+    )
+    resume_payload = (
+        _load_progress_payload(resume_path)
+        if resume_path is not None
+        else None
+    )
+    warm_start_info: dict[str, Any] | None = None
+    if warm_start_path is not None and warm_start_payload is not None:
+        warm_start_info = _warm_start_metadata(
+            warm_start_path,
+            warm_start_payload,
+        )
+    elif resume_payload is not None:
+        external = resume_payload.get("contract", {}).get("external", {})
+        recovered_warm_start = external.get("warm_start")
+        if recovered_warm_start is not None:
+            if not isinstance(recovered_warm_start, dict):
+                raise ValueError("recovery warm-start provenance is invalid")
+            warm_start_info = dict(recovered_warm_start)
+    if resume_payload is not None:
+        saved_contract = resume_payload.get("contract", {})
+        saved_trainer = saved_contract.get("trainer", {})
+        saved_request = saved_trainer.get("device")
+        if args.device != saved_request:
+            raise ValueError(
+                f"recovery requires --device {saved_request}; "
+                f"received {args.device}"
+            )
+        saved_device = str(saved_contract.get("device"))
+        saved_threads = saved_contract.get("cpu_threads")
+        if saved_device != args.device and args.device != "auto":
+            raise ValueError("recovery device metadata is inconsistent")
+        if args.device == "auto" or saved_device == "cpu":
+            pin_auto_device(
+                saved_device,
+                int(saved_threads) if saved_threads is not None else None,
+            )
+            print(
+                f"Recovery pinned device settings to saved {saved_device}.",
+                flush=True,
+            )
 
     cfg = Config(
         max_steps=args.max_steps,
@@ -268,9 +377,23 @@ def main() -> None:
         recovery_expansions=args.recovery_expansions,
         progress_path=str(progress_path),
         resume_from=str(resume_path) if resume_path is not None else None,
-        progress_contract={"source_sha256": source_hashes},
+        progress_contract={
+            "source_sha256": source_hashes,
+            "warm_start": warm_start_info,
+        },
         extend_stopped_rounds=args.extend_stopped_rounds,
     )
+    if warm_start_payload is not None:
+        if warm_start_info is None:
+            raise RuntimeError("warm-start metadata was not initialized")
+        runner.trainer.load_recovery_state(warm_start_payload["trainer"])
+        print(
+            "Warm-started from "
+            f"{warm_start_path} at "
+            f"{warm_start_info['trainer_episodes']} prior episodes; "
+            "curriculum results and data splits start fresh.",
+            flush=True,
+        )
     checkpoint_preexisting = checkpoint.is_file()
     finalization_statuses = {"completed", "test_started", "tested"}
     if checkpoint_preexisting:
@@ -415,7 +538,7 @@ def main() -> None:
     if _source_hashes() != source_hashes:
         raise RuntimeError("training source files changed during the run")
     report = {
-        "schema_version": 5,
+        "schema_version": 6,
         "curriculum_completed": runner.completed,
         "final_test_requested": (
             args.final_test
@@ -452,9 +575,14 @@ def main() -> None:
             "scope": (
                 "post_resume_segment"
                 if resume_path is not None
-                else "full_run"
+                else (
+                    "warm_started_full_revalidation"
+                    if warm_start_info is not None
+                    else "full_run"
+                )
             ),
         },
+        "warm_start": warm_start_info,
         "checkpoint": {
             "path": str(checkpoint),
             "sha256": checkpoint_hash,

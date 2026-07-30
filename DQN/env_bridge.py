@@ -158,6 +158,7 @@ class CoopEnvBridge:
     # Bound by _begin_episode().
     room: Room
     state: EpisodeState
+    _exit: ExitDoor
 
     def __init__(
         self,
@@ -196,6 +197,15 @@ class CoopEnvBridge:
         self._touched: set = set()
         self._tile_region: dict = {}
         self._objectives: list = []
+        self._spawns: tuple[AgentSpawn, ...] = ()
+        self._keys: tuple[Key, ...] = ()
+        self._doors: tuple[LockedDoor, ...] = ()
+        self._switches: tuple[Switch, ...] = ()
+        self._blocks: tuple[PushableBlock, ...] = ()
+        self._checkpoints: tuple[Checkpoint, ...] = ()
+        self._reset_zones: tuple[ResetZone, ...] = ()
+        self._bridges: tuple[TemporaryBridge, ...] = ()
+        self._wipeout_balls: tuple[WipeoutBall, ...] = ()
         self._static_blocked: dict = {}
         self._static_hazard: dict = {}
         self._static_entities: dict = {}
@@ -207,6 +217,11 @@ class CoopEnvBridge:
         self._nav_target: list[dict[Vec2, tuple[Any, str]]] = [{}, {}]
         self._exit_distance: dict[Vec2, int] = {}
         self._task_target_cache: list[list[tuple[Any, str]]] = [[], []]
+        self._navigation_checked = False
+        self._goal_cache: list[
+            tuple[Any, str, Vec2, Vec2, int, bool, bool] | None
+        ] = [None] * N_AGENTS
+        self._unsafe_tiles_cache: set[Vec2] | None = None
         self._crate_roles: dict[str, int] = {}
         self._switch_roles: dict[str, int] = {}
         self._used_switches: set[str] = set()
@@ -271,16 +286,26 @@ class CoopEnvBridge:
         # Cache episode data used on every step.
         self.room = self.sess.room
         self.state = self.sess.state
-        self._exit_pos = self.room.exit.pos
+        self._exit = self.room.exit
+        self._spawns = self.room.spawns
+        self._keys = self.room.keys
+        self._doors = self.room.doors
+        self._switches = self.room.switches
+        self._blocks = self.room.blocks
+        self._checkpoints = self.room.checkpoints
+        self._reset_zones = self.room.reset_zones
+        self._bridges = self.room.bridges
+        self._wipeout_balls = self.room.wipeout_balls
+        self._exit_pos = self._exit.pos
         self._span = float(max(self.room.width, self.room.height))
         self._totals = (
-            max(1, len(self.room.keys)),
-            max(1, len(self.room.doors)),
-            max(1, len(self.room.switches)),
-            max(1, len(self.room.checkpoints)),
+            max(1, len(self._keys)),
+            max(1, len(self._doors)),
+            max(1, len(self._switches)),
+            max(1, len(self._checkpoints)),
         )
         self._build_view_cache()
-        self.pos = [s.pos for s in self.room.spawns]
+        self.pos = [spawn.pos for spawn in self._spawns]
         self.spawns = list(self.pos)
         self._crate_roles = self._assign_crate_roles()
         self._switch_roles = self._assign_switch_roles()
@@ -293,11 +318,11 @@ class CoopEnvBridge:
         # Do not reward state that starts active.
         self.rewarded_keys = set(self.state.keys_collected)
         self.rewarded_doors = {
-            door.id for door in self.room.doors if self.state.is_door_open(door.id)
+            door.id for door in self._doors if self.state.is_door_open(door.id)
         }
         self.rewarded_switches = {
             switch.id
-            for switch in self.room.switches
+            for switch in self._switches
             if self.state.is_switch_active(switch.id)
         }
         self.rewarded_checkpoints = set(self.state.checkpoints_reached)
@@ -306,6 +331,7 @@ class CoopEnvBridge:
         self.progress_scale = self._calculate_progress_scale()
 
         self._nav_signature = None
+        self._invalidate_goal_cache()
         self._phi = [self._potential(i) for i in range(N_AGENTS)]
         self._visited = set(self.pos)
         self._regions_seen = {
@@ -409,6 +435,7 @@ class CoopEnvBridge:
         cut = not done and self.steps >= self.max_steps
         terminal = done or cut
 
+        self._invalidate_goal_cache()
         for i in range(N_AGENTS):
             next_phi = 0.0 if terminal else self._potential(i)
             if not fatal:
@@ -472,14 +499,14 @@ class CoopEnvBridge:
         self.episode_metrics["keys_collected_by_agent"] = [
             sum(
                 key.agent_index == i and self.state.is_key_collected(key.id)
-                for key in self.room.keys
+                for key in self._keys
             )
             for i in range(N_AGENTS)
         ]
         self.episode_metrics["key_doors_opened_by_agent"] = [
             sum(
                 self._door_agent(door) == i and self.state.is_door_open(door.id)
-                for door in self.room.doors
+                for door in self._doors
             )
             for i in range(N_AGENTS)
         ]
@@ -586,7 +613,7 @@ class CoopEnvBridge:
 
     def _holds(self):
         here = set(self.pos)
-        for s in self.room.switches:
+        for s in self._switches:
             if s.mode is SwitchMode.HOLD:
                 self.state.set_switch(s.id, s.pos in here)
 
@@ -594,11 +621,11 @@ class CoopEnvBridge:
         results: list[tuple[float, str | None]] = []
         for i, p in enumerate(self.pos):
             if self.state.is_hazardous(p):
-                self.pos[i] = self.room.spawns[i].pos
+                self.pos[i] = self._spawns[i].pos
                 event = "bridge_fall" if p in self._bridge_tiles else "hazard"
                 results.append((R_HAZARD, event))
             elif not self._walkable(p):
-                self.pos[i] = self.room.spawns[i].pos
+                self.pos[i] = self._spawns[i].pos
                 results.append((0.0, "unstick"))
             else:
                 results.append((0.0, None))
@@ -608,7 +635,7 @@ class CoopEnvBridge:
         return next(
             (
                 ball
-                for ball in self.room.wipeout_balls
+                for ball in self._wipeout_balls
                 if pos in ball.collision_tiles_at(tick)
             ),
             None,
@@ -629,7 +656,7 @@ class CoopEnvBridge:
         return results
 
     def _reset_zone_at(self, pos):
-        return next((zone for zone in self.room.reset_zones if zone.rect.contains(pos)), None)
+        return next((zone for zone in self._reset_zones if zone.rect.contains(pos)), None)
 
     def _reset_destination(self, zone: ResetZone, entered_at: Vec2) -> Vec2:
         if zone.returns_to:
@@ -637,7 +664,7 @@ class CoopEnvBridge:
             if target is not None:
                 return target.pos
         return min(
-            (spawn.pos for spawn in self.room.spawns),
+            (spawn.pos for spawn in self._spawns),
             key=lambda pos: pos.manhattan(entered_at),
         )
 
@@ -660,7 +687,7 @@ class CoopEnvBridge:
                 self._door_timer_remaining(door.id),
                 self._door_needs_rearm(door.id),
             )
-            for door in self.room.doors
+            for door in self._doors
             if door.timer
         }
 
@@ -699,11 +726,11 @@ class CoopEnvBridge:
             "checkpoints": frozenset(self.state.checkpoints_reached),
             "switches": frozenset(
                 switch.id
-                for switch in self.room.switches
+                for switch in self._switches
                 if self.state.is_switch_active(switch.id)
             ),
             "doors": frozenset(
-                door.id for door in self.room.doors if self.state.is_door_open(door.id)
+                door.id for door in self._doors if self.state.is_door_open(door.id)
             ),
             "crate_switches": frozenset(self._crate_weighted_switches()),
             "exit_open": self.state.exit_open,
@@ -711,18 +738,18 @@ class CoopEnvBridge:
 
     def _unfinished_requirement_ids(self) -> set[str]:
         useful: set[str] = set()
-        for door in self.room.doors:
+        for door in self._doors:
             if not door.latching or not self.state.is_door_open(door.id):
                 useful.update(door.requirement.referenced_ids())
         if not self.state.exit_open:
-            useful.update(self.room.exit.requirement.referenced_ids())
+            useful.update(self._exit.requirement.referenced_ids())
         return useful
 
     def _crate_weighted_switches(self) -> set[str]:
         block_positions = set(self.state.block_positions.values())
         return {
             switch.id
-            for switch in self.room.switches
+            for switch in self._switches
             if switch.mode is SwitchMode.HOLD and switch.pos in block_positions
         }
 
@@ -737,7 +764,7 @@ class CoopEnvBridge:
         useful = self._unfinished_requirement_ids()
         raw_total = R_EXIT_OPEN if not self.state.exit_open else 0.0
 
-        for door in self.room.doors:
+        for door in self._doors:
             if not self.state.is_door_open(door.id):
                 raw_total += self._door_reward(door)[0]
 
@@ -1030,7 +1057,14 @@ class CoopEnvBridge:
             return target.push_from
         return target.pos
 
+    def _invalidate_goal_cache(self) -> None:
+        self._navigation_checked = False
+        self._goal_cache = [None] * N_AGENTS
+        self._unsafe_tiles_cache = None
+
     def _ensure_navigation(self):
+        if self._navigation_checked:
+            return
         targets_by_agent = [self._task_targets(i) for i in range(N_AGENTS)]
         open_doors = tuple(sorted(k for k, value in self.state.doors_open.items() if value))
         blocks = tuple(
@@ -1048,6 +1082,7 @@ class CoopEnvBridge:
             bridges,
         )
         if signature == self._nav_signature:
+            self._navigation_checked = True
             return
 
         distances: list[dict[Vec2, int]] = []
@@ -1097,8 +1132,12 @@ class CoopEnvBridge:
         self._nav_target = owners
         self._exit_distance = exit_distance
         self._task_target_cache = targets_by_agent
+        self._navigation_checked = True
 
     def _goal_info(self, i):
+        cached = self._goal_cache[i]
+        if cached is not None:
+            return cached
         self._ensure_navigation()
         me = self.pos[i]
         force_task = any(
@@ -1112,7 +1151,9 @@ class CoopEnvBridge:
                 and target.pos == me
                 and self.state.is_switch_active(target.id)
             ):
-                return target, kind, Vec2(0, 0), Vec2(0, 0), 0, True, True
+                result = target, kind, Vec2(0, 0), Vec2(0, 0), 0, True, True
+                self._goal_cache[i] = result
+                return result
         if me in self._exit_distance and not force_task:
             distance = self._exit_distance[me]
             candidates = [
@@ -1121,8 +1162,8 @@ class CoopEnvBridge:
                 if self._exit_distance.get(me + direction) == distance - 1
             ]
             route, route_wait = self._safe_route(i, candidates)
-            return (
-                self.room.exit,
+            result = (
+                self._exit,
                 "exit",
                 self._exit_pos - me,
                 route,
@@ -1130,6 +1171,8 @@ class CoopEnvBridge:
                 True,
                 route_wait,
             )
+            self._goal_cache[i] = result
+            return result
 
         nav_distance = self._nav_distance[i]
         nav_target = self._nav_target[i]
@@ -1179,19 +1222,24 @@ class CoopEnvBridge:
             route_wait = True
 
         delta = self._target_pos(target) - me
-        return target, kind, delta, route, distance, reachable, route_wait
+        result = target, kind, delta, route, distance, reachable, route_wait
+        self._goal_cache[i] = result
+        return result
 
     def _safe_route(self, i, candidates):
         me = self.pos[i]
-        danger = self.state.lethal_wipeout_tiles()
-        next_danger = self.state.lethal_wipeout_tiles(self.state.tick + 1)
-        unsafe = danger | next_danger
-        for bridge in self.room.bridges:
-            if (
-                not bridge.is_solid_at(self.state.tick)
-                or not bridge.is_solid_at(self.state.tick + 1)
-            ):
-                unsafe.update(bridge.footprint())
+        unsafe = self._unsafe_tiles_cache
+        if unsafe is None:
+            danger = self.state.lethal_wipeout_tiles()
+            next_danger = self.state.lethal_wipeout_tiles(self.state.tick + 1)
+            unsafe = danger | next_danger
+            for bridge in self._bridges:
+                if (
+                    not bridge.is_solid_at(self.state.tick)
+                    or not bridge.is_solid_at(self.state.tick + 1)
+                ):
+                    unsafe.update(bridge.footprint())
+            self._unsafe_tiles_cache = unsafe
         if not candidates and me not in unsafe:
             return Vec2(0, 0), False
         for direction in candidates:
