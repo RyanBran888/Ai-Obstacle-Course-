@@ -12,6 +12,8 @@ I am Jules Thornton, as of the project I am 16 and a rising Junior in Highschool
 ### AI's
   The project contains two AI's one of which is a DQN and the other one uses a Q-table. Both of these methods were used to train 2 agents on completing an obstacle course. In the GUI, only the DQN is implemented. A DQN is a Deep Q-Network: A neural network that takes inputs and produces output Q-values with a series of hidden layers interconnected by weights and biases. The Network learns and improves the parameters by using the quality of the future states and decisions to create a target value that can be used to plug into the loss function for back propogation.
 
+  <img width="1800" height="1123" alt="curriculum_training" src="https://github.com/user-attachments/assets/657bbfed-a587-4676-9c15-ba4b82fb5233" />
+ 
   <img width="1801" height="1123" alt="training" src="https://github.com/user-attachments/assets/c4b28086-5a01-45d2-a080-5311633c277c" />
 
   <img width="1800" height="1200" alt="training" src="https://github.com/user-attachments/assets/ed6938c6-fc73-46e2-bd79-7f7c80ed5582" />
