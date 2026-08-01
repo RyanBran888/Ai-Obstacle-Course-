@@ -1929,7 +1929,7 @@ class CurriculumRunner:
         ):
             raise ValueError(
                 "recovery state does not match this code, seed, or training "
-                "config" + self._route_aux_note(saved_contract)
+                "config" + self._route_aux_note(saved_contract, contract)
             )
         if self._dynamic_door_upgrade and not exact_contract:
             self._validate_dynamic_door_cursor(payload)
@@ -2355,21 +2355,59 @@ class CurriculumRunner:
         )
 
     @staticmethod
-    def _route_aux_note(saved: Mapping[str, Any]) -> str:
-        trainer = saved.get("trainer")
-        weight = (
-            trainer.get("route_aux_weight")
-            if isinstance(trainer, Mapping)
-            else None
-        )
-        if weight == 0.0:
-            return (
-                "\nThat state was trained with no route auxiliary loss, which "
-                "is the setting that stalled near 70% on held-out rooms. Its "
-                "weights were shaped by a different objective, so start a "
-                "fresh run rather than resuming it."
+    def _route_aux_note(
+        saved: Mapping[str, Any],
+        current: Mapping[str, Any] | None = None,
+    ) -> str:
+        """Name what actually differs instead of guessing at a cause.
+
+        This used to blame the route auxiliary loss on every mismatch, which
+        was wrong for any other difference and sent people chasing a setting
+        that had nothing to do with it. Reporting the differing keys costs
+        nothing and is right by construction.
+        """
+        if current is None:
+            return ""
+
+        def sources(contract: Mapping[str, Any]) -> Mapping[str, Any]:
+            external = contract.get("external")
+            found = (
+                external.get("source_sha256")
+                if isinstance(external, Mapping)
+                else None
             )
-        return ""
+            return found if isinstance(found, Mapping) else {}
+
+        edited = sorted(
+            name
+            for name in set(sources(saved)) | set(sources(current))
+            if sources(saved).get(name) != sources(current).get(name)
+        )
+        differing = sorted(
+            key
+            for key in set(saved) | set(current)
+            if key != "external" and saved.get(key) != current.get(key)
+        )
+
+        lines = []
+        if edited:
+            shown = ", ".join(edited[:4])
+            more = f" (+{len(edited) - 4} more)" if len(edited) > 4 else ""
+            lines.append(
+                f"\nSource files changed since that state was saved: {shown}"
+                f"{more}. The environment or trainer behaves differently now, "
+                "so its rounds are no longer comparable -- start a fresh run."
+            )
+        if differing:
+            lines.append(
+                "\nSettings that differ: " + ", ".join(differing[:8]) + "."
+            )
+        if not lines:
+            lines.append(
+                "\nThe recorded settings match, so the difference is in the "
+                "run seed or generated stage list."
+            )
+        return "".join(lines)
 
     def _compatible_source_upgrade(
         self,

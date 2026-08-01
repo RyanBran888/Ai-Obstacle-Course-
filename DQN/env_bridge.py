@@ -1556,6 +1556,23 @@ class CoopEnvBridge:
                 roles[first.id], roles[second.id] = 0, 1
             else:
                 roles[first.id], roles[second.id] = 1, 0
+
+        # A hold switch outside a pair still needs exactly one owner. Without
+        # a role every agent claims it, so both walk onto the lever, both keep
+        # it as their target because they are standing on it, and nobody is
+        # ever routed to the exit -- the planner returns "no route" for both
+        # agents until the step limit. Naming one holder frees the other to
+        # finish the room.
+        for switch in self.room.switches:
+            if switch.mode is not SwitchMode.HOLD or switch.id in roles:
+                continue
+            roles[switch.id] = min(
+                range(N_AGENTS),
+                key=lambda agent: (
+                    self.spawns[agent].manhattan(switch.pos),
+                    agent,
+                ),
+            )
         return roles
 
     def _planned_crate_for_switch(
