@@ -21,11 +21,14 @@ from DQN.DQN_model import (
     CHANNEL_NAMES,
     GLOBAL_NAMES,
     HIDDEN,
+    GUIDED_POLICY_CONTRACT,
+    GUIDED_POLICY_MODE,
     LEARNED_POLICY_CONTRACT,
     LEARNED_POLICY_MODE,
     LEGACY_LEARNED_POLICY_CONTRACT,
     N_ACTIONS,
     OBS_DIM,
+    OBS_DIM_WITH_NAV_GRADIENT,
     OBSERVATION_SCHEMA,
     LEGACY_POLICY_CONTRACT,
     POLICY_MODES,
@@ -40,9 +43,11 @@ _AUTO_DEVICE: torch.device | None = None
 _AUTO_CPU_THREADS: int | None = None
 _ROUTE_AUX_WEIGHT = 0.05
 _ROUTE_AUX_MARGIN = 1.0
-#: Public alias so callers can show the default without reaching for a private
-#: name. See Config.route_aux_weight for what it buys.
-DEFAULT_ROUTE_AUX_WEIGHT = _ROUTE_AUX_WEIGHT
+#: Off by default: sweeping this over 0.05, 1, 2 and 5 changed held-out
+#: success by less than round-to-round noise, because the ranking it enforces
+#: is already satisfied on the states in replay. Assisted mode still uses
+#: _ROUTE_AUX_WEIGHT, whose behavior predates the knob.
+DEFAULT_ROUTE_AUX_WEIGHT = 0.0
 _WAIT_ACTION = ACTIONS.index("wait")
 
 
@@ -237,6 +242,8 @@ def _policy_contract(mode: str) -> dict[str, Any]:
     normalized = _normalize_policy_mode(mode)
     if normalized == LEARNED_POLICY_MODE:
         return dict(LEARNED_POLICY_CONTRACT)
+    if normalized == GUIDED_POLICY_MODE:
+        return dict(GUIDED_POLICY_CONTRACT)
     return dict(ASSISTED_POLICY_CONTRACT)
 
 
@@ -252,11 +259,12 @@ def _checkpoint_policy_mode(checkpoint: Mapping[str, Any]) -> str:
     contract = checkpoint.get("policy")
     if explicit is not None:
         mode = _normalize_policy_mode(str(explicit))
-        accepted = (
-            (LEARNED_POLICY_CONTRACT, LEGACY_LEARNED_POLICY_CONTRACT)
-            if mode == LEARNED_POLICY_MODE
-            else (ASSISTED_POLICY_CONTRACT,)
-        )
+        if mode == LEARNED_POLICY_MODE:
+            accepted = (LEARNED_POLICY_CONTRACT, LEGACY_LEARNED_POLICY_CONTRACT)
+        elif mode == GUIDED_POLICY_MODE:
+            accepted = (GUIDED_POLICY_CONTRACT,)
+        else:
+            accepted = (ASSISTED_POLICY_CONTRACT,)
         if contract not in accepted:
             raise ValueError(
                 "checkpoint policy mode and policy contract do not match"
@@ -265,6 +273,8 @@ def _checkpoint_policy_mode(checkpoint: Mapping[str, Any]) -> str:
 
     if contract in (LEARNED_POLICY_CONTRACT, LEGACY_LEARNED_POLICY_CONTRACT):
         return LEARNED_POLICY_MODE
+    if contract == GUIDED_POLICY_CONTRACT:
+        return GUIDED_POLICY_MODE
     if contract in (
         None,
         ASSISTED_POLICY_CONTRACT,
@@ -319,11 +329,16 @@ class Config:
     shared_net: bool = True
     seed: int = 0
     policy_mode: str = LEARNED_POLICY_MODE
-    #: Weight on the route ranking loss. This is what teaches the network to
-    #: read route_dx/route_dy instead of memorizing individual rooms, so it is
-    #: the difference between a policy that transfers to unseen rooms and one
-    #: that does not. Set to 0.0 to train on TD error alone.
-    route_aux_weight: float = _ROUTE_AUX_WEIGHT
+    #: None resolves per policy mode: on for learned, off for assisted.
+    #: Sets the observation width, so it must match any checkpoint loaded.
+    nav_gradient: bool | None = None
+    #: Weight on the route ranking loss, which pushes the planner's step above
+    #: the other legal actions. Off by default: it is computed on replay
+    #: states, where the network already ranks that action first, so the hinge
+    #: reads ~0.01 against a margin of 1.0 and has nothing to correct. Held-out
+    #: success did not move across weights of 0.05, 1, 2 and 5. Memorization of
+    #: a small room pool is a data problem; see CurriculumRunner.train_pool_max.
+    route_aux_weight: float = DEFAULT_ROUTE_AUX_WEIGHT
 
 
 def eps_at(step: int, cfg: Config) -> float:
@@ -955,7 +970,7 @@ class Agent:
         replay_seed: int = 0,
         important_fraction: float = 0.25,
         policy_mode: str = LEARNED_POLICY_MODE,
-        route_aux_weight: float = _ROUTE_AUX_WEIGHT,
+        route_aux_weight: float = DEFAULT_ROUTE_AUX_WEIGHT,
     ) -> None:
         self.device = torch.device(device)
         self.gamma = gamma
@@ -1177,6 +1192,25 @@ class Agent:
             "opt": _cpu_copy(self.opt.state_dict()),
         }
 
+    def _mismatch_message(self, checkpoint: Mapping[str, Any]) -> str:
+        """Name the width mismatch, because it now has one common cause.
+
+        Learned observations gained the goal-distance flow map, so every
+        checkpoint trained before it is narrower than the environment it is
+        being resumed into. That is a real incompatibility, but the generic
+        message sends people hunting through the whole contract for it.
+        """
+        stored = checkpoint.get("obs_dim")
+        if stored == self.net.obs_dim or not isinstance(stored, int):
+            return "checkpoint network, observation, or action contract does not match"
+        return (
+            f"checkpoint observation width {stored} does not match this "
+            f"environment's {self.net.obs_dim}. Learned observations gained "
+            f"the goal-distance flow map ({OBS_DIM} -> "
+            f"{OBS_DIM_WITH_NAV_GRADIENT}); resume a pre-flow-map learned "
+            f"checkpoint with --no-nav-gradient, or train a fresh one"
+        )
+
     def load_learning_state(self, checkpoint: dict[str, Any]) -> None:
         policy_mode = _checkpoint_policy_mode(checkpoint)
         action_safety = checkpoint.get("action_safety")
@@ -1193,13 +1227,11 @@ class Agent:
                 and action_safety != ACTION_SAFETY_CONTRACT
             )
             or (
-                policy_mode == LEARNED_POLICY_MODE
+                policy_mode in (LEARNED_POLICY_MODE, GUIDED_POLICY_MODE)
                 and action_safety is not None
             )
         ):
-            raise ValueError(
-                "checkpoint network, observation, or action contract does not match"
-            )
+            raise ValueError(self._mismatch_message(checkpoint))
         self.net.load_state_dict(checkpoint["net"])
         self.target.load_state_dict(checkpoint["target"])
         self.opt.load_state_dict(checkpoint["opt"])
@@ -1222,13 +1254,11 @@ class Agent:
             or tuple(checkpoint.get("globals", ())) != GLOBAL_NAMES
             or action_safety not in (None, ACTION_SAFETY_CONTRACT)
             or (
-                policy_mode == LEARNED_POLICY_MODE
+                policy_mode in (LEARNED_POLICY_MODE, GUIDED_POLICY_MODE)
                 and action_safety is not None
             )
         ):
-            raise ValueError(
-                "checkpoint network, observation, or action contract does not match"
-            )
+            raise ValueError(self._mismatch_message(checkpoint))
         self.net.load_state_dict(checkpoint["net"])
         if "target" in checkpoint:
             self.target.load_state_dict(checkpoint["target"])
@@ -1902,6 +1932,12 @@ def _clone_evaluation_env(env: CoopEnvBridge) -> CoopEnvBridge:
         micro=env.micro,
         shaping_gamma=env.shaping_gamma,
         record_metrics=env.record_metrics,
+        # Both must be carried explicitly. policy_mode is re-applied by the
+        # caller, but nav_gradient is fixed at construction because it sets
+        # the observation width -- a lane that guessed it would hand the agent
+        # a differently shaped observation than the one it was built for.
+        policy_mode=env.policy_mode,
+        nav_gradient=env.nav_gradient,
     )
     clone.micro_vary = env.micro_vary
     clone._micro_seed = env._micro_seed

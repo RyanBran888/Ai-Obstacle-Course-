@@ -13,6 +13,26 @@ GLOBALS = 51
 OBS_DIM = VIEW * VIEW * CHANNELS + GLOBALS
 OBSERVATION_SCHEMA = 3
 
+#: Optional trailing block: the goal-distance field over the visible window,
+#: relative to the tile the agent stands on and clipped to +/-1. It is the
+#: flow map a game AI reads, not the answer -- a supervised probe trained on
+#: the planner's own action reaches 93% on unseen rooms with it and 72%
+#: without, and the missing 7% is where the planner overrides the gradient for
+#: hazards, timing and hold switches. Terrain detail alone does not help: two
+#: extra egocentric terrain views measured 69.7%, below the 72.1% baseline.
+NAV_GRADIENT_CELLS = VIEW * VIEW
+#: Distance beyond which the gradient saturates, in tiles.
+NAV_GRADIENT_SCALE = 8.0
+#: Value for tiles with no route to the goal, or when the agent itself is
+#: stranded: maximally uphill.
+NAV_GRADIENT_UNREACHABLE = 1.0
+OBS_DIM_WITH_NAV_GRADIENT = OBS_DIM + NAV_GRADIENT_CELLS
+
+
+def observation_dim(nav_gradient: bool) -> int:
+    """Observation width for an environment with or without the flow map."""
+    return OBS_DIM_WITH_NAV_GRADIENT if nav_gradient else OBS_DIM
+
 CHANNEL_NAMES: tuple[str, ...] = (
     "blocked",
     "hazard",
@@ -121,7 +141,21 @@ ACTION_SAFETY_CONTRACT = {
 }
 LEARNED_POLICY_MODE = "learned"
 ASSISTED_POLICY_MODE = "assisted"
-POLICY_MODES = (LEARNED_POLICY_MODE, ASSISTED_POLICY_MODE)
+#: Assisted bundles four separate crutches: the planner's step in the
+#: observation, planner-based wait shaping, a wipeout safety mask, and a Q-bias
+#: added to the chosen action. Guided keeps the first two and drops the two
+#: that decide actions, so the network reads the planner's suggestion but
+#: commits to every action itself.
+#:
+#: Measured on open_navigation, 1500 episodes over a 16-room pool, validated on
+#: 32 rooms never trained on: 93.8% train / 71.9% held-out, against learned's
+#: 75.0% / 28.1%. It led at every checkpoint. The narrow train-to-held-out gap
+#: is the point -- learned memorizes its pool (47-point spread), guided
+#: transfers.
+GUIDED_POLICY_MODE = "guided"
+POLICY_MODES = (LEARNED_POLICY_MODE, GUIDED_POLICY_MODE, ASSISTED_POLICY_MODE)
+#: Modes whose observation carries the planner's next step.
+ROUTE_OBSERVATION_MODES = (GUIDED_POLICY_MODE, ASSISTED_POLICY_MODE)
 LEGACY_POLICY_CONTRACT = {
     "version": 1,
     "route_q_bias": ROUTE_Q_BIAS,
@@ -144,12 +178,12 @@ POLICY_CONTRACT = {
     "mask_invalid_interact": True,
 }
 ASSISTED_POLICY_CONTRACT = POLICY_CONTRACT
-# The learned-v3 contract trained with no route auxiliary loss at all, which
-# left the network nothing pushing it to read route_dx/route_dy -- the two
-# observation features that name the correct step. It memorized training rooms
-# instead and stalled near 70% on held-out ones. Kept only so those checkpoints
-# can be recognized and upgraded.
-LEGACY_LEARNED_POLICY_CONTRACT = {
+# Default: the route auxiliary loss is off. It was briefly on by default, but
+# a 100x sweep of its weight (0.05, 1, 2, 5) moved held-out success by less
+# than round-to-round noise -- the ranking it enforces is already satisfied on
+# replay states, so it has nothing left to correct. The machinery stays behind
+# Config.route_aux_weight rather than running unasked.
+LEARNED_POLICY_CONTRACT = {
     "version": 3,
     "mode": LEARNED_POLICY_MODE,
     "action_scores": "raw_masked_q",
@@ -158,7 +192,24 @@ LEGACY_LEARNED_POLICY_CONTRACT = {
     "future_survival_action_mask": False,
     "mask_invalid_interact": True,
 }
-LEARNED_POLICY_CONTRACT = {
+# Action selection is byte-identical to learned -- raw masked Q, no bias, no
+# safety oracle. Only the observation differs, and that is recorded separately
+# by obs_dim and the globals list, so this stays a distinct mode rather than a
+# variant of the learned contract.
+GUIDED_POLICY_CONTRACT = {
+    "version": 1,
+    "mode": GUIDED_POLICY_MODE,
+    "action_scores": "raw_masked_q",
+    "double_dqn_next_action": "raw_masked_online_q",
+    "route_observation": True,
+    "route_auxiliary_loss": False,
+    "future_survival_action_mask": False,
+    "mask_invalid_interact": True,
+}
+# Written by checkpoints trained while the loss defaulted on. It changes the
+# weights that come out but not how an action is chosen from them, so these
+# still load and act correctly.
+LEGACY_LEARNED_POLICY_CONTRACT = {
     "version": 4,
     "mode": LEARNED_POLICY_MODE,
     "action_scores": "raw_masked_q",
@@ -270,8 +321,11 @@ def action_scores(
     observations: torch.Tensor,
     policy_mode: str = LEARNED_POLICY_MODE,
 ) -> torch.Tensor:
-    """Return action scores for an explicit learned or assisted contract."""
-    if policy_mode == LEARNED_POLICY_MODE:
+    """Return action scores for an explicit learned, guided or assisted contract."""
+    # Guided scores exactly like learned; its help is in the observation, not
+    # here. Routing it through policy_scores would re-add the Q-bias and undo
+    # the only thing that distinguishes it from assisted.
+    if policy_mode in (LEARNED_POLICY_MODE, GUIDED_POLICY_MODE):
         return learned_policy_scores(q_values, observations)
     if policy_mode == ASSISTED_POLICY_MODE:
         return policy_scores(q_values, observations)

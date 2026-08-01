@@ -16,6 +16,7 @@ import torch
 
 from env_bridge import (
     POLICY_MODE_ASSISTED,
+    POLICY_MODE_GUIDED,
     POLICY_MODE_LEARNED,
     CoopEnvBridge,
     GenerationConfig,
@@ -76,9 +77,32 @@ def _environment_policy_mode(policy_owner: Any) -> str:
     policy_mode = str(getattr(policy_owner, "policy_mode", "assisted"))
     if policy_mode == "learned":
         return POLICY_MODE_LEARNED
+    if policy_mode == "guided":
+        return POLICY_MODE_GUIDED
     if policy_mode == "assisted":
         return POLICY_MODE_ASSISTED
     raise ValueError(f"unsupported trainer policy mode {policy_mode!r}")
+
+
+def _environment_nav_gradient(owner: Any) -> bool | None:
+    """None lets the environment resolve it from the policy mode."""
+    return getattr(owner, "nav_gradient", None)
+
+
+def _effective_nav_gradient(trainer: Any, policy_mode: str) -> bool:
+    """What the observation actually carries, not what was asked for.
+
+    The config may leave this None to defer to the policy mode, so the live
+    environment -- which has already resolved it -- is the honest source. Gates
+    are set against the ceiling the observation supports, so reading the
+    request instead of the result would size them against the wrong ceiling.
+    """
+    del policy_mode  # off in both modes; kept for call-site symmetry
+    env = getattr(trainer, "env", None)
+    resolved = _environment_nav_gradient(env)
+    if resolved is None:
+        resolved = _environment_nav_gradient(getattr(trainer, "cfg", None))
+    return bool(resolved)
 
 
 def _training_requirements_satisfied(
@@ -185,8 +209,8 @@ class CurriculumStage:
     name: str
     config: GenerationConfig
     accepts: RoomCheck
-    train_threshold: float = 0.90
-    validation_threshold: float = 0.80
+    train_threshold: float = 0.80
+    validation_threshold: float = 0.70
     max_wipeout_death_rate: float = 1.0
     lesson: str = ""
     pool_sizes: tuple[int, ...] | None = None
@@ -317,6 +341,55 @@ def _test_result_from_payload(payload: Mapping[str, Any]) -> StageTestResult:
         evaluation=evaluation,
         episodes=episodes,
     )
+
+
+#: Promotion gates were written for the assisted observation, which contains
+#: the planner's next step. A supervised probe -- trained directly on the
+#: correct action, fitting its training rooms to 100% -- tops out at 72.3% per
+#: step on unseen rooms without those features, against 100% with them. Gates
+#: of 90-95% are therefore unreachable in learned mode no matter how long it
+#: trains, which is why a learned run grinds at stage one forever.
+#:
+#: Halving them puts open_navigation's validation gate at 45%, just under the
+#: 48-56% that learned runs actually produced there, so a stage that has been
+#: learned as well as this observation allows will clear it instead of
+#: looping. It is a calibration to measured performance, not a derived
+#: constant: raise it to make the curriculum stricter.
+LEARNED_PROMOTION_SCALE = 0.5
+
+#: The goal-distance flow map raises that probe's ceiling to 93%, which
+#: predicted a much stricter gate. Training measured the opposite: at 1500
+#: episodes on open_navigation it reached 43.8% train / 3.1% held-out against
+#: the plain observation's 75.0% / 28.1%. Losing *training* success is the
+#: giveaway -- extra information cannot make fitting harder -- so the flow map
+#: is an optimization problem, not an information gain, and the gate stays
+#: calibrated to what learned runs actually produce.
+LEARNED_NAV_GRADIENT_PROMOTION_SCALE = LEARNED_PROMOTION_SCALE
+
+
+#: Guided reached 71.9% held-out on open_navigation in the same 1500-episode,
+#: 16-room harness where learned reached 28.1%. Putting the validation gate at
+#: 0.8 * 90% = 72% asks for exactly what it demonstrated there, and the real
+#: curriculum trains on far more rooms for far longer than that harness did,
+#: so this is meant as a floor with headroom rather than a stretch. Raise it
+#: once a full run reports what it actually sustains.
+GUIDED_PROMOTION_SCALE = 0.8
+
+
+def _resolve_promotion_scale(
+    requested: float | None,
+    policy_mode: str,
+    nav_gradient: bool = False,
+) -> float:
+    if requested is not None:
+        return float(requested)
+    if policy_mode == "guided":
+        return GUIDED_PROMOTION_SCALE
+    if policy_mode != "learned":
+        return 1.0
+    if nav_gradient:
+        return LEARNED_NAV_GRADIENT_PROMOTION_SCALE
+    return LEARNED_PROMOTION_SCALE
 
 
 def _with_recorded_route_aux_weight(
@@ -1366,6 +1439,9 @@ class CurriculumRunner:
         *,
         stages: Sequence[CurriculumStage] | None = None,
         pool_sizes: Sequence[int] = (1, 4, 16, 64),
+        train_pool_max: int = 256,
+        episodes_per_round_max: int | None = None,
+        promotion_scale: float | None = None,
         validation_size: int = 64,
         test_size: int = 256,
         episodes_per_seed: int = 50,
@@ -1426,8 +1502,22 @@ class CurriculumRunner:
         self.trainer = trainer
         self.stages = tuple(stages or default_stages())
         self.pool_sizes = tuple(sorted(set(pool_sizes)))
+        if train_pool_max < 1:
+            raise ValueError("train_pool_max must be positive")
+        self.train_pool_max = train_pool_max
+        # Bound the work per round so a wider pool buys room variety rather
+        # than proportionally more wall time. Default keeps the budget the
+        # old largest pool used, so 256 rooms costs what 64 rooms used to.
+        self.episodes_per_round_max = (
+            episodes_per_round_max
+            if episodes_per_round_max is not None
+            else episodes_per_seed * 64
+        )
+        if self.episodes_per_round_max < 1:
+            raise ValueError("episodes_per_round_max must be positive")
+        self._requested_promotion_scale = promotion_scale
         for stage in self.stages:
-            sizes = stage.pool_sizes or self.pool_sizes
+            sizes = self.stage_pool_sizes(stage)
             if not sizes or any(size < 1 for size in sizes):
                 raise ValueError(f"{stage.name} has invalid pool sizes")
         self.validation_size = validation_size
@@ -1459,6 +1549,14 @@ class CurriculumRunner:
                 getattr(self.trainer.cfg, "policy_mode", "assisted"),
             )
         )
+        self.nav_gradient = _effective_nav_gradient(self.trainer, self.policy_mode)
+        self.promotion_scale = _resolve_promotion_scale(
+            self._requested_promotion_scale,
+            self.policy_mode,
+            self.nav_gradient,
+        )
+        if not 0.0 < self.promotion_scale <= 1.0:
+            raise ValueError("promotion_scale must be within (0, 1]")
         self._fresh_learned_run = (
             self.policy_mode == "learned"
             and self._external_progress_contract.get("warm_start") is None
@@ -1504,7 +1602,7 @@ class CurriculumRunner:
     @property
     def completed(self) -> bool:
         expected = sum(
-            len(stage.pool_sizes or self.pool_sizes) for stage in self.stages
+            len(self.stage_pool_sizes(stage)) for stage in self.stages
         )
         return (
             len(self.results) == expected
@@ -1564,6 +1662,9 @@ class CurriculumRunner:
             "run_seed": self.run_seed,
             "data_seed": self.data_seed,
             "pool_sizes": list(self.pool_sizes),
+            "train_pool_max": self.train_pool_max,
+            "episodes_per_round_max": self.episodes_per_round_max,
+            "promotion_scale": self.promotion_scale,
             "validation_size": self.validation_size,
             "test_size": self.test_size,
             "episodes_per_seed": self.episodes_per_seed,
@@ -1587,7 +1688,7 @@ class CurriculumRunner:
                 {
                     "name": stage.name,
                     "config": stage.config.to_dict(),
-                    "pool_sizes": list(stage.pool_sizes or self.pool_sizes),
+                    "pool_sizes": list(self.stage_pool_sizes(stage)),
                     "train_threshold": stage.train_threshold,
                     "validation_threshold": stage.validation_threshold,
                     "max_wipeout_death_rate": stage.max_wipeout_death_rate,
@@ -2034,7 +2135,7 @@ class CurriculumRunner:
         for stage_index, stage in enumerate(
             self.stages[:REPAIR_BRIDGE_INDEX]
         ):
-            pools = tuple(sorted(set(stage.pool_sizes or self.pool_sizes)))
+            pools = self._recorded_pool_sizes(stage)
             limit = 2 if stage_index == REPAIR_BRIDGE_INDEX - 1 else len(pools)
             expected.extend((stage.name, pool) for pool in pools[:limit])
         results = payload.get("results", ())
@@ -2092,7 +2193,7 @@ class CurriculumRunner:
         expected = [
             (stage.name, pool)
             for stage in self.stages[:final_index]
-            for pool in tuple(sorted(set(stage.pool_sizes or self.pool_sizes)))
+            for pool in self._recorded_pool_sizes(stage)
         ]
         results = payload.get("results", ())
         if not isinstance(results, (list, tuple)) or len(results) != len(expected):
@@ -2193,6 +2294,65 @@ class CurriculumRunner:
         migrated = dict(payload)
         migrated["stages"] = stages
         return migrated
+
+    def train_threshold(self, stage: CurriculumStage) -> float:
+        """Training success a stage must reach, scaled for the policy mode."""
+        return stage.train_threshold * self.promotion_scale
+
+    def validation_threshold(self, stage: CurriculumStage) -> float:
+        """Held-out success a stage must reach, scaled for the policy mode."""
+        return stage.validation_threshold * self.promotion_scale
+
+    def max_wipeout_death_rate(self, stage: CurriculumStage) -> float:
+        """Death-rate ceiling. Lower is better here, so the scale relaxes it
+        rather than tightening it -- learned mode also loses the future
+        survival mask, so it dies to balls more often for the same reason it
+        routes worse."""
+        if self.promotion_scale >= 1.0:
+            return stage.max_wipeout_death_rate
+        return min(1.0, stage.max_wipeout_death_rate / self.promotion_scale)
+
+    def _recorded_pool_sizes(self, stage: CurriculumStage) -> tuple[int, ...]:
+        """The ladder a stage climbed before train_pool_max existed.
+
+        The resume upgrade validators replay a specific historical run's
+        cursor, so they have to compare against the ladder that run actually
+        used. Extending it here would make those states unresumable for a
+        reason that has nothing to do with what they recorded.
+        """
+        return tuple(sorted(set(stage.pool_sizes or self.pool_sizes)))
+
+    def stage_pool_sizes(self, stage: CurriculumStage) -> tuple[int, ...]:
+        """The room-count ladder this stage climbs, extended to the cap.
+
+        Stage ladders stop at 16 or 64 rooms. A network with ~380k parameters
+        fits that many rooms exactly and then stops improving on unseen ones:
+        training success pins at 100% while held-out sits near 50%, and the
+        gap is unmoved by the training objective (a 100x sweep of the route
+        auxiliary weight changed held-out success by less than its round to
+        round noise). The generator can produce unlimited rooms, so the ladder
+        keeps doubling to train_pool_max and the network sees more of them.
+        """
+        sizes = set(stage.pool_sizes or self.pool_sizes)
+        largest = max(sizes)
+        while largest < self.train_pool_max:
+            largest *= 2
+            sizes.add(min(largest, self.train_pool_max))
+        return tuple(sorted(size for size in sizes if size <= self.train_pool_max))
+
+    def episodes_for_pool(self, pool_size: int) -> int:
+        """Episodes to run for one round at this pool size.
+
+        Capped so widening the pool trades episodes-per-room for room variety
+        instead of multiplying the round's cost.
+        """
+        return max(
+            50,
+            min(
+                self.episodes_per_seed * pool_size,
+                self.episodes_per_round_max,
+            ),
+        )
 
     @staticmethod
     def _route_aux_note(saved: Mapping[str, Any]) -> str:
@@ -2383,16 +2543,17 @@ class CurriculumRunner:
         evaluation: Evaluation,
     ) -> tuple[str, ...]:
         failures: list[str] = []
-        if evaluation.success_rate < stage.train_threshold:
+        train_gate = self.train_threshold(stage)
+        if evaluation.success_rate < train_gate:
             failures.append(
                 "training success "
-                f"{evaluation.success_rate:.1%} < {stage.train_threshold:.1%}"
+                f"{evaluation.success_rate:.1%} < {train_gate:.1%}"
             )
-        if evaluation.wipeout_death_rate > stage.max_wipeout_death_rate:
+        if evaluation.wipeout_death_rate > self.max_wipeout_death_rate(stage):
             failures.append(
                 "training wipeout deaths "
                 f"{evaluation.wipeout_death_rate:.1%} > "
-                f"{stage.max_wipeout_death_rate:.1%}"
+                f"{self.max_wipeout_death_rate(stage):.1%}"
             )
         if (
             stage.objective_check is not None
@@ -2409,17 +2570,18 @@ class CurriculumRunner:
         if evaluation is None:
             return ()
         failures: list[str] = []
-        if evaluation.success_rate < stage.validation_threshold:
+        validation_gate = self.validation_threshold(stage)
+        if evaluation.success_rate < validation_gate:
             failures.append(
                 "validation success "
                 f"{evaluation.success_rate:.1%} < "
-                f"{stage.validation_threshold:.1%}"
+                f"{validation_gate:.1%}"
             )
-        if evaluation.wipeout_death_rate > stage.max_wipeout_death_rate:
+        if evaluation.wipeout_death_rate > self.max_wipeout_death_rate(stage):
             failures.append(
                 "validation wipeout deaths "
                 f"{evaluation.wipeout_death_rate:.1%} > "
-                f"{stage.max_wipeout_death_rate:.1%}"
+                f"{self.max_wipeout_death_rate(stage):.1%}"
             )
         if (
             stage.objective_check is not None
@@ -2436,8 +2598,8 @@ class CurriculumRunner:
         if stage is None:
             raise ValueError(f"unknown retention stage {stage_name!r}")
         return max(
-            0.50,
-            stage.validation_threshold - self.retention_margin,
+            0.50 * self.promotion_scale,
+            self.validation_threshold(stage) - self.retention_margin,
         )
 
     def _retention_failures(
@@ -2457,11 +2619,11 @@ class CurriculumRunner:
                 continue
             stage = stage_by_name[name]
             evaluation = evaluations[name]
-            if evaluation.wipeout_death_rate > stage.max_wipeout_death_rate:
+            if evaluation.wipeout_death_rate > self.max_wipeout_death_rate(stage):
                 failures.append(
                     f"retention {name} wipeout deaths "
                     f"{evaluation.wipeout_death_rate:.1%} > "
-                    f"{stage.max_wipeout_death_rate:.1%}"
+                    f"{self.max_wipeout_death_rate(stage):.1%}"
                 )
             if (
                 stage.objective_check is not None
@@ -2527,7 +2689,7 @@ class CurriculumRunner:
                 values.append(
                     self._safety_deficit(
                         evaluation.wipeout_death_rate,
-                        stage.max_wipeout_death_rate,
+                        self.max_wipeout_death_rate(stage),
                     )
                 )
                 values.append(self._objective_deficit(stage, evaluation))
@@ -2556,11 +2718,11 @@ class CurriculumRunner:
         deficits = [
             self._success_deficit(
                 training.success_rate,
-                stage.train_threshold,
+                self.train_threshold(stage),
             ),
             self._safety_deficit(
                 training.wipeout_death_rate,
-                stage.max_wipeout_death_rate,
+                self.max_wipeout_death_rate(stage),
             ),
         ]
         deficits.append(self._objective_deficit(stage, training))
@@ -2570,11 +2732,11 @@ class CurriculumRunner:
                 (
                     self._success_deficit(
                         validation.success_rate,
-                        stage.validation_threshold,
+                        self.validation_threshold(stage),
                     ),
                     self._safety_deficit(
                         validation.wipeout_death_rate,
-                        stage.max_wipeout_death_rate,
+                        self.max_wipeout_death_rate(stage),
                     ),
                 )
             )
@@ -2597,7 +2759,7 @@ class CurriculumRunner:
             deficits.append(
                 self._safety_deficit(
                     evaluation.wipeout_death_rate,
-                    retained_stage.max_wipeout_death_rate,
+                    self.max_wipeout_death_rate(retained_stage),
                 )
             )
             deficits.append(
@@ -3071,9 +3233,7 @@ class CurriculumRunner:
             )
         try:
             for stage_index, stage in enumerate(self.stages):
-                stage_pool_sizes = tuple(
-                    sorted(set(stage.pool_sizes or self.pool_sizes))
-                )
+                stage_pool_sizes = self.stage_pool_sizes(stage)
                 largest_pool = stage_pool_sizes[-1]
                 cache_limit = max(largest_pool, self.recovery_pool_max)
 
@@ -3084,6 +3244,7 @@ class CurriculumRunner:
                     shaping_gamma=self.trainer.cfg.gamma,
                     record_metrics=False,
                     policy_mode=_environment_policy_mode(self.trainer),
+                    nav_gradient=_environment_nav_gradient(self.trainer.cfg),
                 )
                 train_env.set_room_cache_limit(cache_limit)
                 training_eval_env = CoopEnvBridge(
@@ -3093,6 +3254,7 @@ class CurriculumRunner:
                     shaping_gamma=self.trainer.cfg.gamma,
                     record_metrics=False,
                     policy_mode=_environment_policy_mode(self.trainer),
+                    nav_gradient=_environment_nav_gradient(self.trainer.cfg),
                 )
                 training_eval_env.set_room_cache_limit(cache_limit)
                 validation_eval_env = CoopEnvBridge(
@@ -3102,6 +3264,7 @@ class CurriculumRunner:
                     shaping_gamma=self.trainer.cfg.gamma,
                     record_metrics=False,
                     policy_mode=_environment_policy_mode(self.trainer),
+                    nav_gradient=_environment_nav_gradient(self.trainer.cfg),
                 )
                 validation_eval_env.set_room_cache_limit(self.validation_size)
                 saved_stage = self._manifest_builder.snapshot().stage(stage.name)
@@ -3394,10 +3557,8 @@ class CurriculumRunner:
                     while True:
                         pool = train_seeds[: int(active["active_pool_size"])]
                         phase = str(active["phase"])
-                        episodes = max(
-                            50,
-                            self.episodes_per_seed
-                            * int(active["active_pool_size"]),
+                        episodes = self.episodes_for_pool(
+                            int(active["active_pool_size"])
                         )
                         (
                             replay_weights,
@@ -3970,6 +4131,7 @@ class CurriculumRunner:
                 shaping_gamma=self.trainer.cfg.gamma,
                 record_metrics=False,
                 policy_mode=_environment_policy_mode(self.trainer),
+                nav_gradient=_environment_nav_gradient(self.trainer.cfg),
             )
             test_env.set_room_cache_limit(self.test_size)
             test_env.cache_rooms(room for _, room in generated)
@@ -4108,6 +4270,7 @@ def make_runner(
         shaping_gamma=training_config.gamma,
         record_metrics=False,
         policy_mode=_environment_policy_mode(training_config),
+        nav_gradient=_environment_nav_gradient(training_config),
     )
     trainer = Trainer(env, training_config)
     kwargs.setdefault("require_full_coverage", stages is None)

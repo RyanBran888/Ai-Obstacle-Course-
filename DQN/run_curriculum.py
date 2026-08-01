@@ -70,12 +70,75 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--policy-mode",
-        choices=("learned", "assisted"),
-        default="learned",
+        choices=("learned", "guided", "assisted"),
+        default="guided",
         help=(
-            "learned hides exact route-action and future-safety answers "
-            "(default); assisted preserves the legacy planner-guided policy "
-            "for compatibility/diagnostics"
+            "guided (default) puts the planner's next step in the "
+            "observation but leaves every decision to the network: no "
+            "Q-bias, no safety mask. It measured 93.8%% train / 71.9%% "
+            "held-out on open_navigation where learned got 75.0%%/28.1%%. "
+            "learned additionally hides the route, capping a probe at 72%% "
+            "per step on unseen rooms. assisted preserves the legacy "
+            "planner-guided policy for compatibility and diagnostics"
+        ),
+    )
+    parser.add_argument(
+        "--nav-gradient",
+        dest="nav_gradient",
+        action="store_true",
+        default=None,
+        help=(
+            "EXPERIMENTAL, off by default. Adds the goal-distance flow map "
+            "to the observation. A probe trained on the planner's own action "
+            "scores 93%% on unseen rooms with it against 72%% without, but "
+            "training measured worse, not better: 43.8%%/3.1%% against "
+            "75.0%%/28.1%% train/held-out on open_navigation at 1500 "
+            "episodes. Losing training success means the cost is in "
+            "optimization, not information, so the encoding needs work "
+            "before this is useful"
+        ),
+    )
+    parser.add_argument(
+        "--no-nav-gradient",
+        dest="nav_gradient",
+        action="store_false",
+        help="the default; kept so scripts can state it explicitly",
+    )
+    parser.add_argument(
+        "--promotion-scale",
+        type=float,
+        default=None,
+        help=(
+            "scale every stage's success gate (default: 1.0 assisted, 0.5 "
+            "learned). The gates were written for the assisted observation, "
+            "which contains the planner's step; without it a probe trained "
+            "directly on the correct action caps at 72%% per step on unseen "
+            "rooms, so 90-95%% gates can never be met and a learned run "
+            "grinds at stage one. Death-rate ceilings relax by the same "
+            "factor rather than tightening"
+        ),
+    )
+    parser.add_argument(
+        "--train-pool-max",
+        type=int,
+        default=256,
+        help=(
+            "largest number of distinct training rooms a stage may reach "
+            "(default 256). Stage ladders stopped at 16 or 64, which the "
+            "network memorizes outright -- training success pins at 100%% "
+            "while held-out sits near 50%%. Raising this is the lever that "
+            "closes that gap. Note a stage never shrinks below its own "
+            "ladder, so this only ever adds rungs"
+        ),
+    )
+    parser.add_argument(
+        "--episodes-per-round-max",
+        type=int,
+        default=None,
+        help=(
+            "cap on episodes per round (default: episodes-per-seed x 64), so "
+            "a wider pool spends the same budget on more rooms instead of "
+            "costing proportionally more time"
         ),
     )
     parser.add_argument(
@@ -83,10 +146,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_ROUTE_AUX_WEIGHT,
         help=(
-            "weight on the route ranking loss that teaches the network to "
-            "read route_dx/route_dy rather than memorize training rooms "
-            f"(default {DEFAULT_ROUTE_AUX_WEIGHT}); 0 trains on TD error "
-            "alone, which stalls near 70%% on held-out rooms"
+            "weight on the route ranking loss, which pushes the planner's "
+            "step above the other legal actions "
+            f"(default {DEFAULT_ROUTE_AUX_WEIGHT}, i.e. off). Sweeping it "
+            "over 0.05, 1, 2 and 5 changed held-out success by less than "
+            "round-to-round noise: it is computed on replay states, where "
+            "the network already ranks that action first"
         ),
     )
     parser.add_argument("--validation-seeds", type=int, default=64)
@@ -780,12 +845,16 @@ def main() -> None:
         seed=args.seed,
         policy_mode=args.policy_mode,
         route_aux_weight=args.route_aux_weight,
+        nav_gradient=args.nav_gradient,
     )
     runner = make_runner(
         cfg,
         validation_size=args.validation_seeds,
         test_size=args.test_seeds,
         episodes_per_seed=args.episodes_per_seed,
+        train_pool_max=args.train_pool_max,
+        episodes_per_round_max=args.episodes_per_round_max,
+        promotion_scale=args.promotion_scale,
         max_rounds=args.max_rounds,
         run_seed=args.seed,
         data_seed=args.data_seed,
@@ -854,13 +923,36 @@ def main() -> None:
     print(
         "Policy mode: "
         f"{runner.trainer.policy_mode} "
-        + (
-            "(route/safety oracles hidden; network actions and TD learning)"
-            if runner.trainer.policy_mode == "learned"
-            else "(legacy planner assistance enabled)"
-        ),
+        + {
+            "learned": "(route/safety oracles hidden; network actions and TD learning)",
+            "guided": (
+                "(planner's step visible as an observation feature; "
+                "network chooses every action, no Q-bias, no safety mask)"
+            ),
+            "assisted": "(legacy planner assistance enabled)",
+        }[runner.trainer.policy_mode],
         flush=True,
     )
+    if runner.nav_gradient:
+        print(
+            f"Observation: {runner.trainer.env.obs_dim} with the experimental "
+            "goal-distance flow map. It measured WORSE than without "
+            "(43.8%/3.1% vs 75.0%/28.1% train/held-out on open_navigation at "
+            "1500 episodes). Drop --nav-gradient unless you are testing it.",
+            flush=True,
+        )
+    if runner.promotion_scale != 1.0:
+        sample = runner.stages[0]
+        print(
+            f"Promotion gates scaled to {runner.promotion_scale:.0%} "
+            f"(e.g. {sample.name} needs train "
+            f"{runner.train_threshold(sample):.0%} / validation "
+            f"{runner.validation_threshold(sample):.0%}, "
+            f"was {sample.train_threshold:.0%} / "
+            f"{sample.validation_threshold:.0%}). "
+            "Override with --promotion-scale.",
+            flush=True,
+        )
     if runner.recovery_status == "test_started" and not args.final_test:
         raise ValueError(
             "this recovery state has a sealed partial final test; "

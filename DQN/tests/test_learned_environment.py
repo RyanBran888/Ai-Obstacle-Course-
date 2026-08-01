@@ -80,7 +80,9 @@ class TestLearnedEnvironmentContract(unittest.TestCase):
         self.assertEqual(global_value(learned_obs, "route_dx"), 0.0)
         self.assertEqual(global_value(learned_obs, "route_dy"), 0.0)
         self.assertEqual(global_value(learned_obs, "route_wait"), 0.0)
-        self.assertEqual(len(learned_obs), OBS_DIM)
+        # Width comes from the environment, which is wider in learned mode
+        # because it carries the goal-distance flow map.
+        self.assertEqual(len(learned_obs), learned.obs_dim)
 
         learned.set_policy_mode(POLICY_MODE_ASSISTED)
         assisted_obs = learned._obs(0)
@@ -89,7 +91,9 @@ class TestLearnedEnvironmentContract(unittest.TestCase):
             or global_value(assisted_obs, "route_dy")
         )
         self.assertEqual(global_value(assisted_obs, "route_wait"), 1.0)
-        self.assertEqual(len(assisted_obs), OBS_DIM)
+        # set_policy_mode must never resize a live observation, or an agent
+        # mid-episode would suddenly be handed a different input shape.
+        self.assertEqual(len(assisted_obs), learned.obs_dim)
 
     def test_learned_mode_returns_a_neutral_mask_without_survival_search(self):
         env = CoopEnvBridge(

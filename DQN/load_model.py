@@ -49,6 +49,8 @@ from DQN.DQN_model import (
     ACTION_SAFETY_CONTRACT,
     ASSISTED_POLICY_CONTRACT,
     ASSISTED_POLICY_MODE,
+    GUIDED_POLICY_CONTRACT,
+    GUIDED_POLICY_MODE,
     HIDDEN,
     LEARNED_POLICY_CONTRACT,
     LEARNED_POLICY_MODE,
@@ -76,7 +78,7 @@ def configure_environment(policy: Any, env: Any) -> Any:
     """
     mode = getattr(policy, "policy_mode", None)
     configure = getattr(env, "set_policy_mode", None)
-    if mode not in (LEARNED_POLICY_MODE, ASSISTED_POLICY_MODE):
+    if mode not in (LEARNED_POLICY_MODE, GUIDED_POLICY_MODE, ASSISTED_POLICY_MODE):
         raise ValueError("loaded policy has no recognized policy mode")
     if not callable(configure):
         raise TypeError("environment does not support policy-mode selection")
@@ -115,21 +117,25 @@ def _checkpoint_policy_mode(checkpoint: Any) -> str:
         # learned-v3 and learned-v4 differ only in whether the route auxiliary
         # loss ran while training, which does not change how an action is
         # picked from the resulting Q-values, so both act correctly here.
-        accepted = (
-            (LEARNED_POLICY_CONTRACT, LEGACY_LEARNED_POLICY_CONTRACT)
-            if mode == LEARNED_POLICY_MODE
-            else (
-                (ASSISTED_POLICY_CONTRACT,)
-                if mode == ASSISTED_POLICY_MODE
-                else ()
+        if mode == LEARNED_POLICY_MODE:
+            accepted: tuple[Any, ...] = (
+                LEARNED_POLICY_CONTRACT,
+                LEGACY_LEARNED_POLICY_CONTRACT,
             )
-        )
+        elif mode == GUIDED_POLICY_MODE:
+            accepted = (GUIDED_POLICY_CONTRACT,)
+        elif mode == ASSISTED_POLICY_MODE:
+            accepted = (ASSISTED_POLICY_CONTRACT,)
+        else:
+            accepted = ()
         if contract not in accepted:
             raise ValueError("checkpoint action policy does not match")
         return mode
 
     if contract in (LEARNED_POLICY_CONTRACT, LEGACY_LEARNED_POLICY_CONTRACT):
         return LEARNED_POLICY_MODE
+    if contract == GUIDED_POLICY_CONTRACT:
+        return GUIDED_POLICY_MODE
     if contract in (
         None,
         ASSISTED_POLICY_CONTRACT,

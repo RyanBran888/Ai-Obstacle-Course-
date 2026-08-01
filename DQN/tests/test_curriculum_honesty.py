@@ -14,8 +14,17 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "DQN"))
 sys.path.insert(0, str(ROOT / "Architecture"))
 
+import torch  # noqa: E402
+
+from DQN.DQN_model import (  # noqa: E402
+    GLOBAL_NAMES,
+    N_ACTIONS,
+    action_scores,
+    learned_policy_scores,
+)
 from DQN.DQN_rewards import CurriculumPlot  # noqa: E402
 from DQN.DQN_train import Config, Evaluation  # noqa: E402
+from env_bridge import N_AGENTS, CoopEnvBridge  # noqa: E402
 from DQN.curriculum import (  # noqa: E402
     CurriculumRunner,
     _environment_policy_mode,
@@ -237,11 +246,38 @@ class TestLearningTelemetry(unittest.TestCase):
 
 
 class TestPolicyModeCLI(unittest.TestCase):
-    def test_fresh_cli_defaults_to_learned(self):
+    def test_fresh_cli_defaults_to_guided(self):
         with patch.object(sys, "argv", ["run_curriculum.py"]):
             args = parse_args()
-        self.assertEqual(args.policy_mode, "learned")
+        self.assertEqual(args.policy_mode, "guided")
         self.assertEqual(args.minimum_fresh_training_rounds, 1)
+
+    def test_no_default_run_gets_an_oracle_in_the_control_path(self):
+        """The property the default has to keep, whatever mode it names.
+
+        Assisted picks actions with a planner Q-bias and a hazard mask, so a
+        run that reaches it by accident reports success the network did not
+        earn. Guided is allowed to default because its help is confined to the
+        observation.
+        """
+        with patch.object(sys, "argv", ["run_curriculum.py"]):
+            mode = parse_args().policy_mode
+        self.assertNotEqual(mode, "assisted")
+
+        env = CoopEnvBridge(seed=0, max_steps=40, record_metrics=False, policy_mode=mode)
+        env.reset(seed=0)
+        self.assertFalse(env.safety_oracle_enabled)
+        self.assertEqual(
+            env.wipeout_action_masks(), ((True,) * N_ACTIONS,) * N_AGENTS
+        )
+
+        torch.manual_seed(0)
+        q = torch.randn(1, N_ACTIONS)
+        obs = torch.tensor([env._obs(0)], dtype=torch.float32)
+        scored = action_scores(q, obs, mode)
+        unbiased = learned_policy_scores(q, obs)
+        # Identical means nothing was added to any action's score.
+        self.assertTrue(torch.equal(scored, unbiased))
 
     def test_assisted_mode_is_explicit(self):
         with patch.object(
@@ -251,6 +287,41 @@ class TestPolicyModeCLI(unittest.TestCase):
         ):
             args = parse_args()
         self.assertEqual(args.policy_mode, "assisted")
+
+    def test_guided_is_a_plain_dqn_with_a_richer_observation(self):
+        """Guided must differ from learned in inputs only, never in algorithm."""
+        guided = CoopEnvBridge(
+            seed=0, max_steps=40, record_metrics=False, policy_mode="guided"
+        )
+        learned = CoopEnvBridge(
+            seed=0, max_steps=40, record_metrics=False, policy_mode="learned"
+        )
+        # Same network shape, same replay, same TD update -- only the values
+        # inside the observation change.
+        self.assertEqual(guided.obs_dim, learned.obs_dim)
+
+        torch.manual_seed(0)
+        q = torch.randn(4, N_ACTIONS)
+        guided.reset(seed=1)
+        obs = torch.tensor([guided._obs(0)] * 4, dtype=torch.float32)
+        self.assertTrue(
+            torch.equal(
+                action_scores(q, obs, "guided"), action_scores(q, obs, "learned")
+            )
+        )
+        # And the route really is present, or guided is just learned.
+        base = guided.obs_dim - len(GLOBAL_NAMES)
+        route = [
+            guided._obs(0)[base + GLOBAL_NAMES.index(name)]
+            for name in ("route_dx", "route_dy")
+        ]
+        self.assertTrue(any(route), "guided observation has no route signal")
+        learned.reset(seed=1)
+        blind = [
+            learned._obs(0)[base + GLOBAL_NAMES.index(name)]
+            for name in ("route_dx", "route_dy")
+        ]
+        self.assertEqual(blind, [0.0, 0.0])
 
 
 if __name__ == "__main__":

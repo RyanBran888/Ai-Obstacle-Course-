@@ -38,14 +38,20 @@ from coop_env.tiles import Tile, is_hazard
 
 from DQN.DQN_model import (
     ASSISTED_POLICY_MODE,
+    GUIDED_POLICY_MODE,
     CHANNELS,
     GLOBALS,
     LEARNED_POLICY_MODE,
     N_ACTIONS,
+    NAV_GRADIENT_CELLS,
+    NAV_GRADIENT_SCALE,
+    NAV_GRADIENT_UNREACHABLE,
     OBS_DIM,
     POLICY_MODES,
+    ROUTE_OBSERVATION_MODES,
     VIEW,
     WIPEOUT_ACTION_MASK_HORIZON,
+    observation_dim,
 )
 
 N_AGENTS = 2
@@ -114,6 +120,7 @@ TIME_SCALE = 64.0
 
 POLICY_MODE_LEARNED = LEARNED_POLICY_MODE
 POLICY_MODE_ASSISTED = ASSISTED_POLICY_MODE
+POLICY_MODE_GUIDED = GUIDED_POLICY_MODE
 
 
 class _ProjectedWipeoutState:
@@ -199,6 +206,8 @@ def micro_room(size: int = 2, seed: int = 0) -> Room:
 
 
 class CoopEnvBridge:
+    #: Instance attribute in practice -- __init__ widens it when the flow map
+    #: is enabled. Kept here so a bare class reference still reads sensibly.
     obs_dim = OBS_DIM
     n_actions = N_ACTIONS
 
@@ -216,12 +225,21 @@ class CoopEnvBridge:
         shaping_gamma=0.99,
         record_metrics=True,
         policy_mode: str = LEARNED_POLICY_MODE,
+        nav_gradient: bool | None = None,
     ):
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1")
         if not 0.0 <= shaping_gamma <= 1.0:
             raise ValueError("shaping_gamma must be between 0 and 1")
         self.set_policy_mode(policy_mode)
+        # Off in both modes. A supervised probe says this lifts the learned
+        # ceiling from 72% to 93%, but training measured the reverse: 43.8%
+        # train / 3.1% held-out on open_navigation against 75.0% / 28.1%
+        # without it. Extra information cannot make *training* success harder,
+        # so the loss is in optimization, not in what the observation knows.
+        # Opt in with nav_gradient=True to experiment with the encoding.
+        self.nav_gradient = bool(nav_gradient)
+        self.obs_dim = observation_dim(self.nav_gradient)
         self.cfg = config or GenerationConfig.preset("standard")
         self.sess = EnvironmentSession(self.cfg, master_seed=seed)
         self.max_steps = max_steps
@@ -308,6 +326,24 @@ class CoopEnvBridge:
 
     @property
     def legacy_assistance_enabled(self) -> bool:
+        """Whether the planner's next step is visible to the agent.
+
+        True for guided as well as assisted: guided's whole premise is that
+        the route arrives as an observation feature. What guided does not get
+        is any oracle in the control path -- see
+        :attr:`safety_oracle_enabled` and the action-scoring dispatch.
+        """
+        return self.policy_mode in ROUTE_OBSERVATION_MODES
+
+    @property
+    def safety_oracle_enabled(self) -> bool:
+        """Whether lethal actions are masked out before the agent chooses.
+
+        Assisted only. Learned runs never actually died -- every validation
+        failure was a step-limit timeout -- so withholding this costs guided
+        nothing it was relying on, and keeping it would mean the environment,
+        not the network, was avoiding the hazards.
+        """
         return self.policy_mode == ASSISTED_POLICY_MODE
 
     def route_action_labels(self) -> tuple[int, ...]:
@@ -788,7 +824,7 @@ class CoopEnvBridge:
             raise RuntimeError("call reset() before requesting action masks")
         if horizon < 1:
             raise ValueError("wipeout action-mask horizon must be positive")
-        if not self.legacy_assistance_enabled:
+        if not self.safety_oracle_enabled:
             # The trainer combines this neutral mask with ordinary semantic
             # action validity. Fresh agents must learn moving-hazard behavior
             # from observations and outcomes rather than a recursive oracle.
@@ -1943,7 +1979,38 @@ class CoopEnvBridge:
                     elif kind == "checkpoint" and not state.is_checkpoint_reached(eid):
                         view[b + CHECKPOINT] = 1.0
 
-        return view + self._extras(i)
+        observation = view + self._extras(i)
+        if self.nav_gradient:
+            observation += self._nav_gradient_view(i)
+        return observation
+
+    def _nav_gradient_view(self, i):
+        """Goal distance over the visible window, relative to where we stand.
+
+        Negative means downhill (closer to the goal). The planner's own BFS
+        field supplies the numbers, so this costs nothing extra to compute,
+        but it names a terrain gradient rather than an action: the agent still
+        has to choose, and still has to override it for hazards and timing.
+        """
+        self._ensure_navigation()
+        distances = self._nav_distance[i]
+        me = self.pos[i]
+        here = distances.get(me)
+        if here is None:
+            # Stranded: report every tile as maximally uphill rather than
+            # inventing a gradient out of missing data.
+            return [NAV_GRADIENT_UNREACHABLE] * NAV_GRADIENT_CELLS
+
+        out = []
+        for dy in range(-RADIUS, RADIUS + 1):
+            for dx in range(-RADIUS, RADIUS + 1):
+                there = distances.get(Vec2(me[0] + dx, me[1] + dy))
+                if there is None:
+                    out.append(NAV_GRADIENT_UNREACHABLE)
+                    continue
+                delta = (there - here) / NAV_GRADIENT_SCALE
+                out.append(float(min(1.0, max(-1.0, delta))))
+        return out
 
     def _can_interact(self, i, target):
         for entity in self.room.entities_at(self.pos[i]):

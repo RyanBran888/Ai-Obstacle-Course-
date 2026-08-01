@@ -92,13 +92,18 @@ class TestTeacherLabelsSurviveLearnedMode(unittest.TestCase):
 
 
 class TestAuxiliaryLossWiring(unittest.TestCase):
-    def test_loss_is_active_in_learned_mode(self):
+    def test_it_is_off_by_default(self):
+        # The sweep found no held-out benefit, so it must not run unasked.
+        self.assertEqual(DEFAULT_ROUTE_AUX_WEIGHT, 0.0)
+        self.assertEqual(Config().route_aux_weight, 0.0)
+
+    def test_loss_is_active_in_learned_mode_when_asked_for(self):
         torch.manual_seed(0)
         agent = Agent(
             device="cpu",
             replay_capacity=1000,
             policy_mode="learned",
-            route_aux_weight=DEFAULT_ROUTE_AUX_WEIGHT,
+            route_aux_weight=0.05,
         )
         _fill(agent)
         agent.learn_batch(64)
@@ -130,7 +135,7 @@ class TestAuxiliaryLossWiring(unittest.TestCase):
             device="cpu",
             replay_capacity=1000,
             policy_mode="learned",
-            route_aux_weight=DEFAULT_ROUTE_AUX_WEIGHT,
+            route_aux_weight=0.05,
         )
         _fill(agent, label=-1)
         agent.learn_batch(64)
@@ -149,7 +154,7 @@ class TestLabelsReachReplayFromEpisodes(unittest.TestCase):
             device="cpu",
             seed=0,
             policy_mode="learned",
-            route_aux_weight=DEFAULT_ROUTE_AUX_WEIGHT,
+            route_aux_weight=0.05,
         )
         env = CoopEnvBridge(seed=0, max_steps=40, policy_mode="learned")
         trainer = Trainer(env, cfg)
@@ -165,10 +170,11 @@ class TestLabelsReachReplayFromEpisodes(unittest.TestCase):
 
 
 class TestCheckpointCompatibility(unittest.TestCase):
-    def test_contract_records_that_the_loss_now_runs(self):
-        self.assertTrue(LEARNED_POLICY_CONTRACT["route_auxiliary_loss"])
-        self.assertFalse(LEGACY_LEARNED_POLICY_CONTRACT["route_auxiliary_loss"])
-        self.assertGreater(
+    def test_contract_records_that_the_loss_is_off_by_default(self):
+        self.assertFalse(LEARNED_POLICY_CONTRACT["route_auxiliary_loss"])
+        # The variant written while it briefly defaulted on stays recognized.
+        self.assertTrue(LEGACY_LEARNED_POLICY_CONTRACT["route_auxiliary_loss"])
+        self.assertNotEqual(
             LEARNED_POLICY_CONTRACT["version"],
             LEGACY_LEARNED_POLICY_CONTRACT["version"],
         )
