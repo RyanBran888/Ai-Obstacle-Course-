@@ -367,6 +367,22 @@ LEARNED_PROMOTION_SCALE = 0.5
 LEARNED_NAV_GRADIENT_PROMOTION_SCALE = LEARNED_PROMOTION_SCALE
 
 
+#: Rounds a stage may spend on one pool before retention is watched every
+#: round, at any pool size rather than only the largest.
+#:
+#: Retention used to be checked only at the largest pool, so the guard sat on
+#: the last rung of the ladder while the fall happened earlier. A stage that
+#: cannot clear a small pool grinds there instead -- hold_switch_door spent
+#: four rounds and 65k optimizer updates on 16 rooms with only 20% rehearsal --
+#: and quietly destroyed the stages behind it: switch_door fell 99.6% -> 25.0%
+#: and timed_switch_door 100% -> 12.5%, measured on the recovery checkpoint.
+#: The stage then cannot pass either, because the policy it was building on is
+#: gone, which is why its score oscillates instead of climbing.
+#:
+#: Two rounds is one clean attempt plus one retry; a stage that needs a third
+#: is grinding, and that is exactly when forgetting starts to accumulate.
+RETENTION_WATCH_ROUNDS = 2
+
 #: Guided reached 71.9% held-out on open_navigation in the same 1500-episode,
 #: 16-room harness where learned reached 28.1%. Putting the validation gate at
 #: 0.8 * 90% = 72% asks for exactly what it demonstrated there, and the real
@@ -3746,6 +3762,19 @@ class CurriculumRunner:
                         retention_details: dict[str, Evaluation] = {}
                         validation_seconds = 0.0
                         retention_seconds = 0.0
+                        # Watch retention once a stage starts grinding, not
+                        # only at the largest pool. Prior stages decay during
+                        # the rounds spent stuck on a small pool, and without
+                        # this the damage is invisible until a pool the run
+                        # may never reach.
+                        # Validation stays a largest-pool gate: running it
+                        # earlier would add a promotion requirement the ladder
+                        # never intended for small pools. Retention is only a
+                        # guard, so watching it early costs nothing but time.
+                        grinding = (
+                            int(active.get("phase_rounds", 0))
+                            >= RETENTION_WATCH_ROUNDS
+                        )
                         if scheduled_pool_size == largest_pool:
                             validation_started = time.perf_counter()
                             validation_eval = evaluate(
@@ -3756,6 +3785,7 @@ class CurriculumRunner:
                             validation_seconds = (
                                 time.perf_counter() - validation_started
                             )
+                        if scheduled_pool_size == largest_pool or grinding:
                             retention_started = time.perf_counter()
                             (
                                 retention_eval,
