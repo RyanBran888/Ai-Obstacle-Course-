@@ -339,6 +339,12 @@ class Config:
     #: success did not move across weights of 0.05, 1, 2 and 5. Memorization of
     #: a small room pool is a data problem; see CurriculumRunner.train_pool_max.
     route_aux_weight: float = DEFAULT_ROUTE_AUX_WEIGHT
+    #: Trunk widths. The default spends 89% of its 381k parameters on the
+    #: 1325-wide input projection, leaving ~42k for everything after it --
+    #: the capacity that has to hold all 31 stages at once. Widening it is
+    #: the lever for catastrophic interference between stages. Recorded in
+    #: every checkpoint, so a change is a new network, not a resumable one.
+    hidden: tuple[int, ...] = HIDDEN
 
 
 def eps_at(step: int, cfg: Config) -> float:
@@ -1473,6 +1479,7 @@ class Trainer:
             return Agent(
                 obs_dim=env.obs_dim,
                 n_actions=env.n_actions,
+                hidden=self.cfg.hidden,
                 lr=self.cfg.lr,
                 gamma=self.cfg.gamma,
                 clip=self.cfg.clip,

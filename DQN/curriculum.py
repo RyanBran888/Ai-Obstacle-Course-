@@ -2977,14 +2977,38 @@ class CurriculumRunner:
             for reason in latest_failures
         )
         phase = str(active["phase"])
+        # Normally a failing current stage keeps its own rounds rather than
+        # spending them on rehearsal. That is the wrong call when the current
+        # stage is failing *because* the stages under it have decayed: more
+        # rounds on the same stage then deepen the hole. Measured on the
+        # hold_switch_door recovery state, four more rounds at 80/20 took the
+        # prior stages from 42.2% to 12.5% mean and the current stage to 0%,
+        # while the consolidation mix took them to 96.9% without costing the
+        # current stage anything. Severe decay therefore overrides the guard.
+        severe = any(
+            rate < 0.5 * self._retention_threshold(name)
+            for name, rate in latest_retention
+        )
         consolidation = (
             bool(weak)
-            and (not current_failed or phase in {"recovery", "extension"})
+            and (
+                not current_failed
+                or severe
+                or phase in {"recovery", "extension"}
+            )
         )
         if consolidation:
-            current_share = 0.50 if current_failed else 0.25
-            maintenance = 0.15 if current_failed else 0.25
-            learning_rate_scale = 0.50 if current_failed else 0.25
+            # A failing current stage normally gets the gentler half-strength
+            # mix so it keeps making progress. Severe decay is the exception:
+            # the half-strength mix was tried and did not repair (retention
+            # 17.2% -> 34.4% -> 32.8% -> 10.9% over four rounds), while the
+            # full mix measured on the same state restored prior stages from
+            # 42.2% to 96.9%. When the foundation is this far gone the current
+            # stage cannot be learned anyway, so repair takes priority.
+            gentle = current_failed and not severe
+            current_share = 0.50 if gentle else 0.25
+            maintenance = 0.15 if gentle else 0.25
+            learning_rate_scale = 0.50 if gentle else 0.25
         else:
             current_share = 0.80
             maintenance = 0.04 if weak else 0.20
@@ -3796,12 +3820,26 @@ class CurriculumRunner:
                             retention_seconds = (
                                 time.perf_counter() - retention_started
                             )
+                        # Retention is measured early to drive repair, but it
+                        # gates promotion only where it always did. Letting an
+                        # early reading block promotion turns every pool into a
+                        # retention gate, and with sixteen prior stages churning
+                        # something is nearly always weak -- a stage then throws
+                        # away rounds it actually passed. Observed directly: a
+                        # round scored train=100.0% and was refused solely on
+                        # retention, at a pool where retention had never been a
+                        # requirement.
+                        gating_retention = (
+                            retention_eval
+                            if scheduled_pool_size == largest_pool
+                            else ()
+                        )
                         failures, rank = self._assessment(
                             stage,
                             training_eval,
                             validation_eval,
-                            retention_eval,
-                            retention_details,
+                            gating_retention,
+                            retention_details if gating_retention else None,
                         )
                         active["latest_retention"] = retention_eval
                         active["latest_failures"] = failures

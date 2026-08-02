@@ -142,6 +142,20 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--hidden",
+        type=str,
+        default=None,
+        help=(
+            "comma-separated trunk widths (default 256,128,64). The default "
+            "spends 89%% of its 381k parameters projecting the 1325-wide "
+            "observation, leaving ~42k for everything after it -- the whole "
+            "capacity available to hold 31 stages at once, which is why "
+            "later stages erase earlier ones. 512,384,256 gives ~298k there "
+            "for 2.6x the total size. Changing this makes a new network: "
+            "existing checkpoints will not load"
+        ),
+    )
+    parser.add_argument(
         "--route-aux-weight",
         type=float,
         default=DEFAULT_ROUTE_AUX_WEIGHT,
@@ -839,6 +853,19 @@ def main() -> None:
                 flush=True,
             )
 
+    hidden = Config.hidden
+    if args.hidden:
+        try:
+            hidden = tuple(
+                int(width) for width in str(args.hidden).split(",") if width.strip()
+            )
+        except ValueError as error:
+            raise ValueError(
+                f"--hidden must be comma-separated integers, got {args.hidden!r}"
+            ) from error
+        if not hidden or any(width < 1 for width in hidden):
+            raise ValueError("--hidden widths must all be positive")
+
     cfg = Config(
         max_steps=args.max_steps,
         device=args.device,
@@ -846,6 +873,7 @@ def main() -> None:
         policy_mode=args.policy_mode,
         route_aux_weight=args.route_aux_weight,
         nav_gradient=args.nav_gradient,
+        hidden=hidden,
     )
     runner = make_runner(
         cfg,
